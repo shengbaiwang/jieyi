@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.db*
+.env
+
+# Local application state and machine-specific settings
+.jieyi.runtime
+jieyi.settings.json
+
+# Editor and build artifacts
+*.orig
+*.tsbuildinfo
+.DS_Store
+
