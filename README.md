@@ -1,14 +1,62 @@
 # 介译（Jieyi）
 
+A local-first, traceable, model-agnostic workbench for long-form scholarly translation.
+
+[MIT License](LICENSE) · [贡献指南](CONTRIBUTING.md) · [问题反馈](https://github.com/shengbaiwang/jieyi/issues)
+
 面向人文社科长文本的可追溯、多模型翻译工作流。目前是一个可运行的工程内核：它把长文分成具有稳定身份的结构化段落，通过可替换的模型适配器生成候选，逐段保存检查点，并将机器译文、人工确认、质量问题和审计记录分别保存。
 
 本项目采用独立核心，而不是合并 TranslateBooksWithLLMs（TBL）和 Supervertaler 的代码。这样既保留长文流水线与专业译者工作台的设计优点，也把许可证、UI 框架和供应商 SDK 隔离在核心之外。
 
+## 安装与启动
+
+需要 Python 3.11+、uv，以及 Node.js 22.13+（含 npm）。仅使用命令行核心时无需 Node.js。
+
+```bash
+git clone https://github.com/shengbaiwang/jieyi.git
+cd jieyi
+uv sync --locked --extra api --extra dev
+cd web
+npm ci
+cd ..
+```
+
+### macOS 一键启动
+
+安装依赖后，双击项目根目录的 `启动介译.command`，或在终端运行：
+
+```bash
+./启动介译.command
+```
+
+启动器会选择可用端口、构建网页、启动本地 API 并打开工作台。终端显示实际访问地址；关闭启动器终端即可停止本次服务。
+
+### 手动启动（macOS / Linux / Windows）
+
+在项目根目录打开终端，启动 API：
+
+```bash
+uv run uvicorn jieyi.api.app:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+另开一个终端，启动网页：
+
+```bash
+cd web
+npx vinext dev --host 127.0.0.1 --port 3000
+```
+
+访问 `http://localhost:3000`。网页默认连接 `http://127.0.0.1:8000`；自定义 API 地址时，在启动或构建网页前设置 `NEXT_PUBLIC_JIEYI_API`，具体说明见 [网页开发指南](web/README.md)。
+
+首次启动的书库为空，可以导入自己的 EPUB/TXT/Markdown，或用 `examples/sample.md` 体验。CLI 内置 `echo` 供应商可离线验证流程；真实翻译需要配置模型服务。macOS 支持钥匙串保存密钥，其他平台可使用环境变量或仅在本次运行会话中输入密钥。
+
+本地数据库、导入书籍、译文、个人模型配置及密钥不随仓库分发。`.env.example` 只列出环境变量示例；CLI/API 不会自动加载 `.env` 文件，请通过终端或进程管理器注入环境变量。当前工作台面向本机使用，未提供远程多用户认证。
+
 ## 图形工作台
 
-在 macOS 中双击项目根目录的 `启动介译.command`。启动器会同时运行本地 API 与图形界面，并打开 `http://localhost:3000/`。
+启动工作台后，可通过侧栏管理书库、翻译任务、术语和模型连接。
 
-- 在左侧选择“模型配置”，可添加多个独立连接，并把草译、审校分别绑定到不同连接和模型。Kimi Coding、GLM、OpenRouter、DeepSeek、本地模型等使用显式端点，不再猜测 `/v1` 或 `/v4`；
+- 在左侧选择“模型配置”，可添加多个独立连接，并把草译、审校、术语发现分别绑定到不同连接、模型和计算模式。Kimi Coding、GLM、OpenRouter、DeepSeek、本地模型等使用显式端点，不再猜测 `/v1` 或 `/v4`；
 - 每个连接的云端密钥使用独立的 macOS 钥匙串条目，不会写入配置文件。后台进程无法取得钥匙串授权时会降级为本次运行会话，并在界面提示；
 - 在左侧选择“导入书籍”，拖入 EPUB、TXT、MD 或 Markdown 文件，确认项目名称、书名、原文/目标语言和翻译风格，检查分段预览后点击“导入并创建项目”；
 - 导入完成后会直接打开真实书稿；书库、目录、全文搜索、分段对照、人工草稿、确认状态、术语、质量问题和双语导出都读取本机数据库。长书按页加载，阅读位置会自动记忆；
@@ -39,6 +87,12 @@ OpenRouter 使用 `https://openrouter.ai/api/v1`，模型填写完整 ID（例�
 - 脚注、批准术语和禁用译法 QA；
 - 候选、人工决定、问题和审计事件分别存储；
 - 无第三方依赖的 CLI，以及可选的 FastAPI 外壳。
+
+网页端并发草译和审校均携带当前章节路径与相邻原文，默认前后各 1 段；审校还附上
+相邻已有译文，按人工确认、审校、人工草稿、机器初译的顺序取用。参考段落来自本轮
+启动时的整本文档快照，即使不在本次选译或抽样审校范围内也可提供上下文。每个请求
+仍只输出当前段译文。新增参考内容使用项目规范和术语之外的剩余上下文预算，过长时
+保留前段末尾和后段开头；续跑时重新读取快照。翻译记忆检索目前仍仅接入普通逐段流程。
 
 术语发现的算法、证据不变量、成本控制和评估方法见 [全书候选术语发现与审核](docs/TERMINOLOGY_DISCOVERY.md)。
 
@@ -194,6 +248,8 @@ src/jieyi/
 
 更详细的边界、状态机和扩展顺序见 [架构说明](docs/ARCHITECTURE.md) 与 [工程决策](docs/DECISIONS.md)。
 
-## 许可证状态
+## 参与贡献与许可证
 
-项目尚未替所有者选择发布许可证。在做出开源或商业化决定前，不应加入 TBL 的 AGPL-3.0 源码。当前实现从零编写；参考项目及边界见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+欢迎通过 [Issues](https://github.com/shengbaiwang/jieyi/issues) 提交问题和建议，或按 [贡献指南](CONTRIBUTING.md) 提交 Pull Request。
+
+介译原创代码采用 [MIT 许可证](LICENSE)。第三方依赖保留各自的许可证；参考项目与代码边界见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。用户导入的书籍与生成的译文不属于本仓库的授权内容。

@@ -304,7 +304,6 @@ class TermDiscoveryApiTests(unittest.TestCase):
             json={
                 "draft_provider": "echo",
                 "draft_model": "draft",
-                "review_policy": "never",
             },
         ).json()
         self.assertEqual(self.client.post(f"/jobs/{job['id']}/run").status_code, 200)
@@ -350,6 +349,59 @@ class TermDiscoveryApiTests(unittest.TestCase):
         ).json()
         self.assertEqual(approved_candidates[0]["senses"][0]["status"], "approved")
 
+        # The approval can be withdrawn without rewriting any translation or evidence.
+        store = SQLiteStore(self.database)
+        before = self.client.get(f"/documents/{document['id']}/segments").json()
+        term_id = payload["term"]["id"]
+        other = self.client.post(
+            f"/projects/{project['id']}/terms",
+            json={"source": "agency", "target": "机构", "sense": "government institution"},
+        )
+        self.assertEqual(other.status_code, 201, other.text)
+        self.assertTrue(any(issue["code"] == "terminology_pending"
+                            for issue in store.list_issues(document["id"])))
+        forbidden_edit = self.client.patch(
+            f"/term-candidate-senses/{candidate_sense['id']}", json={"status": "pending"},
+        )
+        self.assertEqual(forbidden_edit.status_code, 422)
+
+        # Existing databases also retain the keywords entered before this migration.
+        with store._connect() as connection:
+            connection.execute("ALTER TABLE term_candidate_senses DROP COLUMN context_keywords_json")
+        store.migrate()
+        repository = TermRepository(store)
+        self.assertEqual(repository.get_sense(candidate_sense["id"])["context_keywords"],
+                         ["capacity", "act"])
+
+        revoked = self.client.post(f"/term-candidate-senses/{candidate_sense['id']}/revoke", json={})
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        self.assertEqual(revoked.json()["removed_term_id"], term_id)
+        restored = revoked.json()["candidate"]
+        self.assertEqual(restored["status"], "pending")
+        self.assertIsNone(restored["approved_term_id"])
+        self.assertEqual(restored["proposed_target"], "能动性")
+        self.assertEqual(restored["context_keywords"], ["capacity", "act"])
+        self.assertEqual(self.client.get(f"/documents/{document['id']}/segments").json(), before)
+        self.assertEqual([term.id for term in store.list_terms(project["id"])],
+                         [other.json()["id"]])
+        self.assertTrue(all(term_id not in json.dumps(issue.get("details", {}))
+                            for issue in store.list_issues(document["id"])))
+        audit = store.list_audit_events("term_candidate_sense", candidate_sense["id"])
+        self.assertEqual(sum(event["action"] == "approval_revoked" for event in audit), 1)
+        repeated = self.client.post(f"/term-candidate-senses/{candidate_sense['id']}/revoke", json={})
+        self.assertEqual(repeated.status_code, 200)
+        self.assertIsNone(repeated.json()["removed_term_id"])
+        reapproved = self.client.post(
+            f"/term-candidate-senses/{candidate_sense['id']}/approve",
+            json={"target": "主体能动性", "sense": restored["sense"],
+                  "context_keywords": restored["context_keywords"]},
+        )
+        self.assertEqual(reapproved.status_code, 200, reapproved.text)
+        self.assertNotEqual(reapproved.json()["term"]["id"], term_id)
+        self.assertEqual(len(store.list_terms(project["id"])), 2)
+        self.assertEqual(self.client.post("/term-candidate-senses/missing/revoke", json={}).status_code,
+                         404)
+
     def test_rejection_is_auditable_and_does_not_create_term(self):
         project = self.client.post(
             "/projects",
@@ -375,6 +427,7 @@ class TermDiscoveryApiTests(unittest.TestCase):
         )
         self.assertEqual(rejected.status_code, 200, rejected.text)
         self.assertEqual(rejected.json()["status"], "rejected")
+        self.assertEqual(self.client.post(f"/term-candidate-senses/{sense['id']}/revoke", json={}).status_code, 422)
         self.assertEqual(self.client.get(f"/projects/{project['id']}/terms").json(), [])
 
 

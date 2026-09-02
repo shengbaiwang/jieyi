@@ -105,10 +105,6 @@ def create_job(
     document_id: str,
     draft_provider: str,
     draft_model: str,
-    reviewer_provider: str | None = None,
-    reviewer_model: str | None = None,
-    task_mode: str = "draft",
-    review_policy: str = "on_issue",
     tm_enabled: bool = True,
     tm_threshold: float = 0.78,
     tm_max_results: int = 3,
@@ -117,22 +113,14 @@ def create_job(
     max_concurrency: int | None = None,
     max_batch_chars: int = 4_000,
     draft_thinking: bool = False,
-    review_thinking: bool = True,
     draft_compute_mode: str | None = None,
-    review_compute_mode: str | None = None,
     draft_reasoning_effort: str | None = None,
-    review_reasoning_effort: str | None = None,
-    review_sample_rate: float = 0.08,
     max_output_tokens: int = 6_000,
     token_budget: int = 2_000_000,
     segment_ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
 ) -> Job:
     store.get_document(document_id)
     segment_count = len(store.list_segments(document_id))
-    if task_mode not in {"draft", "review"}:
-        raise ValueError("task_mode must be one of: draft, review")
-    if review_policy not in {"never", "on_issue", "all"}:
-        raise ValueError("review_policy must be one of: never, on_issue, all")
     if not 0 <= tm_threshold <= 1:
         raise ValueError("tm_threshold must be between 0 and 1")
     if tm_max_results < 0:
@@ -146,41 +134,24 @@ def create_job(
         raise ValueError("max_concurrency must be between concurrency and 12")
     if max_batch_chars < 500:
         raise ValueError("max_batch_chars must be at least 500")
-    if not 0 <= review_sample_rate <= 1:
-        raise ValueError("review_sample_rate must be between 0 and 1")
     if max_output_tokens < 256 or token_budget < 1:
         raise ValueError("token limits must be positive")
     draft_request = draft_compute_mode or draft_reasoning_effort
-    review_request = review_compute_mode or review_reasoning_effort
     allowed_controls = set(COMPUTE_MODES) | set(LEGACY_EFFORTS)
     if draft_request and draft_request not in allowed_controls:
         raise ValueError("draft_compute_mode is not supported")
-    if review_request and review_request not in allowed_controls:
-        raise ValueError("review_compute_mode is not supported")
     resolved_draft_mode = normalize_compute_mode(
         draft_request or ("high" if draft_thinking else "none"), "economy"
     )
-    resolved_review_mode = normalize_compute_mode(
-        review_request or ("high" if review_thinking else "none"), "performance"
-    )
     resolved_draft_effort = legacy_effort_for_mode(resolved_draft_mode)
-    resolved_review_effort = legacy_effort_for_mode(resolved_review_mode)
     normalized_ranges = tuple(sorted((int(start), int(end)) for start, end in segment_ranges))
     for index, (start, end) in enumerate(normalized_ranges):
         if start < 0 or end < start or end >= segment_count:
             raise ValueError("segment_ranges must contain valid inclusive document ordinals")
         if index and start <= normalized_ranges[index - 1][1]:
             raise ValueError("segment_ranges must be ordered and non-overlapping")
-    reviewer = None
-    if reviewer_provider or reviewer_model:
-        if not reviewer_provider or not reviewer_model:
-            raise ValueError("reviewer_provider and reviewer_model must be provided together")
-        reviewer = ModelSpec(provider=reviewer_provider, model=reviewer_model)
     recipe = TranslationRecipe(
         draft=ModelSpec(provider=draft_provider, model=draft_model),
-        reviewer=reviewer,
-        task_mode=task_mode,
-        review_policy=review_policy,
         tm_enabled=tm_enabled,
         tm_threshold=tm_threshold,
         tm_max_results=tm_max_results,
@@ -189,12 +160,8 @@ def create_job(
         max_concurrency=resolved_max_concurrency,
         max_batch_chars=max_batch_chars,
         draft_thinking=resolved_draft_mode != "economy",
-        review_thinking=resolved_review_mode != "economy",
         draft_compute_mode=resolved_draft_mode,
-        review_compute_mode=resolved_review_mode,
         draft_reasoning_effort=resolved_draft_effort,
-        review_reasoning_effort=resolved_review_effort,
-        review_sample_rate=review_sample_rate,
         max_output_tokens=max_output_tokens,
         token_budget=token_budget,
         segment_ranges=normalized_ranges,

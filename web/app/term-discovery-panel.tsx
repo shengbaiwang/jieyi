@@ -11,6 +11,7 @@ type Evidence = {
 type Sense = {
   id: string; sense: string; concept_definition: string; proposed_target: string;
   rationale: string; disambiguation: string; confidence: number;
+  context_keywords: string[]; approved_term_id: string | null;
   ai_recommended: boolean | null; proposer: string; status: "pending" | "approved" | "rejected";
 };
 type Candidate = {
@@ -41,6 +42,7 @@ type Props = {
   model: string;
   computeMode: string;
   onApproved: (term: ApprovedTerm) => void;
+  onRevoked: (termId: string) => void;
   notify: (message: string) => void;
 };
 
@@ -58,6 +60,8 @@ function formatCount(value = 0) {
   return value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}M` : value >= 1_000 ? `${(value / 1_000).toFixed(1)}K` : String(value);
 }
 
+const computeModeLabel: Record<string, string> = { economy: "节省", balanced: "均衡", performance: "性能" };
+
 const candidateTypeLabel: Record<Candidate["candidate_type"], string> = {
   concept: "概念",
   named_entity: "专名",
@@ -65,7 +69,7 @@ const candidateTypeLabel: Record<Candidate["candidate_type"], string> = {
   unclassified: "未分类",
 };
 
-export function TermDiscoveryPanel({ documentId, provider, model, computeMode, onApproved, notify }: Props) {
+export function TermDiscoveryPanel({ documentId, provider, model, computeMode, onApproved, onRevoked, notify }: Props) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [discovering, setDiscovering] = useState(false);
@@ -173,6 +177,25 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
     }
   }
 
+  async function revoke(sense: Sense) {
+    setBusySense(sense.id);
+    try {
+      const payload = await request<{ removed_term_id: string | null; candidate: Sense }>(
+        `/term-candidate-senses/${sense.id}/revoke`, { method: "POST", body: "{}" },
+      );
+      const termId = payload.removed_term_id || sense.approved_term_id;
+      if (termId) onRevoked(termId);
+      setCandidates((items) => items.map((item) => ({
+        ...item, senses: item.senses.map((entry) => entry.id === sense.id ? payload.candidate : entry),
+      })));
+      notify("已撤回批准，候选恢复待审核；对应术语约束已移除，既有译文保持不变。");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "撤回失败");
+    } finally {
+      setBusySense("");
+    }
+  }
+
   async function approve(sense: Sense) {
     const target = (targets[sense.id] ?? sense.proposed_target).trim();
     if (!target) { notify("请先填写拟定译法，再批准这个义项。 "); return; }
@@ -186,7 +209,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
             target,
             sense: senses[sense.id] ?? sense.sense,
             rationale: sense.rationale || "人工依据候选证据批准",
-            context_keywords: (contexts[sense.id] || "").split(/[,，;；]/).map((item) => item.trim()).filter(Boolean),
+            context_keywords: (contexts[sense.id] ?? sense.context_keywords?.join("，") ?? "").split(/[,，;；]/).map((item) => item.trim()).filter(Boolean),
             disambiguation: sense.disambiguation,
           }),
         },
@@ -203,7 +226,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
 
   return <section className={styles.panel} aria-label="候选术语发现与审核">
     <div className={styles.heading}>
-      <div><span>全书概念发现</span><h2>候选术语</h2><p>扫描覆盖全文；模型只依据原文证据提出候选和译法，人工批准前不会进入翻译约束。</p></div>
+      <div><span>全书概念发现</span><h2>候选术语</h2><p>扫描覆盖全文；模型只依据原文证据提出候选和译法，人工批准前不会进入翻译约束。</p><p>{provider && model ? `术语发现模型：${model} · ${computeModeLabel[computeMode] || "均衡"}` : "未配置术语发现模型，本次仅做本地扫描。"} 可在“模型配置”中单独设置。</p></div>
       <button type="button" onClick={() => void discover()} disabled={running}>{running ? "扫描与模型复核中…" : displayRun ? "重新扫描" : "扫描全书并生成候选"}</button>
     </div>
     {activeRun && <div className={styles.running}>扫描已提交，正在完成全文分析与模型复核；页面会自动刷新，请勿重复提交。</div>}
@@ -225,10 +248,11 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
         {candidate.senses.map((sense) => <div className={styles.sense} key={sense.id}>
           <div className={[styles.senseMeta].join(" ")}><span className={[styles.status, styles[sense.status]].join(" ")}>{sense.status === "pending" ? "待审核" : sense.status === "approved" ? "已批准" : "已驳回"}</span><small>{sense.ai_recommended === false ? "模型建议略过 · 置信度 " + Math.round(sense.confidence * 100) + "%" : sense.proposer.startsWith("deterministic") ? "本地统计召回 · 尚未模型复核" : "模型建议保留 · 置信度 " + Math.round(sense.confidence * 100) + "%"}</small></div>
           {sense.concept_definition && <p>{sense.concept_definition}</p>}
-          <div className={styles.editors}><label><span>拟定译法</span><input value={targets[sense.id] ?? sense.proposed_target} onChange={(event) => setTargets((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="人工确认或修改译法" /></label><label><span>义项</span><input value={senses[sense.id] ?? sense.sense} onChange={(event) => setSenses((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="说明该概念在本书中的义项" /></label><label><span>语境关键词</span><input value={contexts[sense.id] || ""} onChange={(event) => setContexts((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="逗号分隔，用于同形词消歧" /></label></div>
+          <div className={styles.editors}><label><span>拟定译法</span><input value={targets[sense.id] ?? sense.proposed_target} onChange={(event) => setTargets((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="人工确认或修改译法" /></label><label><span>义项</span><input value={senses[sense.id] ?? sense.sense} onChange={(event) => setSenses((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="说明该概念在本书中的义项" /></label><label><span>语境关键词</span><input value={contexts[sense.id] ?? sense.context_keywords?.join("，") ?? ""} onChange={(event) => setContexts((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="逗号分隔，用于同形词消歧" /></label></div>
           {sense.rationale && <p className={styles.rationale}>{sense.rationale}</p>}
           <details><summary>查看 {candidate.evidence.length} 条原文证据</summary>{candidate.evidence.map((evidence) => <blockquote key={evidence.id}><small>第 {evidence.ordinal + 1} 段{evidence.heading_path ? ` · ${evidence.heading_path}` : ""}</small><p>{evidence.quote}</p></blockquote>)}</details>
-          {sense.status === "pending" && <div className={styles.actions}><button type="button" className={styles.reject} disabled={busySense === sense.id} onClick={() => void reject(sense)}>驳回</button><button type="button" className={styles.approve} disabled={busySense === sense.id || !(targets[sense.id] ?? sense.proposed_target).trim()} onClick={() => void approve(sense)}>人工批准并回查译文</button></div>}
+          {sense.status === "approved" && <div className={styles.actions}><button type="button" className={styles.reject} disabled={Boolean(busySense)} onClick={() => void revoke(sense)}>{busySense === sense.id ? "正在撤回…" : "撤回批准"}</button></div>}
+          {sense.status === "pending" && <div className={styles.actions}><button type="button" className={styles.reject} disabled={Boolean(busySense)} onClick={() => void reject(sense)}>驳回</button><button type="button" className={styles.approve} disabled={Boolean(busySense) || !(targets[sense.id] ?? sense.proposed_target).trim()} onClick={() => void approve(sense)}>人工批准并回查译文</button></div>}
         </div>)}
       </article>)}
     </div>

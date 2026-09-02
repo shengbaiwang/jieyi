@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 
 from fastapi.testclient import TestClient
@@ -192,7 +193,6 @@ class EpubRoundTripTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="echo",
             draft_model="dry-run",
-            review_policy="never",
         )
 
         asyncio.run(engine.run(job.id, max_segments=2))
@@ -346,7 +346,7 @@ class SplitHeadingRepairTests(unittest.TestCase):
                 registry.register("split-repair", provider)
                 engine = TranslationEngine(self.store, registry)
                 job = create_job(self.store, document_id=document.id, draft_provider="split-repair",
-                                 draft_model="test", review_policy="never", segment_ranges=[(0, 0)])
+                                 draft_model="test", segment_ranges=[(0, 0)])
                 run = engine.run_optimized if optimized else engine.run
                 asyncio.run(run(job.id))
                 saved = self.store.get_segment(segment.id)
@@ -387,7 +387,7 @@ class SplitHeadingRepairTests(unittest.TestCase):
         registry.register("invalid-fragments", provider)
         engine = TranslationEngine(self.store, registry)
         job = create_job(self.store, document_id=document.id, draft_provider="invalid-fragments",
-                         draft_model="test", review_policy="never", segment_ranges=[(0, 0)])
+                         draft_model="test", segment_ranges=[(0, 0)])
         asyncio.run(engine.run_optimized(job.id))
         self.assertEqual(provider.calls, 4)
         self.assertIsNone(self.store.get_segment(segment.id).machine_translation)
@@ -409,9 +409,10 @@ class EpubReaderApiTests(unittest.TestCase):
             "/projects",
             json={"name": "Reader", "source_lang": "en", "target_lang": "zh-CN"},
         ).json()
+        self.original_epub = build_roundtrip_epub()
         response = self.client.post(
             f"/projects/{self.project['id']}/documents/epub",
-            content=build_roundtrip_epub(),
+            content=self.original_epub,
             headers={"Content-Type": "application/epub+zip"},
         )
         self.assertEqual(response.status_code, 201)
@@ -434,9 +435,9 @@ class EpubReaderApiTests(unittest.TestCase):
         original = self.client.get(
             f"/documents/{self.document['id']}/epub/original"
         )
-        self.assertEqual(original.content, build_roundtrip_epub())
+        self.assertEqual(original.content, self.original_epub)
 
-    def test_translated_book_export_is_a_valid_epub_with_original_assets(self):
+    def test_book_export_variants_preserve_assets_and_match_download_names(self):
         segments = self.client.get(
             f"/documents/{self.document['id']}/segments"
         ).json()
@@ -446,24 +447,41 @@ class EpubReaderApiTests(unittest.TestCase):
         )
         self.assertEqual(confirmed.status_code, 200)
 
-        exported = self.client.get(
-            f"/documents/{self.document['id']}/export",
-            params={"format": "book"},
-        )
-        self.assertEqual(exported.status_code, 200)
-        self.assertEqual(exported.headers["content-type"], "application/epub+zip")
-        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
-            self.assertEqual(archive.namelist()[0], "mimetype")
-            self.assertEqual(
-                archive.getinfo("mimetype").compress_type,
-                zipfile.ZIP_STORED,
-            )
-            chapter = archive.read("EPUB/Text/chapter.xhtml").decode()
-            self.assertIn("往返书籍", chapter)
-            self.assertEqual(
-                archive.read("EPUB/Fonts/book.woff2"),
-                b"fake-font-data",
-            )
+        for bilingual, label in ((False, "仅译文"), (True, "原文译文对照")):
+            with self.subTest(bilingual=bilingual):
+                exported = self.client.get(
+                    f"/documents/{self.document['id']}/export",
+                    params={"format": "book", "bilingual": bilingual},
+                )
+                self.assertEqual(exported.status_code, 200)
+                self.assertEqual(exported.headers["content-type"], "application/epub+zip")
+                self.assertIn(
+                    f"filename*=UTF-8''{self.document['title']}-{label}.epub",
+                    unquote(exported.headers["content-disposition"]),
+                )
+                with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+                    self.assertEqual(archive.namelist()[0], "mimetype")
+                    self.assertEqual(archive.getinfo("mimetype").compress_type, zipfile.ZIP_STORED)
+                    chapter = archive.read("EPUB/Text/chapter.xhtml").decode()
+                    root = ET.fromstring(chapter)
+                    heading = root.find(".//{http://www.w3.org/1999/xhtml}h1")
+                    self.assertIn("往返书籍", "".join(heading.itertext()))
+                    if bilingual:
+                        original = heading.find("{http://www.w3.org/1999/xhtml}span[@class='jy-original']")
+                        self.assertEqual("".join(original.itertext()), "Round Trip")
+                        target = heading.find("{http://www.w3.org/1999/xhtml}span[@class='jy-translation']")
+                        self.assertEqual(target.attrib["lang"], "zh-CN")
+                        self.assertIn("〔尚未翻译〕", chapter)
+                    else:
+                        self.assertNotIn("Round", "".join(heading.itertext()))
+                        self.assertNotIn("jy-bilingual-pair", chapter)
+                    self.assertNotIn("/documents/", chapter)
+                    self.assertNotIn("postMessage", chapter)
+                    self.assertIn("../nav.xhtml#toc", chapter)
+                    self.assertEqual(archive.read("EPUB/Fonts/book.woff2"), b"fake-font-data")
+                    with zipfile.ZipFile(io.BytesIO(build_roundtrip_epub())) as original_zip:
+                        for resource in ("EPUB/Images/cover.svg", "EPUB/Styles/book.css", "EPUB/nav.xhtml"):
+                            self.assertEqual(archive.read(resource), original_zip.read(resource))
 
     def test_rendered_xhtml_and_resources_are_sanitized(self):
         rendered = self.client.get(

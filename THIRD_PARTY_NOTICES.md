@@ -16,6 +16,8 @@ copyright notices, license obligations, and distribution decision in this file.
 In particular, do not add TBL source to a closed-source or network-hosted product
 without an explicit AGPL compliance decision.
 
-The Jieyi project itself does not yet declare a distribution license. The project
-owner should choose one before public distribution. This notice is an engineering
-boundary, not legal advice.
+Jieyi original code is distributed under the MIT License; see `LICENSE`.
+Third-party dependencies retain their own licenses. Python dependency versions
+are recorded in `uv.lock`; web dependency versions and their available license
+metadata are recorded in `web/package-lock.json`. The project license does not
+relicense those dependencies or user-imported books and translation content.

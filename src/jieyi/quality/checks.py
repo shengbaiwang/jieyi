@@ -38,21 +38,6 @@ def _issue(
     )
 
 
-def reviewer_attention_issues(findings: tuple[str, ...]) -> list[QualityIssue]:
-    """Convert reviewer uncertainty into visible, non-blocking human checks."""
-    return [
-        _issue(
-            "reviewer_attention",
-            f"审校 AI 提请人工判断：{finding}",
-            IssueSeverity.WARNING,
-            {"source": "reviewer_ai"},
-            confidence="model",
-        )
-        for finding in dict.fromkeys(item.strip() for item in findings)
-        if finding
-    ]
-
-
 def run_deterministic_checks(
     source: str,
     target: str,

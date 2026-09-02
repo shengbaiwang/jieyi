@@ -41,13 +41,12 @@ type ProviderForm = {
   draft_profile_id: string;
   draft_model: string;
   draft_compute_mode: ComputeMode;
-  reviewer_profile_id: string;
-  reviewer_model: string;
-  reviewer_compute_mode: ComputeMode;
-  review_enabled: boolean;
+  term_discovery_profile_id: string;
+  term_discovery_model: string;
+  term_discovery_compute_mode: ComputeMode;
+  term_discovery_provider: string;
   warnings: string[];
   draft_provider: string;
-  reviewer_provider: string;
   // Flattened compatibility fields consumed by the workbench shell.
   provider_type: string;
   base_url: string;
@@ -228,19 +227,18 @@ function ModelCapabilityCard({ state }: { state: ModelProbeState }) {
 
 export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderForm) => void }) {
   const [form, setForm] = useState<ProviderForm>({
-    version: 3,
+    version: 4,
     profiles: [],
     presets: [],
     draft_profile_id: "",
     draft_model: "",
     draft_compute_mode: "economy",
-    reviewer_profile_id: "",
-    reviewer_model: "",
-    reviewer_compute_mode: "performance",
-    review_enabled: false,
+    term_discovery_profile_id: "",
+    term_discovery_model: "",
+    term_discovery_compute_mode: "balanced",
+    term_discovery_provider: "",
     warnings: [],
     draft_provider: "",
-    reviewer_provider: "",
     provider_type: "custom",
     base_url: "",
     api_key_configured: false,
@@ -260,14 +258,14 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
       .then((value) => {
         const profiles = value.profiles.map((item) => ({ ...item, api_key: "" }));
         const draftPreset = value.presets.find((item) => item.id === profiles.find((profile) => profile.id === value.draft_profile_id)?.provider_type);
-        const reviewerPreset = value.presets.find((item) => item.id === profiles.find((profile) => profile.id === value.reviewer_profile_id)?.provider_type);
         setForm({
           ...value,
           profiles,
           draft_model: value.draft_model || draftPreset?.default_models[0] || "",
           draft_compute_mode: value.draft_compute_mode || "economy",
-          reviewer_model: value.reviewer_model || reviewerPreset?.default_models[0] || "",
-          reviewer_compute_mode: value.reviewer_compute_mode || "performance",
+          term_discovery_profile_id: value.term_discovery_profile_id || value.draft_profile_id,
+          term_discovery_model: value.term_discovery_model ?? value.draft_model ?? "",
+          term_discovery_compute_mode: value.term_discovery_compute_mode || "balanced",
         });
         setActiveProfileId(value.draft_profile_id || profiles[0]?.id || "");
         if (value.warnings?.length) setStatus({ kind: "warning", text: value.warnings.join("；") });
@@ -304,7 +302,7 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
         capabilities: preset.capabilities,
       } : item),
       draft_model: current.draft_profile_id === activeProfile.id && recommended ? recommended : current.draft_model,
-      reviewer_model: current.reviewer_profile_id === activeProfile.id && recommended ? recommended : current.reviewer_model,
+      term_discovery_model: current.term_discovery_profile_id === activeProfile.id && recommended ? recommended : current.term_discovery_model,
     }));
     setStatus(recommended ? { kind: "success", text: `已选择 ${preset.name}，推荐模型为 ${recommended}。` } : null);
     if (preset.default_models[0]) {
@@ -343,7 +341,8 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
       ...current,
       profiles,
       draft_profile_id: current.draft_profile_id === activeProfile.id ? fallbackId : current.draft_profile_id,
-      reviewer_profile_id: current.reviewer_profile_id === activeProfile.id ? fallbackId : current.reviewer_profile_id,
+      term_discovery_profile_id: current.term_discovery_profile_id === activeProfile.id ? fallbackId : current.term_discovery_profile_id,
+      term_discovery_model: current.term_discovery_profile_id === activeProfile.id ? modelsForProfile(fallbackId)[0] || "" : current.term_discovery_model,
     }));
     setActiveProfileId(fallbackId);
     setStatus(null);
@@ -355,11 +354,13 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
     return uniqueModels([...(availableModels[profileId] || []), ...defaults]);
   }
 
-  function changeBindingProfile(role: "draft" | "reviewer", profileId: string) {
+  function changeBindingProfile(role: "draft" | "term_discovery", profileId: string) {
     const recommended = modelsForProfile(profileId)[0] || "";
-    setForm((current) => role === "draft"
-      ? { ...current, draft_profile_id: profileId, draft_model: recommended }
-      : { ...current, reviewer_profile_id: profileId, reviewer_model: recommended });
+    setForm((current) => ({
+      ...current,
+      [`${role}_profile_id`]: profileId,
+      [`${role}_model`]: recommended,
+    }));
   }
 
 
@@ -415,7 +416,7 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
       const value = await api<ProviderForm>("/settings/provider", {
         method: "PATCH",
         body: JSON.stringify({
-          version: 3,
+          version: 4,
           profiles: form.profiles.map((profile) => ({
             id: profile.id,
             name: profile.name,
@@ -431,10 +432,9 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
           draft_profile_id: form.draft_profile_id,
           draft_model: form.draft_model,
           draft_compute_mode: form.draft_compute_mode,
-          reviewer_profile_id: form.reviewer_profile_id,
-          reviewer_model: form.reviewer_model,
-          reviewer_compute_mode: form.reviewer_compute_mode,
-          review_enabled: form.review_enabled,
+          term_discovery_profile_id: form.term_discovery_profile_id,
+          term_discovery_model: form.term_discovery_model,
+          term_discovery_compute_mode: form.term_discovery_compute_mode,
         }),
       });
       const profiles = value.profiles.map((item) => ({ ...item, api_key: "" }));
@@ -443,7 +443,7 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
       onSaved?.(value);
       setStatus(value.warnings?.length
         ? { kind: "warning", text: `配置已保存；${value.warnings.join("；")}` }
-        : { kind: "success", text: "配置已保存，草译与审校将使用各自绑定的连接。" });
+        : { kind: "success", text: "配置已保存，草译和术语发现将使用各自绑定的模型。" });
     } catch (error) {
       setStatus({ kind: "error", text: error instanceof Error ? error.message : "保存失败" });
     } finally {
@@ -458,7 +458,7 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
     try {
       const boundModels = [
         form.draft_profile_id === activeProfile.id ? form.draft_model : "",
-        form.review_enabled && form.reviewer_profile_id === activeProfile.id ? form.reviewer_model : "",
+        form.term_discovery_profile_id === activeProfile.id ? form.term_discovery_model : "",
       ].filter(Boolean);
       const value = await api<{ models: string[]; stages: { message: string }[] }>("/settings/provider/test", {
         method: "POST",
@@ -478,7 +478,6 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
         setForm((current) => ({
           ...current,
           draft_model: current.draft_profile_id === activeProfile.id && !current.draft_model ? value.models[0] : current.draft_model,
-          reviewer_model: current.reviewer_profile_id === activeProfile.id && !current.reviewer_model ? value.models[0] : current.reviewer_model,
         }));
       }
       const message = activeProfile.protocol === "anthropic_messages" && !value.models.length
@@ -494,17 +493,16 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
 
   const configuredCount = form.profiles.filter((item) => !item.auth_required || item.api_key_configured || item.api_key).length;
   const draftModels = modelsForProfile(form.draft_profile_id);
-  const reviewerModels = modelsForProfile(form.reviewer_profile_id);
+  const discoveryModels = modelsForProfile(form.term_discovery_profile_id);
 
   const draftProbeState = modelProbes[modelProbeKey(form.draft_profile_id, form.draft_model)];
-  const reviewerProbeState = modelProbes[modelProbeKey(form.reviewer_profile_id, form.reviewer_model)];
+  const discoveryProbeState = modelProbes[modelProbeKey(form.term_discovery_profile_id, form.term_discovery_model)];
   const draftProbe = draftProbeState?.result;
-  const reviewerProbe = reviewerProbeState?.result;
 
   return (
     <section className="setup-view settings-view">
       <header className="setup-header">
-        <div><span className="page-kicker">偏好设置</span><h1>模型配置</h1><p>管理多个模型连接，并分别绑定草译与审校任务。</p></div>
+        <div><span className="page-kicker">偏好设置</span><h1>模型配置</h1><p>管理多个模型连接，并分别绑定草译和术语发现任务。</p></div>
         <div className={`connection-pill ${configuredCount > 0 ? "online" : ""}`}><i />{loading ? "正在读取" : `${configuredCount} / ${form.profiles.length} 个连接就绪`}</div>
       </header>
 
@@ -537,18 +535,17 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
         </section>
 
         <section className="form-section">
-          <div className="form-section-title"><span>3</span><div><strong>任务模型</strong><small>草译和审校可以来自不同服务</small></div></div>
+          <div className="form-section-title"><span>3</span><div><strong>任务模型</strong><small>草译和术语发现可分别选择连接、模型与计算模式</small></div></div>
           <div className="settings-fields three-columns">
             <label><span>草译连接</span><select value={form.draft_profile_id} onChange={(event) => changeBindingProfile("draft", event.target.value)}>{form.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
             <div className="model-field"><span>草译模型</span><div className="model-control-row"><ModelPicker key={"draft-" + form.draft_profile_id} value={form.draft_model} options={draftModels} onChange={(model) => setForm((current) => ({ ...current, draft_model: model }))} /><button type="button" onClick={() => void testModel(form.draft_profile_id, form.draft_model)} disabled={!form.draft_model || draftProbeState?.loading}>{draftProbeState?.loading ? "实测中…" : draftProbeState?.result ? "重新实测" : "实测能力"}</button></div></div>
             <div className="model-field"><span>草译模式</span><ComputeModePicker value={form.draft_compute_mode} probe={draftProbe} onChange={(draft_compute_mode) => setForm((current) => ({ ...current, draft_compute_mode }))} /></div>
             {draftProbeState && <ModelCapabilityCard state={draftProbeState} />}
-            <label><span>审校连接</span><select value={form.reviewer_profile_id} disabled={!form.review_enabled} onChange={(event) => changeBindingProfile("reviewer", event.target.value)}>{form.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
-            <div className="model-field"><span>审校模型</span><div className="model-control-row"><ModelPicker key={"reviewer-" + form.reviewer_profile_id} value={form.reviewer_model} options={reviewerModels} disabled={!form.review_enabled} onChange={(model) => setForm((current) => ({ ...current, reviewer_model: model }))} /><button type="button" onClick={() => void testModel(form.reviewer_profile_id, form.reviewer_model)} disabled={!form.review_enabled || !form.reviewer_model || reviewerProbeState?.loading}>{reviewerProbeState?.loading ? "实测中…" : reviewerProbeState?.result ? "重新实测" : "实测能力"}</button></div></div>
-            <div className="model-field"><span>审校模式</span><ComputeModePicker value={form.reviewer_compute_mode} probe={reviewerProbe} disabled={!form.review_enabled} onChange={(reviewer_compute_mode) => setForm((current) => ({ ...current, reviewer_compute_mode }))} /></div>
-            {form.review_enabled && reviewerProbeState && <ModelCapabilityCard state={reviewerProbeState} />}
+            <label><span>术语发现连接</span><select value={form.term_discovery_profile_id} onChange={(event) => changeBindingProfile("term_discovery", event.target.value)}>{form.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
+            <div className="model-field"><span>术语发现模型</span><div className="model-control-row"><ModelPicker key={"discovery-" + form.term_discovery_profile_id} value={form.term_discovery_model} options={discoveryModels} onChange={(model) => setForm((current) => ({ ...current, term_discovery_model: model }))} /><button type="button" onClick={() => void testModel(form.term_discovery_profile_id, form.term_discovery_model)} disabled={!form.term_discovery_model || discoveryProbeState?.loading}>{discoveryProbeState?.loading ? "实测中…" : discoveryProbeState?.result ? "重新实测" : "实测能力"}</button></div><small>用于候选筛选、义项与译法建议；留空时仅做本地扫描。</small></div>
+            <div className="model-field"><span>术语发现模式</span><ComputeModePicker value={form.term_discovery_compute_mode} probe={discoveryProbeState?.result} onChange={(term_discovery_compute_mode) => setForm((current) => ({ ...current, term_discovery_compute_mode }))} /></div>
+            {discoveryProbeState && <ModelCapabilityCard state={discoveryProbeState} />}
           </div>
-          <label className="switch-row" htmlFor="review-enabled"><span><strong>启用第二模型审校</strong><small>草译后自动调用审校模型检查问题段落</small></span><input id="review-enabled" aria-label="启用第二模型审校" type="checkbox" checked={form.review_enabled} onChange={(event) => setForm((current) => ({ ...current, review_enabled: event.target.checked }))} /><i /></label>
         </section>
       </div>
 
@@ -570,7 +567,7 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
   const [sourceLang, setSourceLang] = useState("en");
   const [targetLang, setTargetLang] = useState("zh-CN");
   const [stylePreset, setStylePreset] = useState("academic");
-  const [styleGuide, setStyleGuide] = useState(STYLE_PRESETS[0].guide);
+  const [styleGuide, setStyleGuide] = useState<string>(STYLE_PRESETS[0].guide);
   const [file, setFile] = useState<ImportFile | null>(null);
   const [dragging, setDragging] = useState(false);
   const [importing, setImporting] = useState(false);

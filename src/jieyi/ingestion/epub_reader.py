@@ -126,15 +126,50 @@ _FAITHFUL_FIXED_STYLE = """
   background: rgba(255,255,255,.88) !important;
 }
 """
-_RESIZE_SCRIPT = (
-    """(()=>{let pending=false;const root=document.documentElement;"""
-    """const documentId=root.getAttribute("data-jy-document-id");"""
-    """const spineIndex=Number(root.getAttribute("data-jy-spine-index"));"""
-    """const send=()=>{pending=false;const body=document.body;const height=body?Math.max(body.offsetHeight,Math.ceil(body.getBoundingClientRect().height)):root.offsetHeight;parent.postMessage({type:"jy-epub-resize",documentId,spineIndex,height:Math.ceil(height)},"*");};"""
-    """const queue=()=>{if(pending)return;pending=true;requestAnimationFrame(send);};"""
-    """addEventListener("message",event=>{const data=event.data||{};const ordinal=Number(data.segmentOrdinal);if(data.type!=="jy-epub-locate"||data.documentId!==documentId||Number(data.spineIndex)!==spineIndex||!Number.isInteger(ordinal))return;const target=document.querySelector('[data-jy-segment-ordinals~="'+ordinal+'"]');if(!target)return;const top=target.getBoundingClientRect().top+(window.scrollY||0);parent.postMessage({type:"jy-epub-location",documentId,spineIndex,segmentOrdinal:ordinal,top:Math.max(0,Math.round(top))},"*");});"""
-    """addEventListener("load",queue);if(document.fonts){document.fonts.ready.then(queue);}if("ResizeObserver" in window){new ResizeObserver(queue).observe(document.body||document.documentElement);}queue();})();"""
-)
+_RESIZE_SCRIPT = r"""(()=>{
+  let pending=false;
+  const root=document.documentElement;
+  const documentId=root.getAttribute("data-jy-document-id");
+  const spineIndex=Number(root.getAttribute("data-jy-spine-index"));
+  const post=data=>parent.postMessage({...data,documentId,spineIndex},"*");
+  const topOf=element=>Math.max(0,Math.round(element.getBoundingClientRect().top+(window.scrollY||0)));
+  const send=()=>{
+    pending=false;
+    const body=document.body;
+    if(!body)return;
+    const locations=[];
+    for(const element of document.querySelectorAll('[data-jy-segment-ordinals]')){
+      const top=topOf(element);
+      for(const value of element.getAttribute('data-jy-segment-ordinals').split(/\s+/)){
+        const ordinal=Number(value);
+        if(Number.isInteger(ordinal))locations.push({ordinal,top});
+      }
+    }
+    const height=Math.ceil(Math.max(body.offsetHeight,body.getBoundingClientRect().height));
+    post({type:"jy-epub-resize",height,locations});
+  };
+  const queue=()=>{if(pending)return;pending=true;requestAnimationFrame(send);};
+  addEventListener("message",event=>{
+    const data=event.data||{};
+    const ordinal=Number(data.segmentOrdinal);
+    if(event.source!==parent||data.type!=="jy-epub-locate"||data.documentId!==documentId||Number(data.spineIndex)!==spineIndex||!Number.isInteger(ordinal))return;
+    send();
+    const target=document.querySelector('[data-jy-segment-ordinals~="'+ordinal+'"]');
+    post({type:"jy-epub-location",segmentOrdinal:ordinal,found:!!target,top:target?topOf(target):null});
+  });
+  const interact=()=>post({type:"jy-epub-interact"});
+  addEventListener("wheel",interact,{passive:true});
+  addEventListener("touchstart",interact,{passive:true});
+  addEventListener("pointerdown",interact);
+  addEventListener("keydown",event=>{if(["ArrowDown","ArrowUp","PageDown","PageUp","Home","End"," "].includes(event.key))interact();});
+  const ready=()=>{
+    if("ResizeObserver" in window)new ResizeObserver(queue).observe(document.body||root);
+    if(document.fonts)document.fonts.ready.then(queue);
+    queue();
+  };
+  if(document.readyState==="loading")addEventListener("DOMContentLoaded",ready,{once:true});else ready();
+  addEventListener("load",queue);
+})();"""
 _RESIZE_SCRIPT_HASH = base64.b64encode(
     hashlib.sha256(_RESIZE_SCRIPT.encode("utf-8")).digest()
 ).decode("ascii")
@@ -533,7 +568,9 @@ def render_spine(
     return payload, item["media_type"] or "application/xhtml+xml"
 
 
-def _render_export_spine(store, document_id: str, spine_index: int) -> bytes:
+def _render_export_spine(
+    store, document_id: str, spine_index: int, *, bilingual: bool = False
+) -> bytes:
     """Render target text into the original XHTML without reader-only rewrites."""
     spine = store.list_epub_spine(document_id)
     item = next((entry for entry in spine if entry["spine_index"] == spine_index), None)
@@ -542,6 +579,7 @@ def _render_export_spine(store, document_id: str, spine_index: int) -> bytes:
     resource = store.get_epub_resource(document_id, item["path"])
     root = _parse_xml(bytes(resource["data"]), item["path"])
     paths = _path_map(root)
+    project = store.get_project_for_document(document_id)
 
     atoms = store.list_epub_atoms_for_spine(document_id, spine_index)
     node_rows = {
@@ -556,6 +594,18 @@ def _render_export_spine(store, document_id: str, spine_index: int) -> bytes:
         if element is None:
             continue
         translated = [atom for atom in group if atom.get("translation_text")]
+        if bilingual:
+            markup = " ".join(atom["translation_markup"] for atom in translated)
+            _pair_translation(
+                element,
+                markup or "〔尚未翻译〕",
+                [atom["atom_id"] for atom in group],
+                missing=not translated,
+                source_italic=_source_uses_italic(translated),
+            )
+            element[-2].attrib["lang"] = project.source_lang
+            element[-1].attrib["lang"] = project.target_lang
+            continue
         if not translated:
             missing = [dict(atom) for atom in group]
             if missing:
@@ -568,11 +618,17 @@ def _render_export_spine(store, document_id: str, spine_index: int) -> bytes:
         else:
             _replace_text_nodes(paths, group, node_rows)
 
-    project = store.get_project_for_document(document_id)
-    root.attrib["lang"] = project.target_lang
-    xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
-    if xml_lang in root.attrib:
-        root.attrib[xml_lang] = project.target_lang
+    if bilingual:
+        # Stacked pairs also work in EPUB readers without CSS Grid support.
+        _inject_style(root, _READER_STYLE + """
+.jy-bilingual-pair { display: block !important; }
+.jy-translation { margin-block: .65em 1.2em !important; }
+""")
+    else:
+        root.attrib["lang"] = project.target_lang
+        xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
+        if xml_lang in root.attrib:
+            root.attrib[xml_lang] = project.target_lang
     return ET.tostring(
         root,
         encoding="utf-8",
@@ -581,8 +637,8 @@ def _render_export_spine(store, document_id: str, spine_index: int) -> bytes:
     )
 
 
-def export_translated_epub(store, document_id: str) -> bytes:
-    """Build an EPUB with translated spine documents and original book assets."""
+def export_translated_epub(store, document_id: str, *, bilingual: bool = False) -> bytes:
+    """Build a translated or bilingual EPUB, preserving original book assets."""
     original = store.get_original_epub(document_id)
     spine_by_path = {
         item["path"]: item["spine_index"]
@@ -595,7 +651,9 @@ def export_translated_epub(store, document_id: str) -> bytes:
         for info in entries:
             data = source.read(info)
             if info.filename in spine_by_path:
-                data = _render_export_spine(store, document_id, spine_by_path[info.filename])
+                data = _render_export_spine(
+                    store, document_id, spine_by_path[info.filename], bilingual=bilingual
+                )
             if info.filename == "mimetype":
                 target.writestr(info, data, compress_type=zipfile.ZIP_STORED)
             else:

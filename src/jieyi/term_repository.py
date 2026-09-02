@@ -286,6 +286,7 @@ class TermRepository:
                 for sense_row in sense_rows:
                     sense = dict(sense_row)
                     sense["evidence_ids"] = json.loads(sense.pop("evidence_ids_json"))
+                    sense["context_keywords"] = json.loads(sense.pop("context_keywords_json"))
                     if sense["ai_recommended"] is not None:
                         sense["ai_recommended"] = bool(sense["ai_recommended"])
                     senses.append(sense)
@@ -362,6 +363,7 @@ class TermRepository:
         value = dict(row)
         value["forms"] = json.loads(value.pop("forms_json"))
         value["evidence_ids"] = json.loads(value.pop("evidence_ids_json"))
+        value["context_keywords"] = json.loads(value.pop("context_keywords_json"))
         if value["ai_recommended"] is not None:
             value["ai_recommended"] = bool(value["ai_recommended"])
         return value
@@ -432,12 +434,13 @@ class TermRepository:
             connection.execute(
                 """UPDATE term_candidate_senses SET status = 'approved',
                 proposed_target = ?, sense = ?, rationale = ?, disambiguation = ?,
-                approved_term_id = ?, updated_at = ? WHERE id = ?""",
+                context_keywords_json = ?, approved_term_id = ?, updated_at = ? WHERE id = ?""",
                 (
                     term.target,
                     term.sense,
                     term.rationale,
                     term.disambiguation,
+                    json.dumps(term.context_keywords, ensure_ascii=False),
                     term.id,
                     now,
                     sense_id,
@@ -462,3 +465,41 @@ class TermRepository:
                 provenance | {"term_id": term.id},
             )
         return term, candidate
+
+    def revoke_approval(self, sense_id: str, *, actor: str) -> tuple[str | None, str]:
+        """Return a candidate to review and remove only the constraint it created."""
+        with self.store._connect() as connection:
+            # Serialize repeat requests with approval/other writers.
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT s.*, d.project_id FROM term_candidate_senses s
+                JOIN term_lexeme_candidates l ON l.id = s.lexeme_id
+                JOIN term_discovery_runs r ON r.id = l.run_id
+                JOIN documents d ON d.id = r.document_id WHERE s.id = ?""",
+                (sense_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"Term candidate sense not found: {sense_id}")
+            if row["status"] == "pending" and row["approved_term_id"] is None:
+                return None, row["project_id"]
+            if row["status"] != "approved":
+                raise ValueError("Only approved candidates can have approval revoked")
+            term_id = row["approved_term_id"]
+            term = connection.execute("SELECT * FROM terms WHERE id = ?", (term_id,)).fetchone()
+            connection.execute(
+                """UPDATE term_candidate_senses SET status = 'pending',
+                approved_term_id = NULL, updated_at = ? WHERE id = ?""",
+                (utc_now(), sense_id),
+            )
+            if term_id:
+                connection.execute("DELETE FROM terms WHERE id = ?", (term_id,))
+                self.store._audit(
+                    connection, "term", term_id, "approval_revoked",
+                    {"actor": actor, "candidate_sense_id": sense_id,
+                     "previous_term": dict(term) if term else None},
+                )
+            self.store._audit(
+                connection, "term_candidate_sense", sense_id, "approval_revoked",
+                {"actor": actor, "term_id": term_id, "status": "pending"},
+            )
+        return term_id, row["project_id"]

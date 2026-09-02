@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,8 +7,15 @@ name = "jieyi"
 version = "0.1.0"
 description = "A traceable, model-agnostic workflow for long-form scholarly translation"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.11"
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/shengbaiwang/jieyi"
+Repository = "https://github.com/shengbaiwang/jieyi"
+Issues = "https://github.com/shengbaiwang/jieyi/issues"
 
 [project.optional-dependencies]
 api = [

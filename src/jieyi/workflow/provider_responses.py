@@ -21,25 +21,6 @@ _BUDGET_REASONS = {
     "token_limit",
 }
 
-_REVIEW_FINDINGS_MARKER = "JY_REVIEW_ISSUES:"
-
-
-def parse_review_response(text: str) -> tuple[str, tuple[str, ...]]:
-    """Split the optional human-attention appendix from the reviewed translation."""
-    marker = f"\n\n{_REVIEW_FINDINGS_MARKER}"
-    if marker not in text:
-        return text.strip(), ()
-    translation, appendix = text.split(marker, 1)
-    findings = []
-    for line in appendix.strip().splitlines():
-        value = line.strip().removeprefix("-").removeprefix("•").strip()
-        if value and value not in findings:
-            findings.append(value[:500])
-        if len(findings) >= 10:
-            break
-    return translation.strip(), tuple(findings)
-
-
 _CONTENT_FILTER_MARKERS = (
     "code 1301",
     "代码 1301",

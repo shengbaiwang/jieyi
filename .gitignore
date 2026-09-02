@@ -8,13 +8,29 @@ dist/
 build/
 *.db*
 .env
+.env.*
+!.env.example
 
 # Local application state and machine-specific settings
 .jieyi.runtime
+.jieyi.launch.lock/
 jieyi.settings.json
+jieyi.settings.json.*
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Editor and build artifacts
 *.orig
 *.tsbuildinfo
 .DS_Store
 
+# Local secrets and tool state
+*.pem
+*.key
+.claude/
+.coverage*
+htmlcov/

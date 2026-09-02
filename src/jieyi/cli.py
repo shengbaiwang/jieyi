@@ -74,9 +74,6 @@ def build_parser() -> argparse.ArgumentParser:
     job.add_argument("--document", required=True)
     job.add_argument("--draft-provider", default="echo")
     job.add_argument("--draft-model", default="dry-run")
-    job.add_argument("--reviewer-provider")
-    job.add_argument("--reviewer-model")
-    job.add_argument("--review-policy", choices=["never", "on_issue", "all"], default="on_issue")
     job.add_argument("--no-tm", action="store_true")
     job.add_argument("--tm-threshold", type=float, default=0.78)
     job.add_argument("--tm-max-results", type=int, default=3)
@@ -175,9 +172,6 @@ def main(argv: list[str] | None = None) -> int:
             document_id=args.document,
             draft_provider=args.draft_provider,
             draft_model=args.draft_model,
-            reviewer_provider=args.reviewer_provider,
-            reviewer_model=args.reviewer_model,
-            review_policy=args.review_policy,
             tm_enabled=not args.no_tm,
             tm_threshold=args.tm_threshold,
             tm_max_results=args.tm_max_results,

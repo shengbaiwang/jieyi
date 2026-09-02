@@ -228,6 +228,7 @@ CREATE TABLE IF NOT EXISTS term_candidate_senses (
     evidence_ids_json TEXT NOT NULL,
     proposer TEXT NOT NULL,
     status TEXT NOT NULL,
+    context_keywords_json TEXT NOT NULL DEFAULT '[]',
     approved_term_id TEXT REFERENCES terms(id) ON DELETE SET NULL,
     updated_at TEXT NOT NULL
 );
@@ -464,6 +465,18 @@ class SQLiteStore:
             from jieyi.quality.terminology_review import _SCHEMA as review_schema
 
             connection.executescript(review_schema)
+            sense_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(term_candidate_senses)")
+            }
+            if "context_keywords_json" not in sense_columns:
+                connection.execute(
+                    "ALTER TABLE term_candidate_senses ADD COLUMN "
+                    "context_keywords_json TEXT NOT NULL DEFAULT '[]'"
+                )
+                connection.execute(
+                    """UPDATE term_candidate_senses SET context_keywords_json = COALESCE(
+                    (SELECT context_keywords_json FROM terms WHERE id = approved_term_id), '[]')"""
+                )
             issue_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(issues)").fetchall()
             }

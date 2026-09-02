@@ -2,6 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from test_epub import build_epub
@@ -137,21 +138,6 @@ class DuplicatePlaceholderProvider:
             text=source.replace(token, f"{token}重复文本{token}", 1),
             prompt_tokens=10,
             completion_tokens=5,
-        )
-
-
-class ReviewerConcernProvider:
-    async def complete(self, messages, model, **kwargs):
-        del model, kwargs
-        content = messages[-1]["content"]
-        current = content.split("\n\nCURRENT TRANSLATION:\n", 1)[1]
-        current = current.split("\n\nKNOWN ISSUES:\n", 1)[0]
-        return TranslationResult(
-            text=(
-                current
-                + "\n\nJY_REVIEW_ISSUES:\n"
-                + "- 此处概念在现有上下文中仍有两个合理义项。"
-            )
         )
 
 
@@ -379,7 +365,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=self.document.id,
             draft_provider="echo",
             draft_model="dry-run",
-            review_policy="never",
         )
         paused = asyncio.run(self.engine.run(job.id, max_segments=1))
         self.assertEqual(paused.status, JobStatus.PAUSED)
@@ -401,7 +386,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=self.document.id,
             draft_provider="echo",
             draft_model="dry-run",
-            review_policy="never",
             batch_size=2,
             concurrency=2,
             draft_thinking=False,
@@ -429,7 +413,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=self.document.id,
             draft_provider="echo",
             draft_model="dry-run",
-            review_policy="never",
             batch_size=1,
             concurrency=1,
             max_concurrency=1,
@@ -456,7 +439,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=self.document.id,
             draft_provider="echo",
             draft_model="dry-run",
-            review_policy="never",
             segment_ranges=[(1, 1)],
         )
 
@@ -482,7 +464,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=self.document.id,
             draft_provider="cross-wiring",
             draft_model="test",
-            review_policy="never",
             batch_size=3,
             concurrency=1,
         )
@@ -526,7 +507,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=self.document.id,
             draft_provider="concurrent",
             draft_model="test",
-            review_policy="never",
             batch_size=3,
             concurrency=3,
         )
@@ -550,6 +530,75 @@ class WorkflowTests(unittest.TestCase):
                 f"translated:{segment.source_text}",
             )
 
+    def test_optimized_draft_includes_location_and_neighbors_outside_selected_range(self):
+        document = create_document(
+            self.store,
+            project_id=self.project.id,
+            title="Context book",
+            text="# Chapter One\n\nEarlier argument.\n\nThis approach works."
+                 "\n\nFollowing evidence.\n\nDistant conclusion.",
+            source_format="markdown",
+        )
+        segments = self.store.list_segments(document.id)
+        self.store.confirm_segment(segments[1].id, "不应进入初译参考的旧译文。")
+        provider = ConcurrentProbeProvider()
+        registry = ProviderRegistry()
+        registry.register("probe", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store, document_id=document.id,
+            draft_provider="probe", draft_model="test",
+            segment_ranges=[(2, 2)],
+        )
+
+        completed = asyncio.run(engine.run_optimized(job.id))
+
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        self.assertEqual(len(provider.calls), 1)
+        messages, sources = provider.calls[0]
+        self.assertEqual(sources, ["This approach works."])
+        context = messages[-1]["content"].split("\n\nSOURCE:\n", 1)[0]
+        self.assertIn("# LOCATION\nChapter One", context)
+        self.assertIn("# PREVIOUS SOURCE (segment 1)\nEarlier argument.", context)
+        self.assertIn("# FOLLOWING SOURCE (segment 3)\nFollowing evidence.", context)
+        self.assertIn("only the current source is the output target", context)
+        self.assertNotIn("Distant conclusion.", context)
+        self.assertNotIn("旧译文", context)
+        self.assertNotIn("Earlier argument.", messages[0]["content"])
+        self.assertIsNone(self.store.get_segment(segments[3].id).machine_translation)
+        self.assertEqual(
+            self.store.get_segment(segments[2].id).machine_translation,
+            "translated:This approach works.",
+        )
+
+    def test_optimized_context_honors_neighbor_radius(self):
+        for radius in (0, 2):
+            with self.subTest(radius=radius):
+                document = create_document(
+                    self.store, project_id=self.project.id, title="Radius",
+                    text="\n\n".join(f"Passage {index}." for index in range(5)),
+                    source_format="txt",
+                )
+                provider = ConcurrentProbeProvider()
+                registry = ProviderRegistry()
+                registry.register("probe", provider)
+                engine = TranslationEngine(self.store, registry)
+                job = create_job(
+                    self.store, document_id=document.id,
+                    draft_provider="probe", draft_model="test",
+                    segment_ranges=[(2, 2)],
+                )
+                job = self.store.create_job(replace(
+                    job, id=new_id("job"), recipe=replace(job.recipe, neighbor_radius=radius),
+                ))
+                completed = asyncio.run(engine.run_optimized(job.id))
+                self.assertEqual(completed.status, JobStatus.COMPLETED)
+                messages, sources = provider.calls[0]
+                self.assertEqual(sources, ["Passage 2."])
+                prompt = messages[-1]["content"]
+                for index in (0, 1, 3, 4):
+                    self.assertEqual(f"Passage {index}." in prompt, radius == 2)
+
     def test_optimized_runner_continuously_refills_available_slots(self):
         document = create_document(
             self.store,
@@ -571,7 +620,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="continuous",
             draft_model="test",
-            review_policy="never",
             batch_size=1,
             concurrency=2,
             max_concurrency=2,
@@ -604,7 +652,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="adaptive",
             draft_model="test",
-            review_policy="never",
             batch_size=1,
             concurrency=2,
             max_concurrency=4,
@@ -615,7 +662,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(completed.status, JobStatus.COMPLETED)
         self.assertEqual(provider.max_active, 4)
 
-    def test_optimized_runner_quarantines_invalid_segment_and_review_can_recover_it(self):
+    def test_optimized_runner_quarantines_invalid_segment_without_discarding_siblings(self):
         document = create_document(
             self.store,
             project_id=self.project.id,
@@ -636,7 +683,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="permanently-broken",
             draft_model="test",
-            review_policy="never",
             batch_size=3,
             concurrency=3,
             max_concurrency=3,
@@ -659,30 +705,6 @@ class WorkflowTests(unittest.TestCase):
         failure = self.store.list_audit_events("segment", segments[1].id)[-1]
         self.assertIs(failure["payload"]["deferred"], True)
 
-        review_job = create_job(
-            self.store,
-            document_id=document.id,
-            draft_provider="echo",
-            draft_model="unused",
-            reviewer_provider="echo",
-            reviewer_model="reviewer",
-            task_mode="review",
-            review_policy="on_issue",
-            review_sample_rate=0,
-            concurrency=1,
-        )
-        reviewed = asyncio.run(engine.run_optimized(review_job.id))
-
-        self.assertEqual(reviewed.status, JobStatus.COMPLETED)
-        recovered = self.store.list_segments(document.id)[1]
-        self.assertIsNotNone(recovered.reviewed_translation)
-        self.assertFalse(
-            any(
-                issue["code"] == "translation_deferred"
-                for issue in self.store.list_issues(document.id)
-            )
-        )
-
     def test_optimized_runner_retries_empty_reasoning_response_with_larger_budget(self):
         document = create_document(
             self.store,
@@ -700,7 +722,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="budget-sensitive",
             draft_model="reasoning-model",
-            review_policy="never",
             concurrency=1,
             draft_reasoning_effort="low",
         )
@@ -734,7 +755,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="empty",
             draft_model="empty-model",
-            review_policy="never",
             concurrency=1,
         )
 
@@ -764,7 +784,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=self.document.id,
             draft_provider="selective-filter",
             draft_model="filter-model",
-            review_policy="never",
             batch_size=3,
             concurrency=3,
         )
@@ -795,176 +814,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(payload["attempts"][0]["response_id"], "response-filtered-1")
         self.assertNotIn(segments[1].source_text, json.dumps(payload))
 
-        review_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="echo",
-            draft_model="unused-draft-model",
-            reviewer_provider="echo",
-            reviewer_model="different-review-model",
-            task_mode="review",
-            review_policy="on_issue",
-            review_sample_rate=0,
-        )
-        reviewed = asyncio.run(engine.run_optimized(review_job.id))
-        self.assertEqual(reviewed.status, JobStatus.COMPLETED)
-        deferred = self.store.list_segments(self.document.id)[1]
-        self.assertEqual(
-            deferred.reviewed_translation,
-            f"translated:{deferred.source_text}",
-        )
-        review_candidates = self.store.list_candidates(deferred.id)
-        self.assertEqual(review_candidates[-1]["stage"], "review")
-
-    def test_optimized_reviewer_questions_become_human_attention_issues(self):
-        draft_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="echo",
-            draft_model="draft-model",
-            review_policy="never",
-        )
-        asyncio.run(self.engine.run(draft_job.id))
-
-        registry = ProviderRegistry()
-        registry.register("concern-reviewer", ReviewerConcernProvider())
-        engine = TranslationEngine(self.store, registry)
-        review_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="concern-reviewer",
-            draft_model="unused",
-            reviewer_provider="concern-reviewer",
-            reviewer_model="review-model",
-            task_mode="review",
-            review_policy="all",
-            review_sample_rate=0,
-        )
-        completed = asyncio.run(engine.run_optimized(review_job.id))
-
-        self.assertEqual(completed.status, JobStatus.COMPLETED)
-        reviewed = self.store.list_segments(self.document.id)
-        self.assertTrue(all(item.reviewed_translation for item in reviewed))
-        self.assertTrue(
-            all("JY_REVIEW_ISSUES:" not in item.reviewed_translation for item in reviewed)
-        )
-        issues = self.store.list_issues(self.document.id)
-        reviewer_issues = [item for item in issues if item["code"] == "reviewer_attention"]
-        self.assertEqual(len(reviewer_issues), len(reviewed))
-        self.assertTrue(
-            all("提请人工判断" in item["message"] for item in reviewer_issues)
-        )
-
-    def test_optimized_review_policy_all_reuses_every_existing_draft(self):
-        draft_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="echo",
-            draft_model="draft-model",
-            review_policy="never",
-        )
-        asyncio.run(self.engine.run(draft_job.id))
-        before = self.store.list_segments(self.document.id)
-
-        review_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="echo",
-            draft_model="unused-draft-model",
-            reviewer_provider="echo",
-            reviewer_model="review-model",
-            task_mode="review",
-            review_policy="all",
-            review_sample_rate=0,
-        )
-        completed = asyncio.run(self.engine.run_optimized(review_job.id))
-
-        self.assertEqual(completed.status, JobStatus.COMPLETED)
-        after = self.store.list_segments(self.document.id)
-        self.assertEqual(
-            [item.reviewed_translation for item in after],
-            [item.machine_translation for item in before],
-        )
-
-    def test_serial_http_1301_is_skipped_and_translated_by_reviewer(self):
-        registry = ProviderRegistry()
-        registry.register("safety-filter", SelectiveHttpSafetyProvider())
-        registry.register("echo", EchoProvider())
-        engine = TranslationEngine(self.store, registry)
-        draft_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="safety-filter",
-            draft_model="glm-draft",
-            review_policy="never",
-        )
-
-        drafted = asyncio.run(engine.run(draft_job.id))
-
-        self.assertEqual(drafted.status, JobStatus.COMPLETED)
-        deferred = self.store.list_segments(self.document.id)[1]
-        self.assertIsNone(deferred.machine_translation)
-        failure = self.store.list_audit_events("segment", deferred.id)[-1]
-        self.assertEqual(failure["payload"]["kind"], "content_filtered")
-
-        review_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="safety-filter",
-            draft_model="unused-draft-model",
-            reviewer_provider="echo",
-            reviewer_model="different-review-model",
-            task_mode="review",
-            review_policy="on_issue",
-            review_sample_rate=0,
-        )
-        reviewed = asyncio.run(engine.run(review_job.id))
-
-        self.assertEqual(reviewed.status, JobStatus.COMPLETED)
-        deferred = self.store.list_segments(self.document.id)[1]
-        self.assertEqual(
-            deferred.reviewed_translation,
-            f"【zh-CN】{deferred.source_text}",
-        )
-
-    def test_review_job_uses_existing_translation_without_redrafting(self):
-        draft_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="echo",
-            draft_model="draft-model",
-            review_policy="never",
-        )
-        asyncio.run(self.engine.run(draft_job.id))
-        first_before_review = self.store.list_segments(self.document.id)[0]
-        self.store.save_segment_draft(first_before_review.id, "人工草稿。")
-
-        review_job = create_job(
-            self.store,
-            document_id=self.document.id,
-            draft_provider="echo",
-            draft_model="unused-draft-model",
-            reviewer_provider="echo",
-            reviewer_model="review-model",
-            task_mode="review",
-            review_policy="all",
-        )
-        completed = asyncio.run(self.engine.run(review_job.id))
-        self.assertEqual(completed.status, JobStatus.COMPLETED)
-        reviewed_segments = self.store.list_segments(self.document.id)
-        self.assertEqual(reviewed_segments[0].edited_translation, "人工草稿。")
-        self.assertEqual(reviewed_segments[0].reviewed_translation, "人工草稿。")
-        for segment in reviewed_segments:
-            stages = [item["stage"] for item in self.store.list_candidates(segment.id)]
-            self.assertEqual(stages, ["draft", "review"])
-
     def test_human_confirmation_is_separate_and_audited(self):
         job = create_job(
             self.store,
             document_id=self.document.id,
             draft_provider="echo",
             draft_model="dry-run",
-            review_policy="never",
         )
         asyncio.run(self.engine.run(job.id))
         segment = self.store.list_segments(self.document.id)[0]
@@ -1043,7 +898,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=self.document.id,
             draft_provider="flaky",
             draft_model="test",
-            review_policy="never",
         )
 
         with self.assertRaisesRegex(RuntimeError, "simulated provider outage"):
@@ -1073,7 +927,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="repairing",
             draft_model="test",
-            review_policy="never",
         )
         completed = asyncio.run(engine.run(job.id))
         self.assertEqual(completed.status, JobStatus.COMPLETED)
@@ -1101,7 +954,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="optimized-repairing",
             draft_model="test",
-            review_policy="never",
         )
 
         completed = asyncio.run(engine.run_optimized(job.id))
@@ -1131,7 +983,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="retry-repairing",
             draft_model="test",
-            review_policy="never",
         )
 
         completed = asyncio.run(engine.run_optimized(job.id))
@@ -1161,7 +1012,6 @@ class WorkflowTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="duplicate-placeholder",
             draft_model="test",
-            review_policy="never",
         )
 
         completed = asyncio.run(engine.run_optimized(job.id))

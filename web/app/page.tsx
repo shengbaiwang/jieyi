@@ -4,13 +4,14 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { ImportBookPanel, ProviderSettingsPanel } from "./setup-panels";
 import { TermDiscoveryPanel } from "./term-discovery-panel";
 import { TerminologyReviewPanel } from "./terminology-review-panel";
+import { createReaderNavigation, type ReaderPageTarget } from "./reader-navigation";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
 const PAGE_SIZE = 120;
 
 type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ComputeMode = "economy" | "balanced" | "performance";
-type Panel = "library" | "translate" | "reader" | "terms" | "quality" | "import" | "settings";
+type Panel = "library" | "translate" | "reader" | "terms" | "quality" | "import" | "settings" | "export";
 type ViewMode = "split" | "target";
 type Project = { id: string; name: string; source_lang: string; target_lang: string; style_guide: string };
 type Document = { id: string; project_id: string; title: string; source_format: string; created_at: string; cover_url: string | null };
@@ -20,14 +21,14 @@ type Segment = {
   accepted_translation: string | null; status: "source" | "machine_translated" | "human_confirmed";
 };
 type Chapter = { title: string; level: number; start_ordinal: number; end_ordinal: number; segment_count: number; translated_count: number; confirmed_count: number };
-type Overview = { document: Document; project: Project; segment_count: number; translated_count: number; reviewed_count: number; confirmed_count: number; chapters: Chapter[] };
+type Overview = { document: Document; project: Project; segment_count: number; translated_count: number; confirmed_count: number; chapters: Chapter[] };
 type SegmentPage = { document: Document; project: Project; total: number; offset: number; limit: number; items: Segment[] };
 type Term = {
   id: string; source: string; target: string; status: string; scope: string; rationale: string;
   aliases: string[]; context_keywords: string[]; sense: string; disambiguation: string; enforcement?: string;
 };
 type Issue = { id: string; segment_id: string; ordinal: number; code: string; message: string; severity: string; resolved: number };
-type HumanReviewItem = { segment_id: string; ordinal: number; reason: "error" | "warning" | "sample"; issue_count: number; source_text: string; translation: string };
+type HumanReviewItem = { segment_id: string; ordinal: number; reason: "error" | "warning"; issue_count: number; source_text: string; translation: string };
 type Candidate = { id: string; job_id: string; stage: string; provider: string; model: string; prompt_tokens: number; completion_tokens: number; cost_usd: number; created_at: string };
 type Job = {
   id: string; status: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
@@ -37,23 +38,22 @@ type Job = {
   elapsed_seconds?: number; eta_seconds?: number | null;
   deferred_segments?: number;
   recipe: {
-    task_mode?: "draft" | "review"; review_policy?: "never" | "on_issue" | "all"; batch_size?: number; concurrency?: number; max_concurrency?: number;
-    draft_thinking?: boolean; review_thinking?: boolean; draft_compute_mode?: ComputeMode; review_compute_mode?: ComputeMode; draft_reasoning_effort?: ReasoningEffort; review_reasoning_effort?: ReasoningEffort; review_sample_rate?: number; segment_ranges?: [number, number][];
+    batch_size?: number; concurrency?: number; max_concurrency?: number;
+    draft_thinking?: boolean; draft_compute_mode?: ComputeMode; draft_reasoning_effort?: ReasoningEffort; segment_ranges?: [number, number][];
     draft: { model: string; provider: string };
-    reviewer?: { model: string; provider: string } | null;
   };
 };
 type ProviderSettings = {
-  base_url: string; draft_model: string; draft_compute_mode: ComputeMode; reviewer_model: string; reviewer_compute_mode: ComputeMode; review_enabled: boolean;
+  base_url: string; draft_model: string; draft_compute_mode: ComputeMode;
   api_key_configured: boolean; provider_type: string;
-  draft_provider: string; reviewer_provider: string;
-  draft_profile_id: string; reviewer_profile_id: string;
+  draft_provider: string;
+  draft_profile_id: string;
+  term_discovery_provider: string; term_discovery_model: string; term_discovery_compute_mode: ComputeMode;
   profiles: Array<{ id: string; name: string; provider_type: string; base_url: string }>;
   presets: Array<{ id: string; default_models: string[] }>;
 };
 type BookTranslationSettings = {
   draft_profile_id: string; draft_model: string; draft_compute_mode: ComputeMode;
-  reviewer_profile_id: string; reviewer_model: string; reviewer_compute_mode: ComputeMode;
 };
 type BookSettingsEditor = { document: Document; project: Project; value: BookTranslationSettings; style_guide: string };
 type ReaderMode = "original" | "translated" | "bilingual";
@@ -63,7 +63,6 @@ type EpubReaderManifest = {
   spine: Array<{ spine_index: number; path: string; linear: boolean; fixed_layout: boolean }>;
   segment_locations: Array<{ segment_ordinal: number; spine_index: number }>;
 };
-type ReaderPageTarget = { spineIndex: number; pageNumber: number };
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers: { "Content-Type": "application/json", ...(options?.headers || {}) } });
@@ -85,7 +84,7 @@ function ThemeIcon({ dark }: { dark: boolean }) {
     : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.2 8.2 0 0 1 8.8 4a8.2 8.2 0 1 0 11.2 11.2Z" /></svg>;
 }
 function segmentTranslation(segment: Segment | null) { return segment?.accepted_translation || segment?.reviewed_translation || segment?.edited_translation || segment?.machine_translation || ""; }
-function statusLabel(segment: Segment | null) { return segment?.status === "human_confirmed" ? "人工已确认" : segment?.reviewed_translation ? "AI 已审校" : segment?.status === "machine_translated" ? "机器草译" : "待翻译"; }
+function statusLabel(segment: Segment | null) { return segment?.status === "human_confirmed" ? "人工已确认" : segment?.status === "machine_translated" ? "机器草译" : "待翻译"; }
 function jobStatusLabel(status: Job["status"], deferredSegments = 0) { if (status === "completed" && deferredSegments > 0) return `已结束 · ${deferredSegments} 段未成功`; return ({ pending: "等待中", running: "运行中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" } as const)[status]; }
 function formatTokens(value = 0) { return value >= 1_000_000 ? (value / 1_000_000).toFixed(2) + "M" : value >= 1_000 ? (value / 1_000).toFixed(1) + "K" : String(value); }
 function formatDuration(value?: number | null) { if (value == null) return "测算中"; if (value < 60) return Math.max(1, Math.round(value)) + " 秒"; const minutes = Math.round(value / 60); return minutes < 60 ? minutes + " 分钟" : Math.floor(minutes / 60) + " 小时 " + (minutes % 60) + " 分"; }
@@ -100,24 +99,20 @@ function defaultBookSettings(settings: ProviderSettings): BookTranslationSetting
     draft_profile_id: settings.draft_profile_id,
     draft_model: settings.draft_model,
     draft_compute_mode: settings.draft_compute_mode || "economy",
-    reviewer_profile_id: settings.reviewer_profile_id || settings.draft_profile_id,
-    reviewer_model: settings.reviewer_model,
-    reviewer_compute_mode: settings.reviewer_compute_mode || "performance",
   };
 }
 function modelsForProfile(settings: ProviderSettings | null, profileId: string): string[] {
   if (!settings) return [];
   const profile = settings.profiles.find((item) => item.id === profileId);
   const preset = settings.presets.find((item) => item.id === profile?.provider_type);
-  const bound = [
-    settings.draft_profile_id === profileId ? settings.draft_model : "",
-    settings.reviewer_profile_id === profileId ? settings.reviewer_model : "",
-  ];
+  const bound = settings.draft_profile_id === profileId ? [settings.draft_model] : [];
   return [...new Set([...(preset?.default_models || []), ...bound].filter(Boolean))];
 }
-function exportName(document: Document) {
+function exportName(document: Document, bilingual: boolean) {
   const extension = document.source_format === "epub" ? "epub" : document.source_format === "markdown" ? "md" : "txt";
-  return `${document.title}-译文.${extension}`;
+  const cleanTitle = Array.from(document.title, (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127 ? "_" : character).join("");
+  const title = cleanTitle.replace(/[/\\:*?"<>|]/g, "_").replace(/^[ .]+|[ .]+$/g, "") || "书籍";
+  return `${title}-${bilingual ? "原文译文对照" : "仅译文"}.${extension}`;
 }
 function computeModeFromLegacy(mode: ComputeMode | undefined, effort: ReasoningEffort | undefined, thinking: boolean | undefined, fallback: ComputeMode): ComputeMode {
   if (mode) return mode;
@@ -139,18 +134,11 @@ function normalizeSegmentRanges(ranges: [number, number][]) {
   }
   return merged;
 }
-function jobMatchesSettings(job: Job, settings: ProviderSettings, mode: "draft" | "review", segmentRanges: [number, number][] = []) {
+function jobMatchesSettings(job: Job, settings: ProviderSettings, segmentRanges: [number, number][] = []) {
   if (JSON.stringify(normalizeSegmentRanges(job.recipe.segment_ranges || [])) !== JSON.stringify(normalizeSegmentRanges(segmentRanges))) return false;
-  if ((job.recipe.task_mode || "draft") !== mode) return false;
   if (job.recipe.draft.provider !== settings.draft_provider || job.recipe.draft.model !== settings.draft_model) return false;
   const draftMode = computeModeFromLegacy(job.recipe.draft_compute_mode, job.recipe.draft_reasoning_effort, job.recipe.draft_thinking, "economy");
-  if (draftMode !== settings.draft_compute_mode) return false;
-  if (mode === "review") {
-    if (job.recipe.review_policy !== "all") return false;
-    const reviewMode = computeModeFromLegacy(job.recipe.review_compute_mode, job.recipe.review_reasoning_effort, job.recipe.review_thinking, "performance");
-    return job.recipe.reviewer?.provider === settings.reviewer_provider && job.recipe.reviewer?.model === settings.reviewer_model && reviewMode === settings.reviewer_compute_mode;
-  }
-  return true;
+  return draftMode === settings.draft_compute_mode;
 }
 function overviewFromSegments(document: Document, project: Project, segments: Segment[]): Overview {
   const chapters: Chapter[] = [];
@@ -166,13 +154,13 @@ function overviewFromSegments(document: Document, project: Project, segments: Se
   return {
     document, project, chapters, segment_count: segments.length,
     translated_count: segments.filter((item) => Boolean(segmentTranslation(item))).length,
-    reviewed_count: segments.filter((item) => Boolean(item.reviewed_translation)).length,
     confirmed_count: segments.filter((item) => item.status === "human_confirmed").length,
   };
 }
 
 export default function Home() {
   const [panel, setPanel] = useState<Panel>("library");
+  const [exportBilingual, setExportBilingual] = useState(false);
   const [view, setView] = useState<ViewMode>("split");
   const [projects, setProjects] = useState<Project[]>([]);
   const [documents, setDocuments] = useState<Document[]>([]);
@@ -194,7 +182,7 @@ export default function Home() {
   const [draftDirty, setDraftDirty] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [loading, setLoading] = useState(true);
-  const [wholeBookAction, setWholeBookAction] = useState<"draft" | "review" | null>(null);
+  const [startingTask, setStartingTask] = useState(false);
   const [draftPicker, setDraftPicker] = useState<{ document: Document; overview: Overview } | null>(null);
   const [selectedChapterStarts, setSelectedChapterStarts] = useState<number[]>([]);
   const [draftPickerLoading, setDraftPickerLoading] = useState(false);
@@ -226,10 +214,12 @@ export default function Home() {
   const [termSense, setTermSense] = useState("");
   const [termDisambiguation, setTermDisambiguation] = useState("");
   const [libraryError, setLibraryError] = useState("");
+  const [taskMenu, setTaskMenu] = useState(false);
   const searchInput = useRef<HTMLInputElement>(null);
   const readerView = useRef<HTMLElement>(null);
-  const readerPendingOrdinal = useRef<number | null>(null);
-  const readerScrollLockOrdinal = useRef<number | null>(null);
+  const readerNavigation = useRef<ReturnType<typeof createReaderNavigation> | null>(null);
+  const readerRestoreOrdinal = useRef<number | null>(null);
+  const [readerLocating, setReaderLocating] = useState(false);
   const legacySegments = useRef(new Map<string, Segment[]>());
 
   const currentSegment = useMemo(() => page?.items.find((item) => item.ordinal === ordinal) || null, [ordinal, page]);
@@ -240,7 +230,6 @@ export default function Home() {
   const currentIssues = useMemo(() => issues.filter((item) => item.segment_id === currentSegment?.id), [currentSegment, issues]);
   const errorIssues = useMemo(() => issues.filter((item) => item.severity === "error"), [issues]);
   const displayIssues = useMemo(() => issues.filter((item) => item.severity !== "info").sort((a, b) => Number(a.severity !== "error") - Number(b.severity !== "error") || a.ordinal - b.ordinal), [issues]);
-  const requiredHumanChecks = useMemo(() => humanReviewQueue.filter((item) => item.reason !== "sample").length, [humanReviewQueue]);
   const currentErrorIssues = useMemo(() => currentIssues.filter((item) => item.severity === "error"), [currentIssues]);
   const currentWarningIssues = useMemo(() => currentIssues.filter((item) => item.severity === "warning"), [currentIssues]);
   const pendingTermSegments = new Set(issues.filter((item) => item.code === "terminology_pending").map((item) => item.segment_id)).size;
@@ -251,8 +240,7 @@ export default function Home() {
   const selectedDocument = useMemo(() => documents.find((item) => item.id === selectedDocumentId) || null, [documents, selectedDocumentId]);
   const latestJob = jobsDocumentId === overview?.document.id ? jobs[0] || null : null;
   const selectedJob = jobsDocumentId === selectedDocumentId ? jobs[0] || null : null;
-  const selectedDraftJob = jobsDocumentId === selectedDocumentId ? jobs.find((item) => (item.recipe.task_mode || "draft") === "draft" && item.status !== "cancelled") || null : null;
-  const selectedReviewJob = jobsDocumentId === selectedDocumentId ? jobs.find((item) => item.recipe.task_mode === "review" && item.status !== "cancelled") || null : null;
+  const activeDraftJob = jobsDocumentId === overview?.document.id ? jobs.find((item) => item.status !== "cancelled") || null : null;
   const activeJobId = jobs.find((item) => item.status === "running" || item.status === "pending")?.id || "";
   const draftingCurrentSegment = Boolean(segmentDraft && segmentDraft.segmentId === currentSegment?.id);
   const latestCandidate = candidates.at(-1);
@@ -293,7 +281,7 @@ export default function Home() {
     setSavingBookSettings(true);
     try {
       const updatedProject = await api<Project>(`/projects/${bookSettingsEditor.project.id}/style`, { method: "PATCH", body: JSON.stringify({ style_guide: bookSettingsEditor.style_guide }) });
-      const next = { ...value, draft_model: value.draft_model.trim(), reviewer_model: value.reviewer_model.trim() };
+      const next = { ...value, draft_model: value.draft_model.trim() };
       setBookSettings((current) => ({ ...current, [bookSettingsEditor.document.id]: next }));
       localStorage.setItem(`jieyi.book-settings.${bookSettingsEditor.document.id}`, JSON.stringify(next));
       setProjects((items) => items.map((item) => item.id === updatedProject.id ? updatedProject : item));
@@ -349,7 +337,7 @@ export default function Home() {
     } catch { /* Preserve the previous result while the status panel exposes connection errors. */ }
   }, [overview?.document.id]);
 
-  const openDocument = useCallback(async (document: Document, targetOrdinal?: number) => {
+  const openDocument = useCallback(async (document: Document, targetOrdinal?: number, targetPanel?: "translate" | "quality" | "terms" | "export") => {
     setLoading(true);
     setSelectedDocumentId(document.id);
     try {
@@ -372,7 +360,9 @@ export default function Home() {
       setOverview(summary); setTerms(termItems); setIssues(issueItems); setHumanReviewQueue(reviewItems); setJobs(jobItems); setJobsDocumentId(document.id);
       const remembered = Number(localStorage.getItem(`jieyi.ordinal.${document.id}`) || 0);
       await loadPageAt(document.id, targetOrdinal ?? remembered);
-      setPanel("translate");
+      const rememberedPanel = localStorage.getItem("jieyi.panel");
+      const fallbackPanel: Panel = rememberedPanel && ["translate", "quality", "terms", "export"].includes(rememberedPanel) ? rememberedPanel as Panel : "translate";
+      setPanel(targetPanel ?? fallbackPanel);
     } catch (error) { const message = error instanceof Error ? error.message : "无法打开书籍"; setLibraryError(message); notify(message); }
     finally { setLoading(false); }
   }, [loadAllSegments, loadPageAt, projects, notify]);
@@ -427,65 +417,27 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!epubReader) return;
-    function handleEpubMessage(event: MessageEvent) {
-      const data = event.data as { type?: string; documentId?: string; spineIndex?: number; segmentOrdinal?: number; height?: number; top?: number };
-      if (data?.documentId !== epubReader?.document_id) return;
-      const spineIndex = Number(data.spineIndex);
-      if (!Number.isInteger(spineIndex)) return;
-      const frame = document.querySelector<HTMLIFrameElement>(`iframe[data-spine-index="${spineIndex}"]`);
-      if (!frame || event.source !== frame.contentWindow) return;
-      if (data.type === "jy-epub-location") {
-        const segmentOrdinal = Number(data.segmentOrdinal);
-        const top = Number(data.top);
-        if (!Number.isInteger(segmentOrdinal) || !Number.isFinite(top) || readerPendingOrdinal.current !== segmentOrdinal) return;
-        const root = readerView.current;
-        const section = frame.closest<HTMLElement>(".epub-spine-sheet");
-        if (!root || !section) return;
-        const rootRect = root.getBoundingClientRect();
-        const sectionRect = section.getBoundingClientRect();
-        readerPendingOrdinal.current = null;
-        readerScrollLockOrdinal.current = segmentOrdinal;
-        setReaderOrdinal(segmentOrdinal);
-        root.scrollTo({ top: Math.max(0, root.scrollTop + sectionRect.top - rootRect.top + top - 64), behavior: "smooth" });
-        window.setTimeout(() => {
-          if (readerScrollLockOrdinal.current === segmentOrdinal) readerScrollLockOrdinal.current = null;
-        }, 900);
-        return;
-      }
-      if (data.type !== "jy-epub-resize") return;
-      const reportedHeight = Number(data.height);
-      if (!Number.isFinite(reportedHeight)) return;
-      const height = Math.min(50000, Math.max(96, Math.ceil(reportedHeight)));
-      setEpubSpineHeights((current) =>
-        Math.abs((current[spineIndex] || 0) - height) < 4
-          ? current
-          : { ...current, [spineIndex]: height }
-      );
-    }
-    window.addEventListener("message", handleEpubMessage);
-    return () => window.removeEventListener("message", handleEpubMessage);
-  }, [epubReader]);
-
-  useEffect(() => {
-    if (panel !== "reader" || !readerView.current) return;
     const root = readerView.current;
-    const targets = Array.from(root.querySelectorAll<HTMLElement>("[data-reader-ordinal]"));
-    if (!targets.length) return;
-    const observer = new IntersectionObserver((entries) => {
-      if (readerScrollLockOrdinal.current !== null) return;
-      const visible = entries
-        .filter((entry) => entry.isIntersecting)
-        .sort((left, right) => left.boundingClientRect.top - right.boundingClientRect.top)[0];
-      const target = visible?.target as HTMLElement | undefined;
-      const activeOrdinal = Number(target?.dataset.readerOrdinal);
-      if (Number.isInteger(activeOrdinal)) setReaderOrdinal(activeOrdinal);
-      const pageNumber = Number(target?.dataset.readerPage);
-      if (Number.isInteger(pageNumber) && pageNumber > 0) setReaderCurrentPage(pageNumber);
-    }, { root, rootMargin: "-64px 0px -70% 0px", threshold: 0 });
-    targets.forEach((target) => observer.observe(target));
-    return () => observer.disconnect();
-  }, [epubReader, panel, readerPageTargets, readerSegments]);
+    if (panel !== "reader" || readerLoading || !root) return;
+    const navigation = createReaderNavigation(root, {
+      documentId: epubReader?.document_id,
+      targets: readerPageTargets,
+      onPosition: (position, page) => {
+        setReaderOrdinal(position);
+        if (page !== undefined) setReaderCurrentPage(page);
+      },
+      onHeight: (spineIndex, height) => setEpubSpineHeights((current) =>
+        current[spineIndex] === height ? current : { ...current, [spineIndex]: height }),
+      onPending: setReaderLocating,
+      onUnavailable: () => notify("无法精确定位这一节，已显示所在页面。"),
+    });
+    readerNavigation.current = navigation;
+    if (readerRestoreOrdinal.current !== null) {
+      navigation.goTo(readerRestoreOrdinal.current);
+      readerRestoreOrdinal.current = null;
+    }
+    return () => { navigation.destroy(); readerNavigation.current = null; };
+  }, [epubReader, panel, readerLoading, readerPageTargets, readerSegments, readerMode, readerLayout, notify]);
 
   useEffect(() => {
     if (!activeJobId || !jobsDocumentId) return;
@@ -659,12 +611,13 @@ export default function Home() {
     const document = documentItems.find((item) => item.id === result.documentId); if (document) await openDocument(document, 0);
   }
 
-  async function selectLibraryDocument(document: Document) {
-    setSelectedDocumentId(document.id);
-    try {
-      setJobs(await api<Job[]>("/documents/" + document.id + "/jobs"));
-      setJobsDocumentId(document.id);
-    } catch { setJobs([]); setJobsDocumentId(document.id); }
+  function openWorkspacePanel(target: "translate" | "quality" | "terms") {
+    if (!selectedDocument) return;
+    if (overview?.document.id === selectedDocument.id && page?.document.id === selectedDocument.id && panel !== "reader") {
+      setPanel(target);
+    } else {
+      void openDocument(selectedDocument, panel === "reader" ? readerOrdinal : undefined, target);
+    }
   }
 
   async function openReader(document: Document) {
@@ -676,9 +629,11 @@ export default function Home() {
     setReaderCurrentPage(1);
     setEpubReader(null);
     setReaderSegments([]);
-    readerPendingOrdinal.current = null;
-    readerScrollLockOrdinal.current = null;
+    readerRestoreOrdinal.current = null;
+    setReaderLocating(false);
     localStorage.setItem("jieyi.document", document.id);
+    // Carry the workbench cursor into the reader so both surfaces share one position.
+    const seedOrdinal = overview?.document.id === document.id ? ordinal : 0;
     try {
       const summaryPromise = overview?.document.id === document.id
         ? Promise.resolve(overview)
@@ -689,7 +644,8 @@ export default function Home() {
           api<EpubReaderManifest>("/documents/" + document.id + "/epub"),
         ]);
         setOverview(summary);
-        const startOrdinal = summary.chapters[0]?.start_ordinal || 0;
+        const startOrdinal = seedOrdinal || summary.chapters[0]?.start_ordinal || 0;
+        readerRestoreOrdinal.current = startOrdinal || null;
         setReaderOrdinal(startOrdinal);
         const pageBySpine = new Map(
           manifest.spine.filter((item) => item.linear).map((item, index) => [item.spine_index, index + 1])
@@ -710,7 +666,9 @@ export default function Home() {
         legacySegments.current.set(document.id, items);
         setOverview(summary);
         setReaderSegments(items);
-        setReaderOrdinal(items[0]?.ordinal || 0);
+        const startOrdinal = seedOrdinal || items[0]?.ordinal || 0;
+        readerRestoreOrdinal.current = startOrdinal || null;
+        setReaderOrdinal(startOrdinal);
       }
     } catch (error) {
       notify(error instanceof Error ? error.message : "无法打开阅读模式");
@@ -718,48 +676,8 @@ export default function Home() {
   }
 
   function jumpToReaderChapter(chapter: Chapter) {
-    setReaderOrdinal(chapter.start_ordinal);
-    const pageTarget = readerPageTargets[chapter.start_ordinal];
-    const targetId = pageTarget
-      ? `reader-spine-${pageTarget.spineIndex}`
-      : `reader-segment-${chapter.start_ordinal}`;
-    const target = document.getElementById(targetId);
-    if (!target) { notify("暂时无法定位这一节在原书中的页码。"); return; }
-    if (!pageTarget) {
-      target.scrollIntoView({ behavior: "smooth", block: "start" });
-      return;
-    }
-    setReaderCurrentPage(pageTarget.pageNumber);
-    const frame = target.querySelector<HTMLIFrameElement>("iframe");
-    const fixedLayout = epubReader?.spine.find((item) => item.spine_index === pageTarget.spineIndex)?.fixed_layout;
-    if (!frame || fixedLayout) {
-      target.scrollIntoView({ behavior: "smooth", block: "start" });
-      return;
-    }
-    readerPendingOrdinal.current = chapter.start_ordinal;
-    readerScrollLockOrdinal.current = chapter.start_ordinal;
-    if (frame.dataset.loaded === "true") {
-      requestReaderLocation(frame, chapter.start_ordinal);
-    } else {
-      target.scrollIntoView({ behavior: "auto", block: "start" });
-    }
-    window.setTimeout(() => {
-      if (readerPendingOrdinal.current === chapter.start_ordinal) {
-        readerPendingOrdinal.current = null;
-        if (readerScrollLockOrdinal.current === chapter.start_ordinal) readerScrollLockOrdinal.current = null;
-      }
-    }, 3000);
-  }
-
-  function requestReaderLocation(frame: HTMLIFrameElement, segmentOrdinal: number) {
-    const pageTarget = readerPageTargets[segmentOrdinal];
-    if (!epubReader || !pageTarget) return;
-    frame.contentWindow?.postMessage({
-      type: "jy-epub-locate",
-      documentId: epubReader.document_id,
-      spineIndex: pageTarget.spineIndex,
-      segmentOrdinal,
-    }, "*");
+    if (readerLoading) return;
+    readerNavigation.current?.goTo(chapter.start_ordinal);
   }
 
   function readerOrdinalForSpine(spineIndex: number) {
@@ -768,12 +686,16 @@ export default function Home() {
   }
 
   function changeReaderMode(value: ReaderMode) {
+    if (value === readerMode) return;
+    readerRestoreOrdinal.current = readerOrdinal;
     setEpubSpineHeights({});
     setReaderMode(value);
     localStorage.setItem("jieyi.reader.mode", value);
   }
 
   function changeReaderLayout(value: ReaderLayout) {
+    if (value === readerLayout) return;
+    readerRestoreOrdinal.current = readerOrdinal;
     setEpubSpineHeights({});
     setReaderLayout(value);
     localStorage.setItem("jieyi.reader.layout", value);
@@ -808,11 +730,11 @@ export default function Home() {
   }
 
   async function draftCurrentSegment() {
-    if (!overview || !currentSegment || segmentDraft || wholeBookAction || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving") return;
+    if (!overview || !currentSegment || segmentDraft || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving") return;
     const target = { documentId: overview.document.id, segmentId: currentSegment.id, ordinal: currentSegment.ordinal, jobId: "" };
     setSegmentDraft(target);
     try {
-      const job = await runWholeBook(overview.document, "draft", [[target.ordinal, target.ordinal]]);
+      const job = await runWholeBook(overview.document, [[target.ordinal, target.ordinal]]);
       setSegmentDraft(job ? { ...target, jobId: job.id } : null);
     } catch (error) {
       setSegmentDraft(null);
@@ -820,17 +742,15 @@ export default function Home() {
     }
   }
 
-  async function runWholeBook(document: Document, mode: "draft" | "review", segmentRanges: [number, number][] = []) {
-    if (wholeBookAction) return;
+  async function runWholeBook(document: Document, segmentRanges: [number, number][] = []) {
+    if (startingTask) return;
     const normalizedRanges = normalizeSegmentRanges(segmentRanges);
-    const singleOrdinal = mode === "draft" && normalizedRanges.length === 1 && normalizedRanges[0][0] === normalizedRanges[0][1] ? normalizedRanges[0][0] : null;
+    const singleOrdinal = normalizedRanges.length === 1 && normalizedRanges[0][0] === normalizedRanges[0][1] ? normalizedRanges[0][0] : null;
     const providerSettings = settings || await api<ProviderSettings>("/settings/provider").catch(() => null);
     if (!providerSettings) { setPanel("settings"); notify("请先配置并测试草译模型。"); return; }
     const bookConfig = settingsForBook(document.id, providerSettings);
     const draftProfile = providerSettings.profiles.find((item) => item.id === bookConfig.draft_profile_id);
-    const reviewerProfile = providerSettings.profiles.find((item) => item.id === bookConfig.reviewer_profile_id);
     if (!draftProfile?.base_url || !bookConfig.draft_model) { openBookSettings(document); notify("请先为这本书选择草译连接与模型。"); return; }
-    if (mode === "review" && (!reviewerProfile?.base_url || !bookConfig.reviewer_model)) { openBookSettings(document); notify("审校前，请先为这本书选择审校连接与模型。"); return; }
     const currentSettings: ProviderSettings = {
       ...providerSettings,
       base_url: draftProfile.base_url,
@@ -838,38 +758,32 @@ export default function Home() {
       draft_provider: `profile:${bookConfig.draft_profile_id}`,
       draft_model: bookConfig.draft_model,
       draft_compute_mode: bookConfig.draft_compute_mode,
-      reviewer_profile_id: bookConfig.reviewer_profile_id,
-      reviewer_provider: `profile:${bookConfig.reviewer_profile_id}`,
-      reviewer_model: bookConfig.reviewer_model,
-      reviewer_compute_mode: bookConfig.reviewer_compute_mode,
-      review_enabled: Boolean(bookConfig.reviewer_model),
     };
-    setWholeBookAction(mode);
+    setStartingTask(true);
     try {
       const existingJobs = await api<Job[]>("/documents/" + document.id + "/jobs");
-      let job = existingJobs.find((item) => ["pending", "running", "paused", "failed"].includes(item.status) && jobMatchesSettings(item, currentSettings, mode, normalizedRanges));
+      let job = existingJobs.find((item) => ["pending", "running", "paused", "failed"].includes(item.status) && jobMatchesSettings(item, currentSettings, normalizedRanges));
       if (!job) {
         job = await api<Job>("/documents/" + document.id + "/jobs", { method: "POST", body: JSON.stringify({
-          draft_provider: currentSettings.draft_provider || "openai-compatible", draft_model: currentSettings.draft_model, task_mode: mode,
-          reviewer_provider: mode === "review" ? (currentSettings.reviewer_provider || currentSettings.draft_provider || "openai-compatible") : null,
-          reviewer_model: mode === "review" ? currentSettings.reviewer_model : null,
-          review_policy: mode === "review" ? "all" : "never",
+          draft_provider: currentSettings.draft_provider || "openai-compatible", draft_model: currentSettings.draft_model,
           batch_size: singleOrdinal !== null ? 1 : 10, concurrency: singleOrdinal !== null ? 1 : 3, max_concurrency: singleOrdinal !== null ? 1 : 5, max_batch_chars: 4000,
-          draft_thinking: currentSettings.draft_compute_mode !== "economy", review_thinking: currentSettings.reviewer_compute_mode !== "economy",
-          draft_compute_mode: currentSettings.draft_compute_mode, review_compute_mode: currentSettings.reviewer_compute_mode, review_sample_rate: 0,
+          draft_thinking: currentSettings.draft_compute_mode !== "economy",
+          draft_compute_mode: currentSettings.draft_compute_mode,
           max_output_tokens: 6000, token_budget: 2000000, segment_ranges: normalizedRanges,
         }) });
       }
       const started = await api<Job>("/jobs/" + job.id + "/start", { method: "POST" });
       setJobs([started, ...existingJobs.filter((item) => item.id !== started.id)]);
       setJobsDocumentId(document.id);
-      if (mode === "draft") setDraftPicker(null);
-      notify(mode === "draft"
-        ? singleOrdinal !== null ? `正在草译第 ${singleOrdinal + 1} 段。` : normalizedRanges.length ? "已启动所选范围的草译，共 " + normalizedRanges.reduce((total, range) => total + range[1] - range[0] + 1, 0) + " 段；已有译文的段落会自动跳过。" : "全书草译已在后台启动；已有译文的段落会自动跳过。"
-        : "全量独立审校已在后台启动；审校 AI 会逐段对照原文，人工抽检队列将在完成后生成。");
+      setDraftPicker(null);
+      notify(singleOrdinal !== null
+        ? `正在草译第 ${singleOrdinal + 1} 段。`
+        : normalizedRanges.length
+          ? "已启动所选范围的草译，共 " + normalizedRanges.reduce((total, range) => total + range[1] - range[0] + 1, 0) + " 段；已有译文的段落会自动跳过。"
+          : "全书草译已在后台启动；已有译文的段落会自动跳过。");
       return started;
-    } catch (error) { notify(error instanceof Error ? error.message : mode === "draft" ? "草译启动失败" : "全书审校启动失败"); }
-    finally { setWholeBookAction(null); }
+    } catch (error) { notify(error instanceof Error ? error.message : "草译启动失败"); }
+    finally { setStartingTask(false); }
   }
 
   async function controlJob(job: Job, action: "pause" | "cancel") {
@@ -902,11 +816,15 @@ export default function Home() {
   }
 
   useEffect(() => {
+    if (["translate", "reader", "quality", "terms", "export"].includes(panel)) localStorage.setItem("jieyi.panel", panel);
+  }, [panel]);
+
+  useEffect(() => {
     function keydown(event: KeyboardEvent) {
       const command = event.metaKey || event.ctrlKey;
       if (command && event.key.toLowerCase() === "k") { event.preventDefault(); setSearchOpen(true); window.setTimeout(() => searchInput.current?.focus(), 30); }
       if (command && event.key === "Enter" && panel === "translate") { event.preventDefault(); void confirmCurrent(); }
-      if (event.key === "Escape") setSearchOpen(false);
+      if (event.key === "Escape") { setSearchOpen(false); setTaskMenu(false); }
     }
     window.addEventListener("keydown", keydown); return () => window.removeEventListener("keydown", keydown);
   });
@@ -918,47 +836,60 @@ export default function Home() {
     <section className={`workspace-window ${!sidebarOpen ? "sidebar-closed" : ""} ${!inspectorOpen || panel !== "translate" ? "inspector-closed" : ""}`} aria-label="介译翻译工作台">
       <header className="titlebar">
         <div className="titlebar-start"><div className="traffic-lights" aria-hidden="true"><span className="traffic red" /><span className="traffic yellow" /><span className="traffic green" /></div><button className="icon-button sidebar-toggle" aria-label="切换侧栏" onClick={() => setSidebarOpen((value) => !value)}><Mark>▥</Mark></button></div>
-        <div className="document-title"><strong>{panel === "library" ? "我的书库" : panel === "import" ? "导入书籍" : panel === "settings" ? "模型配置" : activeDocument?.title || "介译"}</strong><span>{panel === "translate" ? `${currentChapter?.title || "正文"} · ${saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : "已保存"}` : panel === "reader" ? `原书排版阅读 · ${readerMode === "original" ? "原版" : readerMode === "translated" ? "仅译文" : "双语对照"}` : overview?.project.name || "本地翻译工作台"}</span></div>
-        <div className="titlebar-actions"><button className="icon-button" aria-label="全文搜索" onClick={() => setSearchOpen(true)}><Mark>⌕</Mark><kbd>⌘K</kbd></button><button className="icon-button theme-toggle" title={dark ? "切换到日间模式" : "切换到夜览模式"} aria-label={dark ? "切换到日间模式" : "切换到夜览模式"} aria-pressed={dark} onClick={changeDark}><ThemeIcon dark={dark} /></button>{panel === "translate" && <button className={"primary-button " + (latestJob?.status === "running" ? "running" : "")} onClick={() => activeDocument && void openDraftPicker(activeDocument)} disabled={!activeDocument || wholeBookAction !== null || draftPickerLoading || latestJob?.status === "running"}>{draftPickerLoading ? "正在读取目录…" : latestJob?.status === "running" ? "篇章草译运行中" : "选择篇章草译"}</button>}</div>
+        <div className="document-title"><strong>{panel === "library" ? "我的书库" : panel === "import" ? "导入书籍" : panel === "settings" ? "模型配置" : panel === "export" ? "导出书籍" : activeDocument?.title || "介译"}</strong><span>{panel === "translate" ? currentChapter?.title || "正文" : panel === "reader" ? `原书排版阅读 · ${readerMode === "original" ? "原文" : readerMode === "translated" ? "译文" : "双语"}` : overview?.project.name || "本地翻译工作台"}</span></div>
+        <div className="titlebar-actions"><button className="icon-button" aria-label="全文搜索" onClick={() => setSearchOpen(true)}><Mark>⌕</Mark><kbd>⌘K</kbd></button><button className="icon-button theme-toggle" title={dark ? "切换到日间模式" : "切换到夜览模式"} aria-label={dark ? "切换到日间模式" : "切换到夜览模式"} aria-pressed={dark} onClick={changeDark}><ThemeIcon dark={dark} /></button></div>
         {latestJob?.status === "running" && <div className="title-progress indeterminate" />}
       </header>
 
       <div className="workspace-grid">
-        <aside className="sidebar"><div className="sidebar-scroll"><div className="eyebrow">工作空间</div><nav aria-label="工作空间">
+        <aside className="sidebar"><div className="sidebar-scroll"><div className="eyebrow">工作空间</div><nav aria-label="全局导航">
           <button className={`nav-item ${panel === "library" ? "active" : ""}`} onClick={() => setPanel("library")}><Mark><LibraryIcon /></Mark>书库 <b>{documents.length}</b></button>
-          <button className={`nav-item ${panel === "translate" ? "active" : ""}`} disabled={!overview} onClick={() => { if (panel === "reader" && overview?.document) void openDocument(overview.document, readerOrdinal); else setPanel("translate"); }}><Mark><TranslationIcon /></Mark>翻译</button>
-          <button className={"nav-item " + (panel === "reader" ? "active" : "")} disabled={!overview} onClick={() => overview?.document && void openReader(overview.document)}><Mark>☷</Mark>阅读</button>
-          <button className={`nav-item ${panel === "quality" ? "active" : ""}`} disabled={!overview} onClick={() => setPanel("quality")}><Mark>◉</Mark>审校 {errorIssues.length > 0 && <b className="issue-count">{errorIssues.length}</b>}</button>
-          <button className={`nav-item ${panel === "terms" ? "active" : ""}`} disabled={!overview} onClick={() => setPanel("terms")}><Mark>⌁</Mark>术语库 <b>{terms.length}</b></button>
-          <div className="nav-separator" /><button className={`nav-item ${panel === "import" ? "active" : ""}`} onClick={() => setPanel("import")}><Mark>⇧</Mark>导入书籍</button><button className={`nav-item ${panel === "settings" ? "active" : ""}`} onClick={() => setPanel("settings")}><Mark>⚙</Mark>模型配置</button>
+          <button className={`nav-item ${panel === "import" ? "active" : ""}`} onClick={() => setPanel("import")}><Mark>⇧</Mark>导入书籍</button>
+          <button className={`nav-item ${panel === "settings" ? "active" : ""}`} onClick={() => setPanel("settings")}><Mark>⚙</Mark>模型配置</button>
         </nav>
-        {overview && <><div className="eyebrow section-label">
+        {selectedDocument && <><div className="eyebrow section-label"><span className="current-book-name">{selectedDocument.title}</span><button aria-label="翻译设置" title="翻译设置" onClick={() => openBookSettings(selectedDocument)}><Mark>⚙</Mark></button></div><nav aria-label="当前书">
+          <button className={`nav-item ${panel === "translate" ? "active" : ""}`} disabled={loading} onClick={() => openWorkspacePanel("translate")}><Mark><TranslationIcon /></Mark>翻译</button>
+          <button className={"nav-item " + (panel === "reader" ? "active" : "")} disabled={readerLoading} onClick={() => void openReader(selectedDocument)}><Mark>☷</Mark>阅读</button>
+          <button className={`nav-item ${panel === "quality" ? "active" : ""}`} disabled={loading} onClick={() => openWorkspacePanel("quality")}><Mark>◉</Mark>审校 {overview?.document.id === selectedDocumentId && errorIssues.length > 0 && <b className="issue-count">{errorIssues.length}</b>}</button>
+          <button className={`nav-item ${panel === "terms" ? "active" : ""}`} disabled={loading} onClick={() => openWorkspacePanel("terms")}><Mark>⌁</Mark>术语库 {overview?.document.id === selectedDocumentId && <b>{terms.length}</b>}</button>
+          <button className={`nav-item ${panel === "export" ? "active" : ""}`} onClick={() => setPanel("export")}><Mark>⇩</Mark>导出</button>
+        </nav></>}
+        {selectedJob && <details className="workspace-job"><summary><span>当前任务</span><strong>{jobStatusLabel(selectedJob.status, selectedJob.deferred_segments)}</strong></summary>{selectedJob && <div className={"job-progress-card status-" + selectedJob.status}><div className="job-progress-head"><div><span>{selectedJob.recipe.segment_ranges?.length ? "篇章草译" : "全书草译"}</span><strong>{jobStatusLabel(selectedJob.status, selectedJob.deferred_segments)}</strong></div><small>{selectedJob.processed_segments ?? selectedJob.next_ordinal} / {selectedJob.total_segments ?? "—"} 段</small></div><div className="job-progress-track"><span style={{ width: String(Math.min(100, Math.round(((selectedJob.processed_segments ?? selectedJob.next_ordinal) / Math.max(1, selectedJob.total_segments || 1)) * 100))) + "%" }} /></div><div className="job-metrics"><span><b>{selectedJob.batch_count || 0}</b> 批</span><span><b>{formatTokens(selectedJob.total_tokens)}</b> token</span><span><b>{formatTokens(selectedJob.reasoning_tokens)}</b> 推理</span>{Boolean(selectedJob.deferred_segments) && <span><b>{selectedJob.deferred_segments}</b> 隔离待复核</span>}<span><b>{formatDuration(selectedJob.eta_seconds)}</b> 预计剩余</span></div><p>{`单段隔离、${selectedJob.recipe.concurrency || 3}→${selectedJob.recipe.max_concurrency || selectedJob.recipe.concurrency || 3} 路自适应并发；异常段不会覆盖正文。`}</p>{selectedJob.last_error && <div className="job-progress-error">{selectedJob.last_error}</div>}<div className="job-controls">{selectedJob.status === "running" && <button onClick={() => void controlJob(selectedJob, "pause")}>暂停</button>}{(selectedJob.status === "paused" || selectedJob.status === "failed") && selectedDocument && <button className="accent" onClick={() => void runWholeBook(selectedDocument, selectedJob.recipe.segment_ranges || [])}>继续</button>}{!["completed", "cancelled"].includes(selectedJob.status) && <button className="danger" onClick={() => void controlJob(selectedJob, "cancel")}>取消任务</button>}</div></div>}</details>}
+
+        {overview && overview.document.id === selectedDocumentId && ["translate", "reader", "quality"].includes(panel) && <><div className="eyebrow section-label">
           <span>目录</span><small>{overview.chapters.length} 节</small></div><div className="chapter-list real-chapters">{overview.chapters.map((chapter, index) => <button key={`${chapter.start_ordinal}-${chapter.level}-${chapter.title}`} data-level={chapter.level} style={{ paddingLeft: `${9 + Math.min(chapter.level, 3) * 12}px` }} className={`chapter ${currentChapter?.start_ordinal === chapter.start_ordinal ? "active" : ""}`}
+          aria-current={currentChapter?.start_ordinal === chapter.start_ordinal ? "location" : undefined} disabled={panel === "reader" && readerLoading}
           onClick={() => { if (panel === "reader") jumpToReaderChapter(chapter); else void navigateTo(chapter.start_ordinal); }}
           title={panel === "reader" && readerPageTargets[chapter.start_ordinal] ? `${chapter.title} · 第 ${readerPageTargets[chapter.start_ordinal].pageNumber} 页` : chapter.title}><span>{String(index + 1).padStart(2, "0")}</span>
           <div><strong>{chapter.title}</strong>
             <small>{panel === "reader" && readerPageTargets[chapter.start_ordinal] ? `第 ${readerPageTargets[chapter.start_ordinal].pageNumber} 页 · ${chapter.segment_count} 段` : `${chapter.confirmed_count} 已确认 · ${chapter.segment_count} 段`}</small>
           </div>
         </button>)}</div></>}
-        </div>{overview && <div className="project-progress"><div><span>人工确认</span><strong>{completion}%</strong></div><div className="progress-track"><span style={{ width: `${completion}%` }} /></div><small>草译 {overview.translated_count} / {overview.segment_count} · {translationProgress}%</small></div>}</aside>
+        </div>{overview && overview.document.id === selectedDocumentId && panel !== "library" && <div className="project-progress"><div><span>人工确认</span><strong>{completion}%</strong></div><div className="progress-track"><span style={{ width: `${completion}%` }} /></div><small>草译 {overview.translated_count} / {overview.segment_count} · {translationProgress}%</small></div>}</aside>
 
         {panel === "library" && <section className="library-view book-library">
-          {selectedDocument && <div className="library-quick-actions"><span>{settings ? <>本书草译模型：<strong>{settingsForBook(selectedDocument.id, settings).draft_model || "未选择"}</strong> · 可与其他书使用不同模型同时运行</> : "当前书籍可单独配置翻译风格与模型。"}</span><button onClick={() => openBookSettings(selectedDocument)}>翻译设置</button><a href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book`} download={exportName(selectedDocument)}>一键导出译后书籍</a></div>}
           <div className="library-header"><div><span className="page-kicker">本机项目</span><h1>我的书库</h1><p>{documents.length ? "共 " + projects.length + " 个项目、" + documents.length + " 本书或文档。" : "导入第一本书，开始可追溯的长文本翻译。"}</p></div><button className="primary-button" onClick={() => setPanel("import")}>＋ 导入书籍</button></div>
           {libraryError && <div className="library-error"><i>!</i><span><strong>书籍打开失败</strong><small>{libraryError}</small></span><button onClick={() => void loadLibrary()}>重新连接</button></div>}
-          {selectedDocument && <><div className="book-actions" aria-label="所选书目操作"><div><span>已选中</span><strong>《{selectedDocument.title}》</strong></div><button onClick={() => void openDocument(selectedDocument)}>打开工作台</button><button onClick={() => void openReader(selectedDocument)} disabled={readerLoading}>{readerLoading ? "正在载入…" : "阅读整本"}</button><button className="accent" onClick={() => void openDraftPicker(selectedDocument)} disabled={wholeBookAction !== null || draftPickerLoading || selectedDraftJob?.status === "running"}>{draftPickerLoading ? "正在读取目录…" : selectedDraftJob?.status === "running" ? "草译运行中" : "选择篇章草译"}</button><button onClick={() => void runWholeBook(selectedDocument, "review")} disabled={wholeBookAction !== null || selectedReviewJob?.status === "running"}>{wholeBookAction === "review" ? "正在启动…" : selectedReviewJob?.status === "paused" || selectedReviewJob?.status === "failed" ? "继续全量审校" : selectedReviewJob?.status === "running" ? "审校运行中" : "全量独立审校"}</button><button className="danger" onClick={() => setPendingDelete(selectedDocument)}>删除</button></div>{selectedJob && <div className={"job-progress-card status-" + selectedJob.status}><div className="job-progress-head"><div><span>{selectedJob.recipe.task_mode === "review" ? "全量独立审校" : selectedJob.recipe.segment_ranges?.length ? "篇章草译" : "全书草译"}</span><strong>{jobStatusLabel(selectedJob.status, selectedJob.deferred_segments)}</strong></div><small>{selectedJob.processed_segments ?? selectedJob.next_ordinal} / {selectedJob.total_segments ?? "—"} 段</small></div><div className="job-progress-track"><span style={{ width: String(Math.min(100, Math.round(((selectedJob.processed_segments ?? selectedJob.next_ordinal) / Math.max(1, selectedJob.total_segments || 1)) * 100))) + "%" }} /></div><div className="job-metrics"><span><b>{selectedJob.batch_count || 0}</b> 批</span><span><b>{formatTokens(selectedJob.total_tokens)}</b> token</span><span><b>{formatTokens(selectedJob.reasoning_tokens)}</b> 推理</span>{Boolean(selectedJob.deferred_segments) && <span><b>{selectedJob.deferred_segments}</b> 隔离待复核</span>}<span><b>{formatDuration(selectedJob.eta_seconds)}</b> 预计剩余</span></div><p>{selectedJob.recipe.task_mode === "review" ? "审校 AI 逐段独立对照原文；清晰问题直接修订，未解决的确定性风险进入人工必检队列。" : `单段隔离、${selectedJob.recipe.concurrency || 3}→${selectedJob.recipe.max_concurrency || selectedJob.recipe.concurrency || 3} 路自适应并发；异常段不会覆盖正文。`}</p>{selectedJob.last_error && <div className="job-progress-error">{selectedJob.last_error}</div>}<div className="job-controls">{selectedJob.status === "running" && <button onClick={() => void controlJob(selectedJob, "pause")}>暂停</button>}{(selectedJob.status === "paused" || selectedJob.status === "failed") && selectedDocument && <button className="accent" onClick={() => void runWholeBook(selectedDocument, selectedJob.recipe.task_mode === "review" ? "review" : "draft", selectedJob.recipe.segment_ranges || [])}>继续</button>}{!["completed", "cancelled"].includes(selectedJob.status) && <button className="danger" onClick={() => void controlJob(selectedJob, "cancel")}>取消任务</button>}</div></div>}</>}
-          {loading ? <div className="empty-workspace">正在读取书库…</div> : documents.length === 0 ? <div className="empty-workspace"><Mark>▦</Mark><h2>书库还是空的</h2><p>支持 EPUB、TXT 与 Markdown，原文保存在本机数据库。</p><button className="blue-action" onClick={() => setPanel("import")}>导入第一本书</button></div> : <div className="book-grid">{documents.map((document) => { const project = projects.find((item) => item.id === document.project_id); return <button key={document.id} className={"book-card " + (selectedDocumentId === document.id ? "active" : "")} aria-pressed={selectedDocumentId === document.id} onClick={() => void selectLibraryDocument(document)}><i className={document.cover_url ? "has-cover" : ""}>{document.cover_url ? <img src={API_BASE + document.cover_url} alt={`《${document.title}》封面`} loading="lazy" referrerPolicy="no-referrer" /> : document.source_format.toUpperCase()}</i><div><span>{project?.name}</span><strong>{document.title}</strong><small>{project?.source_lang} → {project?.target_lang} · 导入于 {new Date(document.created_at).toLocaleDateString()}</small></div><Mark>{selectedDocumentId === document.id ? "✓" : "›"}</Mark></button>; })}</div>}
+          {loading ? <div className="empty-workspace">正在读取书库…</div> : documents.length === 0 ? <div className="empty-workspace"><Mark>▦</Mark><h2>书库还是空的</h2><p>支持 EPUB、TXT 与 Markdown，原文保存在本机数据库。</p><button className="blue-action" onClick={() => setPanel("import")}>导入第一本书</button></div> : <div className="book-grid">{documents.map((document) => { const project = projects.find((item) => item.id === document.project_id); return <button key={document.id} className={"book-card " + (selectedDocumentId === document.id ? "active" : "")} aria-pressed={selectedDocumentId === document.id} onClick={() => void openDocument(document)}><i className={document.cover_url ? "has-cover" : ""}>{document.cover_url ? <img src={API_BASE + document.cover_url} alt={`《${document.title}》封面`} loading="lazy" referrerPolicy="no-referrer" /> : document.source_format.toUpperCase()}</i><div><span>{project?.name}</span><strong>{document.title}</strong><small>{project?.source_lang} → {project?.target_lang} · 导入于 {new Date(document.created_at).toLocaleDateString()}</small></div><span className="book-card-aside"><span role="button" tabIndex={0} className="book-card-delete" aria-label={`删除《${document.title}》`} onClick={(event) => { event.stopPropagation(); setPendingDelete(document); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.stopPropagation(); setPendingDelete(document); } }}>×</span><Mark>{selectedDocumentId === document.id ? "✓" : "›"}</Mark></span></button>; })}</div>}
         </section>}
 
-        {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><a className="export-link" href={`${API_BASE}/documents/${overview?.document.id}/export?bilingual=true`} download={`${overview?.document.title || "jieyi"}-双语.txt`}>导出双语</a><div className="segmented" aria-label="编辑器视图"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>对照</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
-          <div className={`editor-columns ${view === "target" ? "target-only" : ""}`}>{view === "split" && <article className={`source-pane content-${currentSegment.kind}`}><div className="column-label"><span>原文 · {overview?.project.source_lang.toUpperCase()}</span><button onClick={() => navigator.clipboard?.writeText(currentSegment.source_text).then(() => notify("原文已复制"))}>复制</button></div>{currentSegment.kind === "heading" ? <h2>{currentSegment.source_text}</h2> : <p>{currentSegment.source_text}</p>}<div className="context-note"><Mark>¶</Mark><div><strong>结构位置</strong><span>{currentSegment.heading_path || "正文"}</span></div></div></article>}<article className="translation-pane"><div className="column-label"><span>译文 · {overview?.project.target_lang}</span><div className={`draft-state ${currentStatus === "human_confirmed" ? "confirmed" : ""}`}><i />{statusLabel(currentSegment)}</div></div><textarea aria-label="译文编辑器" readOnly={draftingCurrentSegment} aria-busy={draftingCurrentSegment} value={translation} onChange={(event) => { setTranslation(event.target.value); setDraftDirty(true); setSaveState("idle"); }} placeholder={currentStatus === "source" ? "等待模型草译，或直接输入人工译文…" : "编辑译文…"} spellCheck={false} /><div className="editor-footer"><span>{translation.length} 字 · {saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : draftDirty ? "待保存" : "已保存"}</span><div className="editor-footer-actions"><button className="segment-draft-button" onClick={() => void draftCurrentSegment()} disabled={segmentDraft !== null || wholeBookAction !== null || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} title={hasCurrentTranslation ? "本段已有译文" : currentDocumentBusy ? "请等待当前任务完成" : "使用本书模型草译当前段落"} aria-busy={draftingCurrentSegment}>{draftingCurrentSegment ? "草译中…" : "草译本段"}</button><button className="confirm-button" onClick={() => void confirmCurrent()} disabled={!translation.trim() || saveState === "saving"}>{currentStatus === "human_confirmed" ? "更新确认" : "确认译文"}<kbd>⌘↵</kbd></button></div></div></article></div></>}</section>}
+        {panel === "export" && <section className="library-view export-view">
+          <div className="library-header"><div><span className="page-kicker">当前书籍</span><h1>导出书籍</h1><p>{selectedDocument ? `《${selectedDocument.title}》` : "请先在书库选择一本书。"}</p></div></div>
+          {selectedDocument && <><fieldset className="export-options"><legend>选择导出内容</legend>
+            <label aria-label="仅译文" htmlFor="export-translated" className={!exportBilingual ? "selected" : ""}><input id="export-translated" type="radio" name="book-export-mode" checked={!exportBilingual} onChange={() => setExportBilingual(false)} /><span><strong>仅译文</strong><small>只包含译文，适合连续阅读。</small></span></label>
+            <label aria-label="原文译文对照" htmlFor="export-bilingual" className={exportBilingual ? "selected" : ""}><input id="export-bilingual" type="radio" name="book-export-mode" checked={exportBilingual} onChange={() => setExportBilingual(true)} /><span><strong>原文译文对照</strong><small>逐段保留原文与译文，方便对照阅读。</small></span></label>
+          </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
+        </section>}
 
-        {panel === "reader" && <section ref={readerView} className="reader-view" aria-label="原书排版阅读模式">
+        {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
+          <div className={`editor-columns ${view === "target" ? "target-only" : ""}`}>{view === "split" && <article className={`source-pane content-${currentSegment.kind}`}><div className="column-label"><span>原文 · {overview?.project.source_lang.toUpperCase()}</span><button onClick={() => navigator.clipboard?.writeText(currentSegment.source_text).then(() => notify("原文已复制"))}>复制</button></div>{currentSegment.kind === "heading" ? <h2>{currentSegment.source_text}</h2> : <p>{currentSegment.source_text}</p>}<div className="context-note"><Mark>¶</Mark><div><strong>结构位置</strong><span>{currentSegment.heading_path || "正文"}</span></div></div></article>}<article className="translation-pane"><div className="column-label"><span>译文 · {overview?.project.target_lang}</span><div className={`draft-state ${currentStatus === "human_confirmed" ? "confirmed" : ""}`}><i />{statusLabel(currentSegment)}</div></div><textarea aria-label="译文编辑器" readOnly={draftingCurrentSegment} aria-busy={draftingCurrentSegment} value={translation} onChange={(event) => { setTranslation(event.target.value); setDraftDirty(true); setSaveState("idle"); }} placeholder={currentStatus === "source" ? "等待模型草译，或直接输入人工译文…" : "编辑译文…"} spellCheck={false} /><div className="editor-footer"><span>{translation.length} 字 · {draftingCurrentSegment ? "正在草译本段…" : saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : draftDirty ? "待保存" : "已保存"}</span><div className="editor-footer-actions"><button className="confirm-button" onClick={() => void confirmCurrent()} disabled={!translation.trim() || saveState === "saving"}>{currentStatus === "human_confirmed" ? "更新确认" : "确认译文"}<kbd>⌘↵</kbd></button></div></div></article></div></>}</section>}
+
+        {panel === "reader" && <section ref={readerView} className="reader-view" aria-label="原书排版阅读模式" tabIndex={-1}>
           <div className="reader-toolbar"><div>
-            <span>{epubReader ? `第 ${readerCurrentPage} / ${epubReader.spine.filter((item) => item.linear).length} 页` : "全文阅读"}</span>
-            <strong>{epubReader ? `${epubReader.spine.filter((item) => item.linear).length} 个书脊文档` : `${readerSegments.length} 段`} · {overview?.translated_count || 0} 段已有译文</strong></div>
+            <span aria-live="polite">{readerLocating ? "正在定位章节…" : epubReader ? `第 ${readerCurrentPage} / ${epubReader.spine.filter((item) => item.linear).length} 页` : "全文阅读"}</span>
+            <strong>{currentChapter?.title || (epubReader ? `${epubReader.spine.filter((item) => item.linear).length} 个书脊文档` : `${readerSegments.length} 段`)}</strong></div>
             <div className="reader-toolbar-actions">
-              <button onClick={() => overview?.document && void openDocument(overview.document, readerOrdinal)}>返回工作台</button>{epubReader?.spine.some((item) => item.fixed_layout) && <div className="segmented" aria-label="定版 EPUB 排版策略"><button className={readerLayout === "faithful" ? "active" : ""} onClick={() => changeReaderLayout("faithful")}>忠实排版</button><button className={readerLayout === "comfort" ? "active" : ""} onClick={() => changeReaderLayout("comfort")}>舒适阅读</button></div>}<div className="segmented" aria-label="阅读语言显示"><button className={readerMode === "original" ? "active" : ""} onClick={() => changeReaderMode("original")}>原版</button><button className={readerMode === "translated" ? "active" : ""} onClick={() => changeReaderMode("translated")}>仅译文</button><button className={readerMode === "bilingual" ? "active" : ""} onClick={() => changeReaderMode("bilingual")}>双语对照</button></div></div></div>
+              {epubReader?.spine.some((item) => item.fixed_layout) && <div className="segmented" aria-label="定版 EPUB 排版策略"><button className={readerLayout === "faithful" ? "active" : ""} onClick={() => changeReaderLayout("faithful")}>忠实排版</button><button className={readerLayout === "comfort" ? "active" : ""} onClick={() => changeReaderLayout("comfort")}>舒适阅读</button></div>}<div className="segmented" aria-label="显示"><button className={readerMode === "original" ? "active" : ""} onClick={() => changeReaderMode("original")}>原文</button><button className={readerMode === "translated" ? "active" : ""} onClick={() => changeReaderMode("translated")}>译文</button><button className={readerMode === "bilingual" ? "active" : ""} onClick={() => changeReaderMode("bilingual")}>双语</button></div></div></div>
           {readerLoading ? <div className="empty-workspace">正在准备原书资源…</div> : epubReader ? <div className={`epub-reader-stack layout-${readerLayout}`}>{epubReader.cover_url && <section className="epub-cover-sheet"><img src={API_BASE + epubReader.cover_url} alt={`《${overview?.document.title || "EPUB"}》封面`} /></section>}
             {epubReader.spine.filter((item) => item.linear).map((item, index) =>
               <section id={`reader-spine-${item.spine_index}`} data-reader-ordinal={readerOrdinalForSpine(item.spine_index)} data-reader-page={index + 1} className={`epub-spine-sheet ${item.fixed_layout ? "fixed-layout" : "reflowable"}`} key={item.spine_index}>
@@ -966,12 +897,7 @@ export default function Home() {
                   key={`${item.spine_index}-${readerMode}-${readerLayout}`}
                   data-spine-index={item.spine_index}
                   loading={index < 2 ? "eager" : "lazy"}
-                  onLoad={(event) => {
-                    const frame = event.currentTarget;
-                    frame.dataset.loaded = "true";
-                    const pendingOrdinal = readerPendingOrdinal.current;
-                    if (pendingOrdinal !== null && readerPageTargets[pendingOrdinal]?.spineIndex === item.spine_index) requestReaderLocation(frame, pendingOrdinal);
-                  }}
+                  onLoad={(event) => readerNavigation.current?.frameLoaded(event.currentTarget)}
                   sandbox="allow-scripts"
                   referrerPolicy="no-referrer"
                   style={!item.fixed_layout ? { height: `${epubSpineHeights[item.spine_index] || 96}px` } : undefined}
@@ -981,26 +907,25 @@ export default function Home() {
               id={"reader-segment-" + segment.ordinal} data-reader-ordinal={segment.ordinal} className={"reader-block reader-" + segment.kind} key={segment.id}>{readerMode !== "translated" && <div className="reader-source"><small>原文</small>{segment.kind === "heading" ? <h2>{segment.source_text}</h2> : <p>{segment.source_text}</p>}</div>}{readerMode !== "original" && <div className={"reader-target " + (!target ? "missing" : "")}><small>{segment.status === "human_confirmed" ? "译文 · 已确认" : "译文"}</small>{segment.kind === "heading" ? <h2>{target || "本节尚未草译"}</h2> : <p>{target || "本段尚未草译"}</p>}</div>}</section>; })}</article>}
         </section>}
 
-        {panel === "terms" && overview && <section className="library-view"><div className="library-header"><div><span className="page-kicker">翻译约束</span><h1>术语库</h1><p>当前项目共有 {terms.length} 条术语约束；固定译法按词组检查；语境译法先逐处判定义项，再检查译文。</p></div></div><TermDiscoveryPanel documentId={overview.document.id} provider={settings?.draft_provider || ""} model={settings?.draft_model || ""} computeMode={settings?.draft_compute_mode || "balanced"} onApproved={(term) => setTerms((items) => [...items, term].sort((left, right) => left.source.localeCompare(right.source)))} notify={notify} /><form className="term-create" onSubmit={(event) => void addTerm(event)}><label><span>规范源词</span><input value={termSource} onChange={(event) => setTermSource(event.target.value)} placeholder="例如 bank" /></label><label><span>批准译法</span><input value={termTarget} onChange={(event) => setTermTarget(event.target.value)} placeholder="例如 银行" /></label><label><span>同义词 / 变体</span><input value={termAliases} onChange={(event) => setTermAliases(event.target.value)} placeholder="逗号分隔，例如 banking institution" /></label><label><span>适用范围</span><select value={termEnforcement} onChange={(event) => setTermEnforcement(event.target.value)}><option value="contextual">按语境采用此译法</option><option value="global">所有用法均采用此译法</option></select></label><label><span>语境关键词（仅作提示）</span><input value={termContext} onChange={(event) => setTermContext(event.target.value)} placeholder="用于消歧，例如 loan, credit" /></label><label><span>义项</span><input value={termSense} onChange={(event) => setTermSense(event.target.value)} placeholder="例如 金融机构" /></label><label><span>消歧说明</span><input value={termDisambiguation} onChange={(event) => setTermDisambiguation(event.target.value)} placeholder="说明何时采用此译法" /></label><button className="primary-button" disabled={!termSource.trim() || !termTarget.trim()}>添加术语约束</button></form><div className="term-table" role="table" aria-label="术语列表"><div className="term-table-head" role="row"><span>源词与同义词</span><span>批准译法 / 义项</span><span>语境触发</span><span>状态</span></div>{terms.map((term) => <div className="term-table-row" role="row" key={term.id}><div className="term-cell"><strong>{term.source}</strong>{term.aliases?.length > 0 && <small>{term.aliases.join(" · ")}</small>}</div><div className="term-cell"><span>{term.target}</span>{term.sense && <small>{term.sense}</small>}</div><small>{term.context_keywords?.length ? term.context_keywords.join(" · ") : term.sense || term.disambiguation || term.enforcement === "contextual" ? "逐处判断语境" : "固定译法"}</small><span className={`term-status ${term.status !== "approved" ? "pending" : ""}`}>{term.status === "approved" ? (term.enforcement === "global" || (term.enforcement !== "contextual" && !term.sense && !term.disambiguation && !term.context_keywords?.length) ? "固定译法" : "按义项采用") : term.status}</span></div>)}</div>{terms.length === 0 && <div className="empty-inline">还没有术语约束。添加后，命中的源词会直接参与译文生成和质量检查。</div>}</section>}
+        {panel === "terms" && overview && <section className="library-view"><div className="library-header"><div><span className="page-kicker">翻译约束</span><h1>术语库</h1><p>当前项目共有 {terms.length} 条术语约束；固定译法按词组检查；语境译法先逐处判定义项，再检查译文。</p></div></div><TermDiscoveryPanel documentId={overview.document.id} provider={settings?.term_discovery_provider || ""} model={settings?.term_discovery_model || ""} computeMode={settings?.term_discovery_compute_mode || "balanced"} onApproved={(term) => { setTerms((items) => [...items.filter((item) => item.id !== term.id), term].sort((left, right) => left.source.localeCompare(right.source))); void refreshQuality(); }} onRevoked={(termId) => { setTerms((items) => items.filter((term) => term.id !== termId)); void refreshQuality(); }} notify={notify} /><form className="term-create" onSubmit={(event) => void addTerm(event)}><label><span>规范源词</span><input value={termSource} onChange={(event) => setTermSource(event.target.value)} placeholder="例如 bank" /></label><label><span>批准译法</span><input value={termTarget} onChange={(event) => setTermTarget(event.target.value)} placeholder="例如 银行" /></label><label><span>同义词 / 变体</span><input value={termAliases} onChange={(event) => setTermAliases(event.target.value)} placeholder="逗号分隔，例如 banking institution" /></label><label><span>适用范围</span><select value={termEnforcement} onChange={(event) => setTermEnforcement(event.target.value)}><option value="contextual">按语境采用此译法</option><option value="global">所有用法均采用此译法</option></select></label><label><span>语境关键词（仅作提示）</span><input value={termContext} onChange={(event) => setTermContext(event.target.value)} placeholder="用于消歧，例如 loan, credit" /></label><label><span>义项</span><input value={termSense} onChange={(event) => setTermSense(event.target.value)} placeholder="例如 金融机构" /></label><label><span>消歧说明</span><input value={termDisambiguation} onChange={(event) => setTermDisambiguation(event.target.value)} placeholder="说明何时采用此译法" /></label><button className="primary-button" disabled={!termSource.trim() || !termTarget.trim()}>添加术语约束</button></form><div className="term-table" role="table" aria-label="术语列表"><div className="term-table-head" role="row"><span>源词与同义词</span><span>批准译法 / 义项</span><span>语境触发</span><span>状态</span></div>{terms.map((term) => <div className="term-table-row" role="row" key={term.id}><div className="term-cell"><strong>{term.source}</strong>{term.aliases?.length > 0 && <small>{term.aliases.join(" · ")}</small>}</div><div className="term-cell"><span>{term.target}</span>{term.sense && <small>{term.sense}</small>}</div><small>{term.context_keywords?.length ? term.context_keywords.join(" · ") : term.sense || term.disambiguation || term.enforcement === "contextual" ? "逐处判断语境" : "固定译法"}</small><span className={`term-status ${term.status !== "approved" ? "pending" : ""}`}>{term.status === "approved" ? (term.enforcement === "global" || (term.enforcement !== "contextual" && !term.sense && !term.disambiguation && !term.context_keywords?.length) ? "固定译法" : "按义项采用") : term.status}</span></div>)}</div>{terms.length === 0 && <div className="empty-inline">还没有术语约束。添加后，命中的源词会直接参与译文生成和质量检查。</div>}</section>}
 
         {panel === "quality" && overview && <section className="library-view quality-view">
-          <div className="library-header"><div><span className="page-kicker">第三阶段 · 人工把关</span><h1>审校</h1><p>{requiredHumanChecks ? `${requiredHumanChecks} 段因未解决问题必须人工检查；另有 ${humanReviewQueue.length - requiredHumanChecks} 段来自约 8% 的全书分布式抽样。` : humanReviewQueue.length ? `当前人工队列没有遗留问题；请抽检 ${humanReviewQueue.length} 个已审校段落。` : pendingTermSegments ? "尚有术语用法待机器核验，不能视为审校完成。" : overview?.reviewed_count ? "当前人工抽检队列已处理完成。" : "请先完成草译和全量独立审校。"}</p></div><div className="large-score"><span>{humanReviewQueue.length}</span><small>待人工检查</small></div></div>
-          <div className="quality-summary"><div><strong>{overview?.reviewed_count || 0}</strong><span>AI 已审校</span></div><div><strong>{requiredHumanChecks}</strong><span>问题必检</span></div><div><strong>{humanReviewQueue.length - requiredHumanChecks}</strong><span>分布抽检</span></div><div><strong>{overview?.confirmed_count || 0}</strong><span>人工确认</span></div></div>
+          <div className="library-header"><div><span className="page-kicker">人工把关</span><h1>审校</h1><p>{humanReviewQueue.length ? `${humanReviewQueue.length} 段带有未解决的检查问题，需要逐段人工确认。` : pendingTermSegments ? "尚有术语用法待机器核验；核验完成后如仍有问题会在此列出。" : "自动检查未发现遗留问题；可在下方核验术语语境，或从工作台逐段终审。"}</p></div><div className="large-score"><span>{humanReviewQueue.length}</span><small>问题必检</small></div></div>
+          <div className="quality-summary"><div><strong>{overview.segment_count}</strong><span>全书段数</span></div><div><strong>{overview.translated_count}</strong><span>已草译</span></div><div><strong>{humanReviewQueue.length}</strong><span>问题必检</span></div><div><strong>{overview.confirmed_count}</strong><span>人工确认</span></div></div>
           <TerminologyReviewPanel key={overview.document.id} documentId={overview.document.id} onChange={refreshQuality} />
-          <div className="issue-list">{humanReviewQueue.map((item) => <button key={item.segment_id} onClick={() => { setPanel("translate"); void navigateTo(item.ordinal); }}><i className={item.reason === "error" ? "warning-icon" : "format-icon"}>{item.reason === "error" ? "!" : item.reason === "warning" ? "?" : "抽"}</i><div><strong>{item.reason === "error" ? "确定问题 · 必检" : item.reason === "warning" ? "建议复核 · 必检" : "全书分布抽检"}</strong><span>第 {item.ordinal + 1} 段 · {item.source_text.slice(0, 90)}</span></div><Mark>›</Mark></button>)}</div>
-          {humanReviewQueue.length === 0 && <div className="empty-inline">{pendingTermSegments ? "人工队列暂为空；请先完成上方的术语语境核验。" : overview?.reviewed_count ? "抽检项已全部人工确认；仍可从工作台逐段终审。" : "完成全量独立审校后，这里会自动生成问题必检与约 8% 的抽检队列。"}</div>}
+          {humanReviewQueue.length > 0 && <div className="issue-list">{humanReviewQueue.map((item) => <button key={item.segment_id} onClick={() => { setPanel("translate"); void navigateTo(item.ordinal); }}><i className={item.reason === "error" ? "warning-icon" : "format-icon"}>{item.reason === "error" ? "!" : "?"}</i><div><strong>{item.reason === "error" ? "确定问题 · 必检" : "建议复核 · 必检"}</strong><span>第 {item.ordinal + 1} 段 · {item.source_text.slice(0, 90)}</span></div><Mark>›</Mark></button>)}</div>}
           {displayIssues.length > 0 && <div className="issue-list">{displayIssues.map((issue) => <button key={issue.id} onClick={() => { setPanel("translate"); void navigateTo(issue.ordinal); }}><i className={issue.severity === "error" ? "warning-icon" : "format-icon"}>{issue.severity === "error" ? "!" : issue.severity === "info" ? "待" : "?"}</i><div><strong>自动检查 · {issue.code}</strong><span>第 {issue.ordinal + 1} 段 · {issue.message}</span></div><Mark>›</Mark></button>)}</div>}
         </section>}
 
         {panel === "import" && <ImportBookPanel onImported={(result) => void handleImported(result)} />}
         {panel === "settings" && <ProviderSettingsPanel onSaved={(value) => { setSettings(value); notify("模型配置已更新。"); }} />}
 
-        <aside className="inspector"><div className="inspector-heading"><strong>检查器</strong><button aria-label="关闭检查器" onClick={() => setInspectorOpen(false)}>×</button></div><div className="inspector-scroll"><div className="quality-card"><div className={`segment-state-mark ${currentStatus}`}><Mark>{currentStatus === "human_confirmed" ? "✓" : currentSegment?.reviewed_translation ? "校" : currentStatus === "machine_translated" ? "AI" : "—"}</Mark></div><div><strong>{statusLabel(currentSegment)}</strong><small>{currentErrorIssues.length ? `${currentErrorIssues.length} 项确定问题` : currentWarningIssues.length ? `${currentWarningIssues.length} 项建议复核` : currentIssues.some((item) => item.severity === "info") ? "本段术语待机器核验" : "本段没有已报告的问题"}</small></div></div>{currentIssues.length > 0 && <div className="inspector-section"><div className="eyebrow">问题</div>{currentIssues.map((issue) => <div className="issue-chip" key={issue.id}><i>{issue.severity === "error" ? "!" : issue.severity === "info" ? "待" : "?"}</i><span>{issue.message}</span></div>)}</div>}<div className="inspector-section"><div className="eyebrow">本段术语 <button onClick={() => setPanel("terms")}>查看全部</button></div>{relevantTerms.length ? relevantTerms.map((term) => <div className="term-row" key={term.id}><span>{term.source}</span><strong>{term.target}</strong></div>) : <p className="inspector-empty">未命中已批准术语</p>}</div><div className="inspector-section"><div className="eyebrow">生成信息</div>{candidates.length ? <dl><div><dt>模型</dt><dd>{candidates.at(-1)?.model}</dd></div><div><dt>{generationUsage?.task ? "本段任务输入 / 输出" : "输入 / 输出"}</dt><dd>{generationUsage ? `${generationUsage.prompt} / ${generationUsage.completion}` : "用量见任务记录"}</dd></div>{generationUsage && <div><dt>{generationUsage.task ? "本段任务费用" : "费用"}</dt><dd>${generationUsage.cost.toFixed(6)}</dd></div>}</dl> : <p className="inspector-empty">本段还没有模型候选</p>}</div>{latestJob && <div className="inspector-section"><div className="eyebrow">当前任务</div><dl><div><dt>状态</dt><dd>{jobStatusLabel(latestJob.status, latestJob.deferred_segments)}</dd></div><div><dt>进度</dt><dd>{latestJob.processed_segments ?? latestJob.next_ordinal} / {latestJob.total_segments ?? overview?.segment_count}</dd></div><div><dt>任务输入 / 输出</dt><dd>{latestJob.prompt_tokens ?? "—"} / {latestJob.completion_tokens ?? "—"}</dd></div><div><dt>累计费用</dt><dd>${latestJob.total_cost_usd.toFixed(4)}</dd></div></dl>{latestJob.last_error && <p className="job-error">{latestJob.last_error}</p>}</div>}</div></aside>
+        <aside className="inspector"><div className="inspector-heading"><strong>检查器</strong><button aria-label="关闭检查器" onClick={() => setInspectorOpen(false)}>×</button></div><div className="inspector-scroll"><div className="quality-card"><div className={`segment-state-mark ${currentStatus}`}><Mark>{currentStatus === "human_confirmed" ? "✓" : currentStatus === "machine_translated" ? "AI" : "—"}</Mark></div><div><strong>{statusLabel(currentSegment)}</strong><small>{currentErrorIssues.length ? `${currentErrorIssues.length} 项确定问题` : currentWarningIssues.length ? `${currentWarningIssues.length} 项建议复核` : currentIssues.some((item) => item.severity === "info") ? "本段术语待机器核验" : "本段没有已报告的问题"}</small></div></div>{currentIssues.length > 0 && <div className="inspector-section"><div className="eyebrow">问题</div>{currentIssues.map((issue) => <div className="issue-chip" key={issue.id}><i>{issue.severity === "error" ? "!" : issue.severity === "info" ? "待" : "?"}</i><span>{issue.message}</span></div>)}</div>}<div className="inspector-section"><div className="eyebrow">本段术语 <button onClick={() => setPanel("terms")}>查看全部</button></div>{relevantTerms.length ? relevantTerms.map((term) => <div className="term-row" key={term.id}><span>{term.source}</span><strong>{term.target}</strong></div>) : <p className="inspector-empty">未命中已批准术语</p>}</div><div className="inspector-section"><div className="eyebrow">生成信息</div>{candidates.length ? <dl><div><dt>模型</dt><dd>{candidates.at(-1)?.model}</dd></div><div><dt>{generationUsage?.task ? "本段任务输入 / 输出" : "输入 / 输出"}</dt><dd>{generationUsage ? `${generationUsage.prompt} / ${generationUsage.completion}` : "用量见任务记录"}</dd></div>{generationUsage && <div><dt>{generationUsage.task ? "本段任务费用" : "费用"}</dt><dd>${generationUsage.cost.toFixed(6)}</dd></div>}</dl> : <p className="inspector-empty">本段还没有模型候选</p>}</div></div></aside>
       </div>
     </section>
 
     {searchOpen && <div className="command-overlay"><div className="command-palette search-palette"><form onSubmit={(event) => void performSearch(event)}><Mark>⌕</Mark><input ref={searchInput} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索当前书籍的原文或译文…" /><button type="submit" className="search-submit" disabled={!searchQuery.trim() || searching}>{searching ? "搜索中" : "搜索"}</button><button type="button" className="search-close" aria-label="关闭搜索" onClick={() => setSearchOpen(false)}>×</button></form><div className="command-results">{searching ? <div className="search-message">正在搜索…</div> : searchResults.length ? searchResults.map((item) => <button key={item.id} onClick={() => { setSearchOpen(false); setPanel("translate"); void navigateTo(item.ordinal); }}><span><strong>第 {item.ordinal + 1} 段</strong><small>{item.source_text.slice(0, 120)}</small></span><Mark>↵</Mark></button>) : <div className="search-message">输入关键词，搜索整本书的原文和译文。</div>}</div></div></div>}
-    {draftPicker && <div className="command-overlay chapter-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && wholeBookAction === null) setDraftPicker(null); }}><div className="chapter-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="chapter-picker-title"><header><div><span>草译范围</span><h2 id="chapter-picker-title">选择要翻译的篇章</h2><p>《{draftPicker.document.title}》· 可多选，任务只处理勾选范围。</p></div><button aria-label="关闭篇章选择" onClick={() => setDraftPicker(null)} disabled={wholeBookAction !== null}>×</button></header><div className="chapter-picker-tools"><strong>目录 · {draftPicker.overview.chapters.length} 节</strong><div><button onClick={() => setSelectedChapterStarts([...new Set(draftPicker.overview.chapters.map((chapter) => chapter.start_ordinal))])}>全选</button><button onClick={() => setSelectedChapterStarts([])}>清空</button></div></div><div className="chapter-picker-list" role="group" aria-label="选择草译篇章">{draftPicker.overview.chapters.map((chapter, index) => { const checked = selectedChapterStarts.includes(chapter.start_ordinal); return <label className={checked ? "selected" : ""} key={chapter.start_ordinal + "-" + chapter.title}><input type="checkbox" checked={checked} onChange={() => toggleDraftChapter(chapter.start_ordinal)} /><span className="chapter-check" aria-hidden="true">✓</span><span className="chapter-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{chapter.title}</strong><small>{chapter.segment_count} 段 · 已草译 {chapter.translated_count} · 已确认 {chapter.confirmed_count}</small></div></label>; })}</div><footer><span>已选 <strong>{selectedDraftChapters.length}</strong> 篇 · 去重后共 <strong>{selectedDraftSegmentCount}</strong> 段</span><div><button onClick={() => setDraftPicker(null)} disabled={wholeBookAction !== null}>取消</button><button className="accent" disabled={!selectedDraftRanges.length || wholeBookAction !== null} onClick={() => void runWholeBook(draftPicker.document, "draft", selectedDraftRanges)}>{wholeBookAction === "draft" ? "正在启动…" : "开始草译所选篇章"}</button></div></footer></div></div>}
+    {draftPicker && <div className="command-overlay chapter-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !startingTask) setDraftPicker(null); }}><div className="chapter-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="chapter-picker-title"><header><div><span>草译范围</span><h2 id="chapter-picker-title">选择要翻译的篇章</h2><p>《{draftPicker.document.title}》· 可多选，任务只处理勾选范围。</p></div><button aria-label="关闭篇章选择" onClick={() => setDraftPicker(null)} disabled={startingTask}>×</button></header><div className="chapter-picker-tools"><strong>目录 · {draftPicker.overview.chapters.length} 节</strong><div><button onClick={() => setSelectedChapterStarts([...new Set(draftPicker.overview.chapters.map((chapter) => chapter.start_ordinal))])}>全选</button><button onClick={() => setSelectedChapterStarts([])}>清空</button></div></div><div className="chapter-picker-list" role="group" aria-label="选择草译篇章">{draftPicker.overview.chapters.map((chapter, index) => { const checked = selectedChapterStarts.includes(chapter.start_ordinal); return <label className={checked ? "selected" : ""} key={chapter.start_ordinal + "-" + chapter.title}><input type="checkbox" checked={checked} onChange={() => toggleDraftChapter(chapter.start_ordinal)} /><span className="chapter-check" aria-hidden="true">✓</span><span className="chapter-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{chapter.title}</strong><small>{chapter.segment_count} 段 · 已草译 {chapter.translated_count} · 已确认 {chapter.confirmed_count}</small></div></label>; })}</div><footer><span>已选 <strong>{selectedDraftChapters.length}</strong> 篇 · 去重后共 <strong>{selectedDraftSegmentCount}</strong> 段</span><div><button onClick={() => setDraftPicker(null)} disabled={startingTask}>取消</button><button className="accent" disabled={!selectedDraftRanges.length || startingTask} onClick={() => void runWholeBook(draftPicker.document, selectedDraftRanges)}>{startingTask ? "正在启动…" : "开始草译所选篇章"}</button></div></footer></div></div>}
     {pendingDelete && <div className="command-overlay delete-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !deleting) setPendingDelete(null); }}><div className="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title"><div className="delete-mark">!</div><h2 id="delete-title">从书库删除《{pendingDelete.title}》？</h2><p>这会同时删除该书的原文、译文、任务记录与质量检查结果。此操作无法撤销。</p><div><button onClick={() => setPendingDelete(null)} disabled={deleting}>取消</button><button className="danger" onClick={() => void deleteSelectedDocument()} disabled={deleting}>{deleting ? "正在删除…" : "确认删除"}</button></div></div></div>}
     {bookSettingsEditor && settings && <div className="command-overlay book-settings-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !savingBookSettings) setBookSettingsEditor(null); }}>
       <div className="book-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="book-settings-title">
@@ -1010,11 +935,6 @@ export default function Home() {
             <label><span>连接</span><select value={bookSettingsEditor.value.draft_profile_id} onChange={(event) => { const profileId = event.target.value; setBookSettingsEditor((current) => current ? { ...current, value: { ...current.value, draft_profile_id: profileId, draft_model: modelsForProfile(settings, profileId)[0] || "" } } : current); }}>{settings.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
             <label><span>模型 ID</span><input list={"draft-models-" + bookSettingsEditor.document.id} value={bookSettingsEditor.value.draft_model} onChange={(event) => setBookSettingsEditor((current) => current ? { ...current, value: { ...current.value, draft_model: event.target.value } } : current)} placeholder="选择或输入模型 ID" /><datalist id={"draft-models-" + bookSettingsEditor.document.id}>{modelsForProfile(settings, bookSettingsEditor.value.draft_profile_id).map((model) => <option value={model} key={model} />)}</datalist></label>
             <label><span>计算档位</span><select value={bookSettingsEditor.value.draft_compute_mode} onChange={(event) => setBookSettingsEditor((current) => current ? { ...current, value: { ...current.value, draft_compute_mode: event.target.value as ComputeMode } } : current)}><option value="economy">节省</option><option value="balanced">均衡</option><option value="performance">性能</option></select></label>
-          </div></section>
-          <section><h3>审校模型 <small>可选</small></h3><div className="book-model-grid">
-            <label><span>连接</span><select value={bookSettingsEditor.value.reviewer_profile_id} onChange={(event) => { const profileId = event.target.value; setBookSettingsEditor((current) => current ? { ...current, value: { ...current.value, reviewer_profile_id: profileId, reviewer_model: modelsForProfile(settings, profileId)[0] || "" } } : current); }}>{settings.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
-            <label><span>模型 ID</span><input list={"review-models-" + bookSettingsEditor.document.id} value={bookSettingsEditor.value.reviewer_model} onChange={(event) => setBookSettingsEditor((current) => current ? { ...current, value: { ...current.value, reviewer_model: event.target.value } } : current)} placeholder="留空则不启用审校" /><datalist id={"review-models-" + bookSettingsEditor.document.id}>{modelsForProfile(settings, bookSettingsEditor.value.reviewer_profile_id).map((model) => <option value={model} key={model} />)}</datalist></label>
-            <label><span>计算档位</span><select value={bookSettingsEditor.value.reviewer_compute_mode} onChange={(event) => setBookSettingsEditor((current) => current ? { ...current, value: { ...current.value, reviewer_compute_mode: event.target.value as ComputeMode } } : current)}><option value="economy">节省</option><option value="balanced">均衡</option><option value="performance">性能</option></select></label>
           </div></section>
           <section className="book-style-section"><h3>翻译风格</h3><div className="book-style-presets">{STYLE_PRESETS.map((preset) => <button type="button" className={bookSettingsEditor.style_guide === preset.guide ? "selected" : ""} key={preset.id} onClick={() => setBookSettingsEditor((current) => current ? { ...current, style_guide: preset.guide } : current)}>{preset.label}</button>)}</div><textarea aria-label="这本书的翻译风格" value={bookSettingsEditor.style_guide} onChange={(event) => setBookSettingsEditor((current) => current ? { ...current, style_guide: event.target.value } : current)} placeholder="描述语气、读者、术语和行文要求" /></section>
         </div>

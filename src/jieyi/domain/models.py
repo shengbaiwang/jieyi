@@ -52,7 +52,6 @@ class TermStatus(StrEnum):
 
 class CandidateStage(StrEnum):
     DRAFT = "draft"
-    REVIEW = "review"
     REPAIR = "repair"
 
 
@@ -133,9 +132,6 @@ class ModelSpec:
 @dataclass(frozen=True, slots=True)
 class TranslationRecipe:
     draft: ModelSpec
-    reviewer: ModelSpec | None = None
-    task_mode: str = "draft"  # draft | review
-    review_policy: str = "on_issue"  # never | on_issue | all
     neighbor_radius: int = 1
     max_context_chars: int = 12_000
     tm_enabled: bool = True
@@ -146,12 +142,8 @@ class TranslationRecipe:
     max_concurrency: int = 5
     max_batch_chars: int = 4_000
     draft_thinking: bool = False
-    review_thinking: bool = True
     draft_compute_mode: str = "economy"
-    review_compute_mode: str = "performance"
     draft_reasoning_effort: str = "none"
-    review_reasoning_effort: str = "high"
-    review_sample_rate: float = 0.08
     max_output_tokens: int = 6_000
     token_budget: int = 2_000_000
     segment_ranges: tuple[tuple[int, int], ...] = ()
@@ -161,14 +153,10 @@ class TranslationRecipe:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> TranslationRecipe:
-        reviewer = value.get("reviewer")
         concurrency = int(value.get("concurrency", 3))
         legacy_max_concurrency = 5 if concurrency == 3 else concurrency
         return cls(
             draft=ModelSpec(**value["draft"]),
-            reviewer=ModelSpec(**reviewer) if reviewer else None,
-            task_mode=value.get("task_mode", "draft"),
-            review_policy=value.get("review_policy", "on_issue"),
             neighbor_radius=int(value.get("neighbor_radius", 1)),
             max_context_chars=int(value.get("max_context_chars", 12_000)),
             tm_enabled=bool(value.get("tm_enabled", True)),
@@ -181,14 +169,9 @@ class TranslationRecipe:
             ),
             max_batch_chars=int(value.get("max_batch_chars", 4_000)),
             draft_thinking=bool(value.get("draft_thinking", False)),
-            review_thinking=bool(value.get("review_thinking", True)),
             draft_compute_mode=normalize_compute_mode(
                 value.get("draft_compute_mode") or value.get("draft_reasoning_effort"),
                 "economy",
-            ),
-            review_compute_mode=normalize_compute_mode(
-                value.get("review_compute_mode") or value.get("review_reasoning_effort"),
-                "performance",
             ),
             draft_reasoning_effort=str(
                 value.get(
@@ -196,13 +179,6 @@ class TranslationRecipe:
                     "high" if value.get("draft_thinking", False) else "none",
                 )
             ),
-            review_reasoning_effort=str(
-                value.get(
-                    "review_reasoning_effort",
-                    "high" if value.get("review_thinking", True) else "none",
-                )
-            ),
-            review_sample_rate=float(value.get("review_sample_rate", 0.08)),
             max_output_tokens=int(value.get("max_output_tokens", 6_000)),
             token_budget=int(value.get("token_budget", 2_000_000)),
             segment_ranges=tuple(
@@ -235,7 +211,6 @@ class TranslationResult:
     prompt_cache_hit_tokens: int = 0
     prompt_cache_miss_tokens: int = 0
     raw_response: str | None = None
-    review_findings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

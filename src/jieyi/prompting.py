@@ -30,26 +30,7 @@ def build_system_prompt(request: TranslationRequest) -> str:
             "This source contains no placeholder tokens. Do not introduce any JY_PH marker "
             "or double-bracket placeholder."
         )
-    if request.task is CandidateStage.REVIEW:
-        if request.existing_translation:
-            instruction = (
-                "Independently compare the source and current translation sentence by sentence; "
-                "do not assume the draft is correct. Check for omissions, additions, mistranslations, "
-                "distorted modality or attribution, terminology errors, and unnatural target-language "
-                "wording. Revise only where justified, preserve genuine source ambiguity, and actively "
-                "correct every clear issue listed below. Return the complete revised translation first. "
-                "Only when a material ambiguity or factual decision cannot be resolved from the source "
-                "and supplied context, append a blank line, the exact line JY_REVIEW_ISSUES:, and one "
-                "concise bullet per question for a human. Omit this appendix when no human decision is needed."
-            )
-        else:
-            instruction = (
-                "No draft translation is available because the earlier draft was refused or did "
-                "not pass structural validation. Translate the source faithfully now. "
-                "Preserve meaning, modality, attribution and every mandatory terminology "
-                "constraint. Return only the translation."
-            )
-    elif request.task is CandidateStage.REPAIR and request.atom_boundaries:
+    if request.task is CandidateStage.REPAIR and request.atom_boundaries:
         instruction = (
             "Repair the EPUB translation by returning one translated value per source fragment. "
             "Read all fragments together as one sentence, then align each value to its source. "
@@ -90,13 +71,7 @@ def build_system_prompt(request: TranslationRequest) -> str:
 
 def build_user_prompt(request: TranslationRequest) -> str:
     segment_context = request.segment_context.strip()
-    if request.task is CandidateStage.REVIEW:
-        prompt = (
-            f"SOURCE:\n{request.segment.source_text}\n\n"
-            f"CURRENT TRANSLATION:\n{request.existing_translation or ''}\n\n"
-            f"KNOWN ISSUES:\n{request.issue_summary or 'Perform an independent fidelity review.'}"
-        )
-    elif request.task is CandidateStage.REPAIR and request.atom_boundaries:
+    if request.task is CandidateStage.REPAIR and request.atom_boundaries:
         fragments = {
             opening: request.segment.source_text.split(opening, 1)[1].split(closing, 1)[0]
             for opening, closing in request.atom_boundaries

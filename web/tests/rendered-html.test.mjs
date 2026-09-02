@@ -22,8 +22,10 @@ test("server-renders the Jieyi translation workbench", async () => {
   const html = await response.text();
   assert.match(html, /<title>介译 · 翻译工作台<\/title>/);
   assert.match(html, /我的书库/);
-  assert.match(html, /<nav aria-label="工作空间">[\s\S]*翻译<\/button>[\s\S]*阅读<\/button>[\s\S]*审校[\s\S]*术语库/);
-  assert.match(html, /M3 2.5h7.5/);
+  // The sidebar splits into a global group (always rendered) and a per-book
+  // group (rendered only once a document is open, so absent from the empty SSR).
+  assert.match(html, /<nav aria-label="全局导航">[\s\S]*书库 <b>[\s\S]*导入书籍<\/button>[\s\S]*模型配置<\/button>/);
+  assert.doesNotMatch(html, /<nav aria-label="当前书">/);
   assert.match(html, /m10.7 3.1 2.55-.55/);
   assert.doesNotMatch(html, /阅读与翻译|阅读模式/);
   assert.doesNotMatch(html, /[①②③]/);
@@ -54,10 +56,9 @@ test("reader opens directly, locates exact EPUB chapters, and lazy-loads pages",
   assert.doesNotMatch(openReader, /openDocument\(/);
   assert.match(source, /manifest\.segment_locations/);
   assert.match(source, /jumpToReaderChapter\(chapter\)/);
-  assert.match(source, /jy-epub-locate/);
-  assert.match(source, /jy-epub-location/);
+  assert.match(source, /createReaderNavigation/);
   assert.match(source, /id=\{`reader-spine-\$\{item\.spine_index\}`\}/);
-  assert.match(source, /new IntersectionObserver/);
+  assert.match(source, /readerNavigation.current\?\.goTo/);
   assert.match(source, /readerCurrentPage/);
   assert.match(source, /loading=\{index < 2 \? "eager" : "lazy"\}/);
 });

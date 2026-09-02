@@ -28,7 +28,7 @@ from jieyi.providers.catalog import (
     validate_http_url,
 )
 
-SETTINGS_VERSION = 3
+SETTINGS_VERSION = 4
 KEYCHAIN_SERVICE = "org.jieyi.translation.providers"
 LEGACY_KEYCHAIN_SERVICE = "org.jieyi.translation.openai-compatible"
 LEGACY_KEYCHAIN_ACCOUNT = "default"
@@ -94,8 +94,13 @@ class ProviderSettings:
     version: int = SETTINGS_VERSION
     profiles: tuple[ProviderProfile, ...] = field(default_factory=lambda: (_default_profile(),))
     draft: ModelBinding = field(default_factory=ModelBinding)
-    reviewer: ModelBinding = field(default_factory=lambda: ModelBinding(compute_mode="performance"))
-    review_enabled: bool = False
+    term_discovery: ModelBinding | None = None
+
+    def __post_init__(self):
+        if self.term_discovery is None:
+            self.term_discovery = ModelBinding(
+                self.draft.profile_id, self.draft.model, self.draft.compute_mode
+            )
 
     def profile(self, profile_id: str) -> ProviderProfile | None:
         return next((item for item in self.profiles if item.id == profile_id), None)
@@ -200,7 +205,7 @@ class LocalSettingsStore:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return ProviderSettings()
-        if payload.get("version") in {2, SETTINGS_VERSION} and isinstance(
+        if payload.get("version") in {2, 3, SETTINGS_VERSION} and isinstance(
             payload.get("profiles"), list
         ):
             return self._load_v2(payload)
@@ -244,7 +249,7 @@ class LocalSettingsStore:
             if isinstance(item, dict)
         )
         draft_payload = payload.get("draft") or {}
-        reviewer_payload = payload.get("reviewer") or {}
+        discovery_payload = payload.get("term_discovery")
         first_id = profiles[0].id if profiles else "default"
         settings = ProviderSettings(
             profiles=profiles or (_default_profile(),),
@@ -260,19 +265,13 @@ class LocalSettingsStore:
                     "economy",
                 ),
             ),
-            reviewer=ModelBinding(
-                profile_id=str(reviewer_payload.get("profile_id", first_id)),
-                model=str(reviewer_payload.get("model", "")),
+            term_discovery=ModelBinding(
+                profile_id=str(discovery_payload.get("profile_id", first_id)),
+                model=str(discovery_payload.get("model", "")),
                 compute_mode=normalize_compute_mode(
-                    str(
-                        reviewer_payload.get("compute_mode")
-                        or reviewer_payload.get("reasoning_effort")
-                        or ""
-                    ),
-                    "performance",
+                    discovery_payload.get("compute_mode"), "balanced"
                 ),
-            ),
-            review_enabled=bool(payload.get("review_enabled", False)),
+            ) if isinstance(discovery_payload, dict) else None,
         )
         try:
             validate_settings(settings)
@@ -299,10 +298,6 @@ class LocalSettingsStore:
         return ProviderSettings(
             profiles=(profile,),
             draft=ModelBinding("default", str(payload.get("draft_model") or ""), "economy"),
-            reviewer=ModelBinding(
-                "default", str(payload.get("reviewer_model") or ""), "performance"
-            ),
-            review_enabled=bool(payload.get("review_enabled", False)),
         )
 
 
@@ -347,9 +342,12 @@ def validate_settings(settings: ProviderSettings) -> None:
         validate_http_url(profile.models_endpoint, f"{profile.name} 的 Models 地址")
     if settings.draft.profile_id not in ids:
         raise ValueError("草译模型绑定的连接不存在")
-    if settings.reviewer.profile_id not in ids:
-        raise ValueError("审校模型绑定的连接不存在")
-    for role, binding in (("草译", settings.draft), ("审校", settings.reviewer)):
+    if settings.term_discovery.profile_id not in ids:
+        raise ValueError("术语发现模型绑定的连接不存在")
+    for role, binding in (
+        ("草译", settings.draft),
+        ("术语发现", settings.term_discovery),
+    ):
         if binding.compute_mode not in COMPUTE_MODES:
             raise ValueError(f"{role}计算策略不合法：{binding.compute_mode}")
 
@@ -369,7 +367,7 @@ def provider_public_payload(store: LocalSettingsStore) -> dict[str, Any]:
             }
         )
     draft_profile = settings.profile(settings.draft.profile_id) or settings.profiles[0]
-    reviewer_profile = settings.profile(settings.reviewer.profile_id) or draft_profile
+    discovery_profile = settings.profile(settings.term_discovery.profile_id) or draft_profile
     draft_key, draft_key_source = store.get_api_key(draft_profile.id)
     return {
         "version": SETTINGS_VERSION,
@@ -380,12 +378,10 @@ def provider_public_payload(store: LocalSettingsStore) -> dict[str, Any]:
         "draft_model": settings.draft.model,
         "draft_compute_mode": settings.draft.compute_mode,
         "draft_reasoning_effort": legacy_effort_for_mode(settings.draft.compute_mode),
-        "reviewer_profile_id": settings.reviewer.profile_id,
-        "reviewer_provider": reviewer_profile.registry_name,
-        "reviewer_model": settings.reviewer.model,
-        "reviewer_compute_mode": settings.reviewer.compute_mode,
-        "reviewer_reasoning_effort": legacy_effort_for_mode(settings.reviewer.compute_mode),
-        "review_enabled": settings.review_enabled,
+        "term_discovery_profile_id": settings.term_discovery.profile_id,
+        "term_discovery_provider": discovery_profile.registry_name,
+        "term_discovery_model": settings.term_discovery.model,
+        "term_discovery_compute_mode": settings.term_discovery.compute_mode,
         "warnings": configuration_warnings(settings),
         "provider_type": draft_profile.provider_type,
         "base_url": draft_profile.base_url,
@@ -396,9 +392,12 @@ def provider_public_payload(store: LocalSettingsStore) -> dict[str, Any]:
 
 def configuration_warnings(settings: ProviderSettings) -> list[str]:
     warnings: list[str] = []
-    bindings = (("草译", settings.draft), ("审校", settings.reviewer))
+    bindings = (
+        ("草译", settings.draft),
+        ("术语发现", settings.term_discovery),
+    )
     for role, binding in bindings:
-        if not binding.model or (role == "审校" and not settings.review_enabled):
+        if not binding.model:
             continue
         profile = settings.profile(binding.profile_id)
         if profile is None:
@@ -616,8 +615,8 @@ def test_openai_compatible_model(
         raise ValueError("请先选择要测试的模型")
 
     if protocol != "chat_completions":
-        from jieyi.providers.openai_compatible import OpenAICompatibleProvider
         from jieyi.domain.models import ModelSpec
+        from jieyi.providers.openai_compatible import OpenAICompatibleProvider
         started = time.perf_counter()
         provider = OpenAICompatibleProvider(api_key=api_key, chat_endpoint=endpoint, protocol=protocol)
         try:

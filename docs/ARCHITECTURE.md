@@ -39,7 +39,7 @@ EPUB 适配器不把 ZIP 解压到磁盘，而是：
 2. 拒绝 XML DTD 与实体声明，并仅展开安全的内置 HTML 命名实体；
 3. 从 `META-INF/container.xml` 定位 OPF package，解析 manifest、完整 spine、EPUB 2 NCX / EPUB 3 nav、page progression 和 rendition metadata；
 4. 原始 EPUB 字节与每个成员（OPF、XHTML、CSS、封面、图片、SVG、字体等）一起写入 `epub_packages` / `epub_resources`；EPUB 3 `cover-image`、EPUB 2 `meta name=cover` 及 guide cover 都会解析；
-5. 可翻译文本仍经 `SourceAtom → ParsedBlock → Segment` 进入既有术语、审校、QA、TM 和人工确认流程；
+5. 可翻译文本仍经 `SourceAtom → ParsedBlock → Segment` 进入既有术语、QA、TM 和人工确认流程；
 6. `epub_atoms` 与 `epub_text_nodes` 保存 Segment/SourceAtom 到 spine index、DOM path、`element.text` / `element.tail` slot 的稳定映射；
 7. 多 SourceAtom Segment 的模型输入使用受保护的 atom 与内联标签边界，模型必须按原顺序逐 atom 返回；恢复时同时验证 placeholder 和 atom ID/顺序；
 8. 阅读器以原 XHTML 为模板产生原版、仅译文和双语视图。内容通过无脚本 sandbox iframe 呈现，服务端删除脚本、事件属性、表单及危险 URL，CSS/SVG 只允许访问同一本 EPUB 的白名单资源；
@@ -57,7 +57,7 @@ machine_translated
 human_confirmed
 ```
 
-机器审校不会产生 `human_confirmed`。每次模型输出写入 `candidates`，当前机器稿写入段落；人工确认同时写入 `decisions` 和 `audit_events`。重跑模型不能覆盖 `accepted_translation`。
+机器草译不会产生 `human_confirmed`。每次模型输出写入 `candidates`，当前机器稿写入段落；人工确认同时写入 `decisions` 和 `audit_events`。重跑模型不能覆盖 `accepted_translation`。
 
 ## 任务状态与恢复
 
@@ -71,9 +71,8 @@ pending → running → completed
 
 1. 保存模型候选；
 2. 运行确定性 QA；
-3. 必要时调用审校模型并保存第二候选；
-4. 保存最终机器稿与问题；
-5. 更新任务 `next_ordinal`。
+3. 保存最终机器稿与问题；
+4. 更新任务 `next_ordinal`。
 
 因此进程在下一段失败时，上一段仍然是完整检查点。生产 worker 可以直接重试相同任务。
 
@@ -82,8 +81,8 @@ pending → running → completed
 这只改变请求调度，不改变提示词、模型参数或译文验收规则。
 
 内容拒绝、输出预算耗尽以及占位符或 EPUB SourceAtom 最终修复失败等可确定为单段局部的
-错误，会记录 `translation_deferred` 硬错误并隔离该段。无效输出不会写入当前译文，后续
-审校任务可从原文重新处理；其余段落继续运行。无法确定为局部错误的连接中断、服务商
+错误，会记录 `translation_deferred` 硬错误并隔离该段。无效输出不会写入当前译文，可
+重试草译或人工翻译；其余段落继续运行。无法确定为局部错误的连接中断、服务商
 故障等仍使任务失败并保留断点，防止把系统性故障误判为大量坏段。
 
 ## 上下文编译
@@ -144,24 +143,19 @@ TM 只作为参考上下文，不自动产生人工确认。后续数据量增�
 - 查询只返回未解决且译文哈希仍匹配的结果，避免并发或中断造成陈旧告警；
 - 检测器版本升级时全库重扫一次，成功后记录版本检查点。
 
-检查器只对脚注标记、批准术语等高置信不变量生成 `error`，并将审校模型明确提请人工
-判断的内容显示为 `warning`。本地化表达、排版和结构恢复会让规则式比对频繁误判，
-因此检查器不比较数字、括号引文、方括号引用或括号配对。界面只把 `error` 计入红色
-待处理数，`warning` 明确标为不阻断流程的建议复核；`on_issue` 自动审校也只由
-`error` 触发。
+检查器只对脚注标记、批准术语等高置信不变量生成 `error`，把不阻断流程的建议复核显示为
+`warning`。本地化表达、排版和结构恢复会让规则式比对频繁误判，因此检查器不比较数字、
+括号引文、方括号引用或括号配对。界面只把 `error` 计入红色待处理数。
 
 ## 模型路由
 
 `TranslationRecipe` 将角色和供应商分开：
 
 - `draft`：主译；
-- `reviewer`：独立审校；
-- `review_policy`：`never`、`on_issue` 或 `all`。
+- `term_discovery`：术语发现与语境核验（在设置中单独绑定）。
 
-工作台的标准生产流程使用 `all`：草译完成后，独立审校模型逐段对照原文并保存
-`review` 候选；审校后的确定性问题会重新计算。质量页把仍有问题的段落全部列为人工
-必检，并从无问题的已审校段落中按全书位置分布抽取约 8%，供人工抽检。只有人工明确
-确认才产生 `human_confirmed` 并写入翻译记忆。`on_issue` 保留给成本受限的兼容流程。
+草译完成后，确定性检查器与术语语境核验会标出仍有问题的段落。质量页把这些段落全部
+列为人工必检；只有人工明确确认才产生 `human_confirmed` 并写入翻译记忆。
 
 ### 跨模型计算策略
 

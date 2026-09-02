@@ -116,7 +116,6 @@ class TerminologyReviewTests(unittest.TestCase):
             document_id=document.id,
             draft_provider="echo",
             draft_model="draft",
-            review_policy="never",
         )
         for segment, (_, target) in zip(segments, pairs, strict=True):
             self.store.set_machine_translation(segment.id, target)

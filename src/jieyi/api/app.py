@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from math import ceil
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -101,10 +101,6 @@ class TerminologyReviewCreate(BaseModel):
 class JobCreate(BaseModel):
     draft_provider: str = "echo"
     draft_model: str = "dry-run"
-    reviewer_provider: str | None = None
-    reviewer_model: str | None = None
-    task_mode: str = "draft"
-    review_policy: str = "on_issue"
     tm_enabled: bool = True
     tm_threshold: float = Field(default=0.78, ge=0, le=1)
     tm_max_results: int = Field(default=3, ge=0, le=10)
@@ -113,12 +109,8 @@ class JobCreate(BaseModel):
     max_concurrency: int = Field(default=5, ge=1, le=12)
     max_batch_chars: int = Field(default=4_000, ge=500, le=12_000)
     draft_thinking: bool = False
-    review_thinking: bool = True
     draft_compute_mode: str | None = None
-    review_compute_mode: str | None = None
     draft_reasoning_effort: str | None = None
-    review_reasoning_effort: str | None = None
-    review_sample_rate: float = Field(default=0.08, ge=0, le=1)
     max_output_tokens: int = Field(default=6_000, ge=256, le=32_000)
     token_budget: int = Field(default=2_000_000, ge=1)
     segment_ranges: list[tuple[int, int]] = Field(default_factory=list)
@@ -148,17 +140,15 @@ class ProviderProfileUpdate(BaseModel):
 
 
 class ProviderSettingsUpdate(BaseModel):
-    version: int = 3
+    version: int = 4
     profiles: list[ProviderProfileUpdate] | None = None
     draft_profile_id: str = ""
     draft_model: str = ""
     draft_compute_mode: str | None = None
     draft_reasoning_effort: str | None = None
-    reviewer_profile_id: str = ""
-    reviewer_model: str = ""
-    reviewer_compute_mode: str | None = None
-    reviewer_reasoning_effort: str | None = None
-    review_enabled: bool = False
+    term_discovery_profile_id: str = ""
+    term_discovery_model: str = ""
+    term_discovery_compute_mode: str | None = None
     # Legacy single-provider fields remain accepted during migration.
     provider_type: str = "openai"
     base_url: str = ""
@@ -233,10 +223,10 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
 
     def start_terminology_review(document_id, token_budget=200_000):
         settings = settings_store.load()
-        binding = settings.reviewer if settings.reviewer.model else settings.draft
+        binding = settings.draft
         profile = settings.profile(binding.profile_id)
         if not binding.model or profile is None:
-            raise ValueError("请先在设置中配置审校模型或草译模型。")
+            raise ValueError("请先在设置中配置草译模型。")
         return terminology_manager.start(
             document_id, ModelSpec(profile.registry_name, binding.model, 0.0),
             binding.compute_mode, token_budget,
@@ -632,7 +622,6 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                 )
                 for item in segments
             ),
-            "reviewed_count": sum(bool(item.reviewed_translation) for item in segments),
             "confirmed_count": sum(item.status.value == "human_confirmed" for item in segments),
             "chapters": chapters,
         }
@@ -699,11 +688,6 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
             raise HTTPException(
                 status_code=422,
                 detail=f"Provider is not configured: {body.draft_provider}",
-            )
-        if body.reviewer_provider and body.reviewer_provider not in providers.names():
-            raise HTTPException(
-                status_code=422,
-                detail=f"Provider is not configured: {body.reviewer_provider}",
             )
         try:
             job = create_job(store, document_id=document_id, **body.model_dump())
@@ -781,52 +765,28 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         return document_issues(store, document_id)
 
     @app.get("/documents/{document_id}/human-review-queue")
-    async def get_human_review_queue(
-        document_id: str,
-        sample_rate: float = Query(default=0.08, ge=0, le=1),
-    ):
-        """Return unresolved findings plus a reproducible sample of clean AI-reviewed text."""
+    async def get_human_review_queue(document_id: str):
+        """Return every unconfirmed segment that carries an unresolved finding."""
         store.get_document(document_id)
         segments = store.list_segments(document_id)
         issues_by_segment: dict[str, list[dict]] = {}
-        all_findings = document_issues(store, document_id)
-        pending_ids = {issue["segment_id"] for issue in all_findings
-                       if not requires_human_review(issue)}
-        for issue in all_findings:
+        for issue in document_issues(store, document_id):
             if requires_human_review(issue):
                 issues_by_segment.setdefault(issue["segment_id"], []).append(issue)
 
-        unconfirmed = [
-            segment for segment in segments if segment.status.value != "human_confirmed"
-        ]
-        clean = [
-            segment
-            for segment in unconfirmed
-            if segment.reviewed_translation and segment.id not in issues_by_segment
-            and segment.id not in pending_ids
-        ]
-        sample_count = min(len(clean), ceil(len(clean) * sample_rate)) if sample_rate else 0
-        sampled_ids: set[str] = set()
-        if sample_count:
-            # Midpoints of equal ordinal intervals give a stable, book-wide sample instead
-            # of over-representing the opening pages.
-            sampled_ids = {
-                clean[min(len(clean) - 1, int((index + 0.5) * len(clean) / sample_count))].id
-                for index in range(sample_count)
-            }
-
         result = []
-        for segment in unconfirmed:
+        for segment in segments:
+            if segment.status.value == "human_confirmed":
+                continue
             findings = issues_by_segment.get(segment.id, [])
-            if not findings and segment.id not in sampled_ids:
+            if not findings:
                 continue
             has_error = any(item["severity"] == "error" for item in findings)
-            reason = "error" if has_error else "warning" if findings else "sample"
             result.append(
                 {
                     "segment_id": segment.id,
                     "ordinal": segment.ordinal,
-                    "reason": reason,
+                    "reason": "error" if has_error else "warning",
                     "issue_count": len(findings),
                     "source_text": segment.source_text,
                     "translation": (
@@ -851,12 +811,21 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         format: str = Query(default="text", pattern="^(text|book)$"),
     ):
         document = store.get_document(document_id)
+        extension = (
+            "epub" if format == "book" and document.source_format == "epub"
+            else "md" if document.source_format == "markdown" else "txt"
+        )
+        title = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]', "_", document.title).strip(" .") or "书籍"
+        variant = "原文译文对照" if bilingual else "仅译文"
+        filename = f"{title}-{variant}.{extension}"
+        fallback = f"{'bilingual' if bilingual else 'translated'}.{extension}"
+        disposition = f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(filename, safe="")}'
         if format == "book" and document.source_format == "epub":
             return Response(
-                content=export_translated_epub(store, document_id),
+                content=export_translated_epub(store, document_id, bilingual=bilingual),
                 media_type="application/epub+zip",
                 headers={
-                    "Content-Disposition": 'attachment; filename="translated.epub"',
+                    "Content-Disposition": disposition,
                     "X-Content-Type-Options": "nosniff",
                 },
             )
@@ -868,7 +837,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         return Response(
             content=store.export_document(document_id, bilingual=bilingual),
             media_type=media_type,
-            headers={"Content-Disposition": 'attachment; filename="translated.txt"'},
+            headers={"Content-Disposition": disposition},
         )
 
     @app.get("/settings/provider")
@@ -878,6 +847,8 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     @app.patch("/settings/provider")
     async def patch_provider_settings(body: ProviderSettingsUpdate):
         try:
+            current = settings_store.load()
+            fields = body.model_fields_set
             if body.profiles is not None:
                 profiles = tuple(
                     profile_from_preset(
@@ -895,55 +866,41 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                     )
                     for item in body.profiles
                 )
-                first_id = profiles[0].id if profiles else ""
-                settings = ProviderSettings(
-                    profiles=profiles,
-                    draft=ModelBinding(
-                        body.draft_profile_id or first_id,
-                        body.draft_model.strip(),
-                        normalize_compute_mode(
-                            body.draft_compute_mode or body.draft_reasoning_effort,
-                            "economy",
-                        ),
-                    ),
-                    reviewer=ModelBinding(
-                        body.reviewer_profile_id or body.draft_profile_id or first_id,
-                        body.reviewer_model.strip(),
-                        normalize_compute_mode(
-                            body.reviewer_compute_mode or body.reviewer_reasoning_effort,
-                            "performance",
-                        ),
-                    ),
-                    review_enabled=body.review_enabled,
-                )
                 key_updates = [(item.id, item.api_key) for item in body.profiles]
-            else:
-                profile = profile_from_preset(
-                    "default",
-                    body.provider_type,
-                    base_url=body.base_url,
-                )
-                settings = ProviderSettings(
-                    profiles=(profile,),
-                    draft=ModelBinding(
-                        "default",
-                        body.draft_model.strip(),
-                        normalize_compute_mode(
-                            body.draft_compute_mode or body.draft_reasoning_effort,
-                            "economy",
-                        ),
-                    ),
-                    reviewer=ModelBinding(
-                        "default",
-                        body.reviewer_model.strip(),
-                        normalize_compute_mode(
-                            body.reviewer_compute_mode or body.reviewer_reasoning_effort,
-                            "performance",
-                        ),
-                    ),
-                    review_enabled=body.review_enabled,
-                )
+            elif fields & {"provider_type", "base_url", "api_key"}:
+                profiles = (profile_from_preset(
+                    "default", body.provider_type, base_url=body.base_url,
+                ),)
                 key_updates = [("default", body.api_key)]
+            else:
+                profiles = current.profiles
+                key_updates = []
+
+            profile_ids = {profile.id for profile in profiles}
+            first_id = profiles[0].id if profiles else ""
+
+            def binding(role, previous):
+                profile_id = getattr(body, f"{role}_profile_id")
+                if f"{role}_profile_id" not in fields:
+                    profile_id = previous.profile_id
+                    if profile_id not in profile_ids and not previous.model:
+                        profile_id = first_id
+                model = (
+                    getattr(body, f"{role}_model").strip()
+                    if f"{role}_model" in fields else previous.model
+                )
+                mode = getattr(body, f"{role}_compute_mode")
+                legacy_mode = getattr(body, f"{role}_reasoning_effort", None)
+                return ModelBinding(
+                    profile_id or first_id, model,
+                    normalize_compute_mode(mode or legacy_mode, previous.compute_mode),
+                )
+
+            settings = ProviderSettings(
+                profiles=profiles,
+                draft=binding("draft", current.draft),
+                term_discovery=binding("term_discovery", current.term_discovery),
+            )
             settings_store.save(settings)
             warnings: list[str] = []
             for profile_id, api_key in key_updates:
@@ -1025,7 +982,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     async def get_terminology_review(document_id: str):
         summary = terminology_manager.repository.summary(document_id)
         settings = settings_store.load()
-        binding = settings.reviewer if settings.reviewer.model else settings.draft
+        binding = settings.draft
         profile = settings.profile(binding.profile_id)
         return summary | {
             "configured_model": binding.model,

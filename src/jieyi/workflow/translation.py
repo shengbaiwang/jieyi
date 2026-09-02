@@ -6,7 +6,6 @@ from jieyi.context.compiler import ContextCompiler
 from jieyi.domain.models import (
     CandidateStage,
     Document,
-    IssueSeverity,
     Job,
     JobStatus,
     ModelSpec,
@@ -21,16 +20,13 @@ from jieyi.protection import PlaceholderIntegrityError, ProtectedText, Protected
 from jieyi.providers.registry import ProviderRegistry
 from jieyi.quality.checks import (
     DETECTOR_VERSION,
-    reviewer_attention_issues,
     run_deterministic_checks,
 )
 from jieyi.workflow.provider_responses import (
     EmptyProviderResponseError,
     content_filter_audit_payload,
-    deferred_content_filter_message,
     inspect_empty_result,
     is_content_filtered_error,
-    parse_review_response,
 )
 
 _PLACEHOLDER_REPAIR_ATTEMPTS = 3
@@ -86,81 +82,6 @@ class TranslationEngine:
                     structured_source or segment.source_text
                 )
 
-                if job.recipe.task_mode == "review":
-                    existing = (
-                        segment.reviewed_translation
-                        or segment.edited_translation
-                        or segment.machine_translation
-                        or segment.accepted_translation
-                    )
-                    deferred_message = deferred_content_filter_message(self.store, segment.id)
-                    if not existing and not deferred_message:
-                        job = self.store.save_job(replace(job, next_ordinal=segment.ordinal + 1))
-                        continue
-                    if (
-                        structured
-                        and existing
-                        and not self.store.epub_structured_translation(segment.id)
-                    ):
-                        structured = False
-                        protected = self.protected_text_codec.encode(segment.source_text)
-                    review_spec = job.recipe.reviewer
-                    if review_spec is None:
-                        raise ValueError("A reviewer model is required for review jobs")
-                    first_issues = run_deterministic_checks(
-                        segment.source_text,
-                        existing or "",
-                        terms,
-                        segment_kind=segment.kind,
-                    )
-                    reviewed, review_cost = await self._translate_protected(
-                        job=job,
-                        project=project,
-                        document=document,
-                        segment=segment,
-                        protected=protected,
-                        structured=structured,
-                        context=context,
-                        stage=CandidateStage.REVIEW,
-                        model_spec=review_spec,
-                        existing_translation=existing,
-                        issue_summary="\n".join(
-                            filter(
-                                None,
-                                [
-                                    deferred_message,
-                                    *(issue.message for issue in first_issues),
-                                ],
-                            )
-                        ),
-                    )
-                    final_issues = run_deterministic_checks(
-                        segment.source_text,
-                        reviewed.text,
-                        terms,
-                        segment_kind=segment.kind,
-                    )
-                    final_issues.extend(
-                        reviewer_attention_issues(reviewed.review_findings)
-                    )
-                    self.store.replace_issues(
-                        job.id,
-                        segment.id,
-                        final_issues,
-                        target_text=reviewed.text,
-                        detector_version=DETECTOR_VERSION,
-                    )
-                    self.store.set_reviewed_translation(segment.id, reviewed.text)
-                    job = self.store.save_job(
-                        replace(
-                            job,
-                            next_ordinal=segment.ordinal + 1,
-                            total_cost_usd=job.total_cost_usd + review_cost,
-                        )
-                    )
-                    processed += 1
-                    continue
-
                 draft_spec = job.recipe.draft
                 try:
                     draft, draft_cost = await self._translate_protected(
@@ -193,48 +114,11 @@ class TranslationEngine:
 
                 final = draft
                 segment_cost = draft_cost
-                first_issues = run_deterministic_checks(
-                    segment.source_text,
-                    draft.text,
-                    terms,
-                    segment_kind=segment.kind,
-                )
-                should_review = (
-                    job.recipe.reviewer is not None
-                    and job.recipe.review_policy != "never"
-                    and (
-                        job.recipe.review_policy == "all"
-                        or any(issue.severity is IssueSeverity.ERROR for issue in first_issues)
-                    )
-                )
-                if should_review:
-                    review_spec = job.recipe.reviewer
-                    assert review_spec is not None
-                    reviewed, review_cost = await self._translate_protected(
-                        job=job,
-                        project=project,
-                        document=document,
-                        segment=segment,
-                        protected=protected,
-                        structured=structured,
-                        context=context,
-                        stage=CandidateStage.REVIEW,
-                        model_spec=review_spec,
-                        existing_translation=draft.text,
-                        issue_summary="\n".join(issue.message for issue in first_issues),
-                    )
-                    if reviewed.text.strip():
-                        final = reviewed
-                        segment_cost += review_cost
-
                 final_issues = run_deterministic_checks(
                     segment.source_text,
                     final.text,
                     terms,
                     segment_kind=segment.kind,
-                )
-                final_issues.extend(
-                    reviewer_attention_issues(final.review_findings)
                 )
                 self.store.replace_issues(
                     job.id,
@@ -371,24 +255,6 @@ class TranslationEngine:
                 model_spec=model_spec,
                 result=result,
             )
-        if stage is CandidateStage.REVIEW:
-            raw_review_text = result.text
-            reviewed_text, findings = parse_review_response(raw_review_text)
-            result = replace(
-                result,
-                text=reviewed_text,
-                raw_response=result.raw_response or raw_review_text,
-                review_findings=findings,
-            )
-            if not result.text.strip():
-                self._raise_empty_result(
-                    job=job,
-                    segment=segment,
-                    stage=stage,
-                    model_spec=model_spec,
-                    result=result,
-                )
-
         try:
             restored_value = protected.restore(result.text)
             restored = replace(
@@ -481,7 +347,6 @@ class TranslationEngine:
                             if structured
                             else restored_value
                         ),
-                        review_findings=result.review_findings,
                     )
                     break
                 except (PlaceholderIntegrityError, ValueError) as repair_exc:

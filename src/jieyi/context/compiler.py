@@ -4,6 +4,72 @@ from jieyi.domain.models import Project, Segment, TermEntry, TermStatus
 from jieyi.terminology import matching_terms, render_terminology_constraints
 
 
+def compile_neighbor_context(
+    segment: Segment,
+    neighbors: list[Segment],
+    *,
+    max_chars: int,
+    include_translations: bool = False,
+) -> str:
+    """Render reference passages with a shared budget for both sides of the source."""
+    sections: list[tuple[str, str, bool]] = []
+    if segment.heading_path:
+        sections.append(("# LOCATION", segment.heading_path, False))
+    for neighbor in sorted(neighbors, key=lambda item: item.ordinal):
+        if neighbor.document_id != segment.document_id or neighbor.ordinal == segment.ordinal:
+            continue
+        previous = neighbor.ordinal < segment.ordinal
+        direction = "PREVIOUS" if previous else "FOLLOWING"
+        sections.append(
+            (f"# {direction} SOURCE (segment {neighbor.ordinal})", neighbor.source_text, previous)
+        )
+        translation = (
+            neighbor.accepted_translation
+            or neighbor.reviewed_translation
+            or neighbor.edited_translation
+            or neighbor.machine_translation
+        )
+        if include_translations and translation:
+            sections.append(
+                (f"# {direction} TRANSLATION (segment {neighbor.ordinal})", translation, previous)
+            )
+    if not sections:
+        return ""
+
+    prefix = (
+        "# REFERENCE CONTEXT\n"
+        "Use these passages to resolve references and maintain consistent wording. "
+        "Do not translate, copy or repair neighboring passages; only the current source "
+        "is the output target. Neighbor translations may contain errors; verify them "
+        "against their source."
+    )
+    suffix = "\n\n# END REFERENCE CONTEXT"
+    remaining = max_chars - len(prefix) - len(suffix) - sum(
+        len(title) + 3 for title, _, _ in sections
+    )
+    if remaining < len(sections):
+        return ""
+
+    # Share space fairly, reclaiming unused space from short headings/passages.
+    limits = [0] * len(sections)
+    ordered = sorted(range(len(sections)), key=lambda index: len(sections[index][1]))
+    for position, index in enumerate(ordered):
+        limits[index] = min(len(sections[index][1]), remaining // (len(ordered) - position))
+        remaining -= limits[index]
+    rendered = [prefix]
+    for (title, value, keep_tail), limit in zip(sections, limits, strict=True):
+        if len(value) > limit:
+            # Keep the text closest to the current segment when a neighbor is long.
+            if limit <= 1:
+                value = "…"[:limit]
+            elif keep_tail:
+                value = "…" + value[-(limit - 1):]
+            else:
+                value = value[:limit - 1] + "…"
+        rendered.append(f"{title}\n{value}")
+    return "\n\n".join(rendered) + suffix
+
+
 class ContextCompiler:
     """Compile bounded, inspectable context instead of dumping an entire book."""
 

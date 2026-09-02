@@ -223,16 +223,24 @@ nav { display: grid; gap: 3px; }
 .editor, .library-view { min-width: 0; overflow: hidden; background: var(--paper); transition: background .3s ease; }
 .editor { display: flex; flex-direction: column; }
 .editor-toolbar {
-  height: 52px;
-  flex: 0 0 52px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 10px 8px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 14px 0 18px;
+  padding: 12px 14px 10px 18px;
   border-bottom: 1px solid var(--line);
   color: var(--muted);
   font-size: 10.5px;
 }
+.editor-book-actions { flex: 0 0 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+.editor-book-actions > span { color: var(--muted); font-size: 10px; }
+.editor-task-buttons { display: inline-flex; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
+.editor-task-buttons button { min-height: 29px; border: 0; padding: 5px 12px; color: var(--text); background: transparent; font-size: 10.5px; font-weight: 600; }
+.editor-task-buttons button + button { border-left: 1px solid var(--line); }
+.editor-task-buttons button:hover:not(:disabled) { color: var(--accent-text); background: var(--blue-soft); }
+.editor-task-buttons button:disabled { color: var(--muted); opacity: .6; cursor: not-allowed; }
 .segment-nav, .editor-tools { display: flex; align-items: center; gap: 8px; }
 .segment-nav button {
   width: 24px;
@@ -402,11 +410,6 @@ nav { display: grid; gap: 3px; }
 .book-actions > button.accent { border-color: transparent; color: white; background: var(--blue-solid); }
 .book-actions > button.danger { color: var(--red); }
 .book-actions > button:disabled { opacity: .5; }
-.library-quick-actions { min-height: 44px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 12px; border: 1px solid color-mix(in srgb, var(--blue) 24%, var(--line)); border-radius: 10px; padding: 8px 10px; background: var(--blue-soft); }
-.library-quick-actions span { min-width: 0; flex: 1; color: var(--muted); font-size: 9px; }
-.library-quick-actions span strong { color: var(--text); font-weight: 680; }
-.library-quick-actions button, .library-quick-actions a { min-height: 29px; display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 7px; padding: 0 10px; color: var(--text); background: var(--paper); font-size: 9px; font-weight: 650; text-decoration: none; white-space: nowrap; }
-.library-quick-actions a { border-color: transparent; color: white; background: var(--blue-solid); }
 
 .job-progress-card { margin-top: 10px; border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: var(--paper); box-shadow: 0 4px 18px rgba(30,38,50,.06); }
 .job-progress-card.status-running { border-color: color-mix(in srgb, var(--blue) 38%, var(--line)); }
@@ -426,7 +429,25 @@ nav { display: grid; gap: 3px; }
 .job-controls button.accent { border-color: transparent; color: white; background: var(--blue-solid); }
 .job-controls button.danger { color: var(--red); }
 
-.reader-view { min-width: 0; overflow: auto; color: var(--text); background: color-mix(in srgb, var(--panel) 82%, #171a1f); }
+.current-book-name { min-width: 0; overflow: hidden; text-transform: none; letter-spacing: 0; font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+
+.task-menu-anchor { position: relative; display: inline-flex; }
+.task-trigger { min-height: 26px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line-strong, var(--line)); border-radius: 7px; padding: 0 10px; color: var(--accent-text); background: var(--blue-soft); font-size: 10.5px; font-weight: 620; white-space: nowrap; }
+.task-trigger:hover:not(:disabled) { border-color: var(--blue); }
+.task-trigger:disabled { opacity: .45; }
+.task-menu-backdrop { position: fixed; inset: 0; z-index: 20; }
+.task-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 21; min-width: 168px; display: grid; gap: 2px; border: 1px solid var(--line); border-radius: 9px; padding: 5px; background: var(--paper); box-shadow: 0 16px 40px rgba(20,24,31,.18), 0 2px 8px rgba(20,24,31,.1); }
+.task-menu button { width: 100%; min-height: 30px; display: flex; align-items: center; border: 0; border-radius: 6px; padding: 0 9px; background: transparent; text-align: left; font-size: 11px; font-weight: 550; }
+.task-menu button:hover:not(:disabled) { color: var(--accent-text); background: var(--blue-soft); }
+.task-menu button:disabled { opacity: .4; }
+.task-menu-sep { height: 1px; margin: 4px 2px; background: var(--line); }
+
+.book-card-aside { display: inline-flex; align-items: center; gap: 6px; }
+.book-card-delete { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 6px; color: var(--muted); font-size: 15px; line-height: 1; opacity: 0; transition: opacity .14s ease, background .14s ease, color .14s ease; }
+.book-card:hover .book-card-delete, .book-card.active .book-card-delete { opacity: 1; }
+.book-card-delete:hover { color: white; background: var(--red-solid); }
+
+.reader-view { min-width: 0; overflow: auto; overflow-anchor: none; overscroll-behavior: contain; color: var(--text); background: color-mix(in srgb, var(--panel) 82%, #171a1f); }
 .epub-reader-stack { width: min(900px, calc(100% - 36px)); display: flex; flex-direction: column; gap: 0; overflow: hidden; margin: 18px auto 48px; border: 1px solid color-mix(in srgb, var(--line) 78%, transparent); border-radius: 7px; background: white; box-shadow: 0 18px 54px rgba(20,24,31,.16); }
 .epub-cover-sheet { min-height: 62vh; display: grid; place-items: center; padding: 28px; background: white; }
 .epub-cover-sheet img { max-width: min(100%, 520px); max-height: 76vh; object-fit: contain; box-shadow: 0 18px 52px rgba(25,30,40,.18); }
@@ -596,7 +617,7 @@ nav { display: grid; gap: 3px; }
 .book-card > div { min-width: 0; display: grid; gap: 6px; }
 .book-card > div span, .book-card > div small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .book-card > div strong { overflow: hidden; font-family: ui-serif, Georgia, serif; font-size: 16px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
-.book-card > .symbol { color: var(--muted); font-size: 18px; }
+.book-card .symbol { color: var(--muted); font-size: 18px; }
 .empty-workspace { min-height: 360px; display: grid; place-items: center; align-content: center; gap: 10px; color: var(--muted); text-align: center; }
 .empty-workspace > .symbol { font-size: 34px; }
 .empty-workspace h2, .empty-workspace p { margin: 0; }
@@ -739,8 +760,6 @@ nav { display: grid; gap: 3px; }
 .dark .project-progress { border-top-color: rgba(235,238,244,.22); background: rgba(52,57,64,.98); }
 
 @media (max-width: 560px) {
-  .library-quick-actions { align-items: stretch; flex-wrap: wrap; }
-  .library-quick-actions span { flex-basis: 100%; line-height: 1.5; }
   .book-model-grid { grid-template-columns: 1fr; }
   .book-style-presets { grid-template-columns: 1fr 1fr; }
   .book-settings-dialog > footer { align-items: stretch; flex-direction: column; }
@@ -757,3 +776,32 @@ nav { display: grid; gap: 3px; }
 .terminology-review button { flex-shrink: 0; }
 .term-create select { background: var(--paper); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
 @media (max-width: 700px) { .terminology-review-heading { flex-direction: column; } }
+
+.reader-toolbar > div:first-child { min-width: 0; }
+.reader-toolbar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chapter[aria-current="location"] { box-shadow: inset 3px 0 var(--blue-solid); }
+.chapter:disabled { opacity: .55; cursor: wait; }
+
+/* Book actions live in the workspace; the library only manages stored books. */
+.workspace-job { margin: 16px 0 0; border-top: 1px solid var(--line); padding-top: 12px; }
+.workspace-job > summary { cursor: pointer; color: var(--muted); font-size: 10px; }
+.workspace-job > summary strong { margin-left: 8px; color: var(--text); font-weight: 600; }
+.workspace-job .job-progress-card { padding: 10px; box-shadow: none; }
+.workspace-job .job-progress-head { align-items: flex-start; flex-direction: column; gap: 6px; }
+.workspace-job .job-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.workspace-job .job-controls { flex-wrap: wrap; }
+.book-actions > div { min-width: 0; }
+.export-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 28px 0 0; padding: 0; border: 0; }
+.export-options legend { margin-bottom: 12px; color: var(--muted); font-size: 11px; }
+.export-options label { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--line); border-radius: 12px; padding: 20px 16px; background: var(--paper); cursor: pointer; }
+.export-options label.selected { border-color: var(--blue); background: var(--blue-soft); }
+.export-options input { margin: 3px 0 0; accent-color: var(--blue-solid); }
+.export-options label span { display: grid; gap: 8px; }
+.export-options strong { font-size: 13px; }
+.export-options small { color: var(--muted); font-size: 10.5px; line-height: 1.6; }
+.export-download { display: grid; justify-items: start; gap: 10px; margin-top: 24px; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+.export-download > span { color: var(--muted); font-size: 10px; }
+.export-download > strong { max-width: 100%; font-size: 12px; overflow-wrap: anywhere; }
+.export-download p { margin: 0 0 8px; color: var(--muted); font-size: 10.5px; line-height: 1.7; }
+.export-download a { display: inline-flex; align-items: center; text-decoration: none; }
+@media (max-width: 640px) { .export-options { grid-template-columns: minmax(0, 1fr); } }

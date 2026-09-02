@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi.testclient import TestClient
 from test_epub import build_epub
@@ -18,73 +19,77 @@ class ApiTests(unittest.TestCase):
         self.client.close()
         self.tempdir.cleanup()
 
-    def test_human_review_queue_combines_required_checks_and_distributed_sampling(self):
+    def test_export_text_variants_and_unicode_filenames(self):
+        project = self.client.post(
+            "/projects", json={"name": "Export", "source_lang": "en", "target_lang": "zh-CN"}
+        ).json()
+        for source_format, extension in (("txt", "txt"), ("markdown", "md")):
+            document = self.client.post(
+                f"/projects/{project['id']}/documents",
+                json={"title": '书名/第一章: "测试"', "text": "Original paragraph.", "source_format": source_format},
+            ).json()
+            segment = self.client.get(f"/documents/{document['id']}/segments").json()[0]
+            self.client.patch(f"/segments/{segment['id']}/confirm", json={"translation": "译文段落。"})
+            for bilingual, label in ((False, "仅译文"), (True, "原文译文对照")):
+                with self.subTest(format=source_format, bilingual=bilingual):
+                    result = self.client.get(
+                        f"/documents/{document['id']}/export",
+                        params={"format": "book", "bilingual": bilingual},
+                    )
+                    self.assertEqual(result.status_code, 200)
+                    self.assertEqual(result.text, ("Original paragraph.\n\n" if bilingual else "") + "译文段落。\n")
+                    self.assertIn(
+                        f"filename*=UTF-8''书名_第一章_ _测试_-{label}.{extension}",
+                        unquote(result.headers["content-disposition"]),
+                    )
+
+    def test_human_review_queue_lists_segments_with_unresolved_findings(self):
         project = self.client.post(
             "/projects",
             json={"name": "Review flow", "source_lang": "en", "target_lang": "zh-CN"},
         ).json()
+        self.assertEqual(
+            self.client.post(
+                f"/projects/{project['id']}/terms",
+                json={"source": "agency", "target": "能动性", "status": "approved"},
+            ).status_code,
+            201,
+        )
         document = self.client.post(
             f"/projects/{project['id']}/documents",
             json={
-                "title": "Three paragraphs",
-                "text": "One paragraph.\n\nTwo paragraphs in 2020.\n\nThree paragraphs.",
+                "title": "Two paragraphs",
+                "text": "A plain sentence.\n\nAgency shapes social power.",
                 "source_format": "txt",
             },
         ).json()
         draft_job = self.client.post(
             f"/documents/{document['id']}/jobs",
-            json={"draft_provider": "echo", "draft_model": "draft", "review_policy": "never"},
+            json={"draft_provider": "echo", "draft_model": "draft"},
         ).json()
         self.assertEqual(self.client.post(f"/jobs/{draft_job['id']}/run").status_code, 200)
 
-        review_job = self.client.post(
-            f"/documents/{document['id']}/jobs",
-            json={
-                "draft_provider": "echo",
-                "draft_model": "unused",
-                "reviewer_provider": "echo",
-                "reviewer_model": "reviewer",
-                "task_mode": "review",
-                "review_policy": "all",
-                "review_sample_rate": 0,
-            },
-        ).json()
-        self.assertEqual(self.client.post(f"/jobs/{review_job['id']}/run").status_code, 200)
+        # The echo draft never renders the approved target, so the "agency" segment
+        # carries an unresolved terminology finding and the plain one does not.
+        queue = self.client.get(f"/documents/{document['id']}/human-review-queue").json()
+        self.assertEqual([item["ordinal"] for item in queue], [1])
+        self.assertEqual(queue[0]["reason"], "error")
 
-        overview = self.client.get(f"/documents/{document['id']}/overview").json()
-        self.assertEqual(overview["reviewed_count"], 3)
-        queue = self.client.get(
-            f"/documents/{document['id']}/human-review-queue",
-            params={"sample_rate": 0.34},
-        ).json()
-        self.assertEqual(len(queue), 2)
-        self.assertEqual({item["reason"] for item in queue}, {"sample"})
-        self.assertEqual([item["ordinal"] for item in queue], sorted(item["ordinal"] for item in queue))
-
-        confirmed = queue[0]
-        response = self.client.patch(
-            f"/segments/{confirmed['segment_id']}/confirm",
-            json={"translation": confirmed["translation"], "rationale": "Human sample passed"},
+        # Confirming the segment with a compliant translation clears the queue.
+        segment = next(
+            item for item in self.client.get(f"/documents/{document['id']}/segments").json()
+            if item["ordinal"] == 1
         )
-        self.assertEqual(response.status_code, 200)
-        remaining = self.client.get(
-            f"/documents/{document['id']}/human-review-queue",
-            params={"sample_rate": 0.34},
-        ).json()
-        self.assertNotIn(confirmed["segment_id"], {item["segment_id"] for item in remaining})
-
-        segments = self.client.get(f"/documents/{document['id']}/segments").json()
-        segment = next(item for item in segments if item["ordinal"] == 1)
-        edited = self.client.patch(
-            f"/segments/{segment['id']}/draft",
-            json={"translation": "人工改写但漏掉了数字。"},
+        self.assertEqual(
+            self.client.patch(
+                f"/segments/{segment['id']}/confirm",
+                json={"translation": "能动性塑造社会权力。", "rationale": "Human fixed terminology"},
+            ).status_code,
+            200,
         )
-        self.assertEqual(edited.status_code, 200)
-        required = self.client.get(
-            f"/documents/{document['id']}/human-review-queue",
-            params={"sample_rate": 0},
-        ).json()
-        self.assertEqual(required, [])
+        self.assertEqual(
+            self.client.get(f"/documents/{document['id']}/human-review-queue").json(), []
+        )
 
     def test_epub_overview_uses_embedded_navigation_boundaries(self):
         project = self.client.post(
@@ -179,7 +184,6 @@ class ApiTests(unittest.TestCase):
             json={
                 "draft_provider": "echo",
                 "draft_model": "dry-run",
-                "review_policy": "never",
             },
         )
         self.assertEqual(job_response.status_code, 201)
@@ -268,8 +272,6 @@ class ApiTests(unittest.TestCase):
                 "provider_type": "ollama",
                 "base_url": "http://127.0.0.1:11434/v1",
                 "draft_model": "local-model",
-                "reviewer_model": "",
-                "review_enabled": False,
             },
         )
         self.assertEqual(updated.status_code, 200)
@@ -280,7 +282,7 @@ class ApiTests(unittest.TestCase):
         health = self.client.get("/health")
         self.assertIn("openai-compatible", health.json()["providers"])
 
-    def test_draft_and_reviewer_can_use_independent_provider_profiles(self):
+    def test_draft_and_term_discovery_can_use_independent_provider_profiles(self):
         updated = self.client.patch(
             "/settings/provider",
             json={
@@ -294,7 +296,7 @@ class ApiTests(unittest.TestCase):
                     },
                     {
                         "id": "glm",
-                        "name": "GLM 审校",
+                        "name": "GLM 术语发现",
                         "provider_type": "glm-cn",
                         "base_url": "https://open.bigmodel.cn/api/paas/v4",
                     },
@@ -302,21 +304,19 @@ class ApiTests(unittest.TestCase):
                 "draft_profile_id": "kimi",
                 "draft_model": "k3",
                 "draft_reasoning_effort": "low",
-                "reviewer_profile_id": "glm",
-                "reviewer_model": "glm-5.3-flash",
-                "reviewer_reasoning_effort": "xhigh",
-                "review_enabled": True,
+                "term_discovery_profile_id": "glm",
+                "term_discovery_model": "glm-5.3-flash",
+                "term_discovery_compute_mode": "performance",
             },
         )
 
         self.assertEqual(updated.status_code, 200)
         payload = updated.json()
         self.assertEqual(payload["draft_provider"], "profile:kimi")
-        self.assertEqual(payload["reviewer_provider"], "profile:glm")
+        self.assertEqual(payload["term_discovery_provider"], "profile:glm")
         self.assertEqual(payload["draft_compute_mode"], "economy")
-        self.assertEqual(payload["reviewer_compute_mode"], "performance")
+        self.assertEqual(payload["term_discovery_compute_mode"], "performance")
         self.assertEqual(payload["draft_reasoning_effort"], "low")
-        self.assertEqual(payload["reviewer_reasoning_effort"], "high")
         self.assertEqual(len(payload["profiles"]), 2)
         self.assertNotIn("api_key", payload["profiles"][0])
         providers = self.client.get("/health").json()["providers"]

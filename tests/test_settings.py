@@ -79,7 +79,6 @@ class SettingsTests(unittest.TestCase):
                             }
                         ],
                         "draft": {"profile_id": "deepseek", "model": "deepseek-v4-flash"},
-                        "reviewer": {"profile_id": "deepseek", "model": ""},
                     }
                 ),
                 encoding="utf-8",
@@ -89,7 +88,6 @@ class SettingsTests(unittest.TestCase):
             profile = settings.profiles[0]
 
         self.assertEqual(settings.draft.compute_mode, "economy")
-        self.assertEqual(settings.reviewer.compute_mode, "performance")
         self.assertIn("thinking", profile.capabilities)
         self.assertIn("reasoning_effort", profile.capabilities)
         self.assertIn("tools", profile.capabilities)
@@ -103,8 +101,6 @@ class SettingsTests(unittest.TestCase):
                         "provider_type": "custom",
                         "base_url": "https://open.bigmodel.cn/api/paas/v4",
                         "draft_model": "glm-5.3-flash",
-                        "reviewer_model": "",
-                        "review_enabled": False,
                     }
                 ),
                 encoding="utf-8",
@@ -122,7 +118,7 @@ class SettingsTests(unittest.TestCase):
                 "https://open.bigmodel.cn/api/paas/v4/models",
             )
 
-    def test_round_trips_independent_draft_and_reviewer_profiles(self):
+    def test_round_trips_independent_draft_and_discovery_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
             store = LocalSettingsStore(path)
@@ -132,15 +128,14 @@ class SettingsTests(unittest.TestCase):
                     profile_from_preset("glm", "glm-cn"),
                 ),
                 draft=ModelBinding("kimi", "k3", "economy"),
-                reviewer=ModelBinding("glm", "glm-5.3-flash", "performance"),
-                review_enabled=True,
+                term_discovery=ModelBinding("glm", "glm-5.3-flash", "balanced"),
             )
 
             store.save(settings)
             loaded = store.load()
 
             self.assertEqual(loaded.draft, ModelBinding("kimi", "k3", "economy"))
-            self.assertEqual(loaded.reviewer, ModelBinding("glm", "glm-5.3-flash", "performance"))
+            self.assertEqual(loaded.term_discovery, ModelBinding("glm", "glm-5.3-flash", "balanced"))
             self.assertEqual(len(loaded.profiles), 2)
             self.assertNotIn("api_key", path.read_text(encoding="utf-8"))
 

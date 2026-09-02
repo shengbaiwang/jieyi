@@ -41,6 +41,10 @@ class TermCandidateReview(BaseModel):
     actor: str = "human"
 
 
+class TermCandidateRevocation(BaseModel):
+    actor: str = "human"
+
+
 class TermCandidateApproval(BaseModel):
     target: str = Field(min_length=1)
     sense: str = ""
@@ -216,6 +220,19 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/term-candidate-senses/{sense_id}/revoke")
+    async def revoke_term_candidate_approval(sense_id: str, body: TermCandidateRevocation):
+        try:
+            term_id, project_id = repository.revoke_approval(
+                sense_id, actor=body.actor.strip() or "human",
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        reindex_project_quality(store, project_id)
+        return {"removed_term_id": term_id, "candidate": repository.get_sense(sense_id)}
 
     @app.post("/term-candidate-senses/{sense_id}/approve")
     async def approve_term_candidate_sense(sense_id: str, body: TermCandidateApproval):

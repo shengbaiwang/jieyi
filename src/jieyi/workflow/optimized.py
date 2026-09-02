@@ -4,6 +4,7 @@ import asyncio
 import time
 from dataclasses import replace
 
+from jieyi.context.compiler import compile_neighbor_context
 from jieyi.domain.models import (
     CandidateStage,
     IssueSeverity,
@@ -20,17 +21,14 @@ from jieyi.prompting import build_messages
 from jieyi.protection import PlaceholderIntegrityError
 from jieyi.quality.checks import (
     DETECTOR_VERSION,
-    reviewer_attention_issues,
     run_deterministic_checks,
 )
 from jieyi.terminology import matching_terms, render_terminology_constraints
 from jieyi.workflow.provider_responses import (
     EmptyProviderResponseError,
     content_filter_audit_payload,
-    deferred_translation_message,
     inspect_empty_result,
     is_content_filtered_error,
-    parse_review_response,
     should_expand_output_budget,
 )
 
@@ -213,62 +211,45 @@ async def _translate_group(
     *,
     project_context: str,
     approved_terms: list[TermEntry],
+    segments_by_ordinal: dict[int, Segment],
     limiter: _AdaptiveConcurrencyLimiter,
 ):
-    stage = CandidateStage.REVIEW if job.recipe.task_mode == "review" else CandidateStage.DRAFT
-    model_spec = job.recipe.reviewer if stage is CandidateStage.REVIEW else job.recipe.draft
-    if model_spec is None:
-        raise ValueError("A reviewer model is required for review jobs")
+    stage = CandidateStage.DRAFT
+    model_spec = job.recipe.draft
     provider = engine.providers.get(model_spec.provider)
     source_by_id: dict[str, str] = {}
     structured_by_id: dict[str, bool] = {}
     protected_by_id = {}
     for segment in segments:
         epub_source = engine.store.epub_translation_source(segment.id)
-        existing = _visible_translation(segment) if stage is CandidateStage.REVIEW else ""
-        structured_existing = (
-            engine.store.epub_structured_translation(segment.id)
-            if stage is CandidateStage.REVIEW and epub_source
-            else None
-        )
-        use_structure = bool(
-            epub_source
-            and (stage is not CandidateStage.REVIEW or not existing or structured_existing)
-        )
+        use_structure = bool(epub_source)
         source = epub_source if use_structure else segment.source_text
         source_by_id[segment.id] = source
         structured_by_id[segment.id] = use_structure
         protected_by_id[segment.id] = engine.protected_text_codec.encode(source)
     requests: list[TranslationRequest] = []
     terms_by_id: dict[str, list[TermEntry]] = {}
+    context_by_id: dict[str, str] = {}
     for segment in segments:
         protected = protected_by_id[segment.id]
         relevant = matching_terms(segment.source_text, approved_terms)
         terms_by_id[segment.id] = relevant
-        existing = _visible_translation(segment) if stage is CandidateStage.REVIEW else None
-        existing_for_prompt = (
-            engine.store.epub_structured_translation(segment.id)
-            if existing and structured_by_id[segment.id]
-            else existing
+        term_context = _term_context(segment.source_text, relevant)
+        radius = max(0, job.recipe.neighbor_radius)
+        neighbors = [
+            segments_by_ordinal[ordinal]
+            for ordinal in range(max(0, segment.ordinal - radius), segment.ordinal + radius + 1)
+            if ordinal != segment.ordinal and ordinal in segments_by_ordinal
+        ]
+        neighbor_context = compile_neighbor_context(
+            segment,
+            neighbors,
+            max_chars=max(
+                0, job.recipe.max_context_chars - len(project_context) - len(term_context) - 4
+            ),
+            include_translations=False,
         )
-        masked_existing = existing_for_prompt
-        issue_summary = (
-            deferred_translation_message(engine.store, segment.id)
-            if stage is CandidateStage.REVIEW and not existing
-            else ""
-        )
-        if existing:
-            issues = run_deterministic_checks(
-                segment.source_text,
-                existing,
-                relevant,
-                segment_kind=segment.kind,
-            )
-            issue_summary = "\n".join(issue.message for issue in issues)
-            try:
-                masked_existing = protected.mask_translation(existing_for_prompt)
-            except PlaceholderIntegrityError as exc:
-                issue_summary = "\n".join(filter(None, [issue_summary, str(exc)]))
+        context_by_id[segment.id] = "\n\n".join(filter(None, [term_context, neighbor_context]))
         requests.append(
             TranslationRequest(
                 project=project,
@@ -276,28 +257,18 @@ async def _translate_group(
                 segment=replace(segment, source_text=protected.masked),
                 atom_boundaries=protected.atom_boundaries if structured_by_id[segment.id] else (),
                 context=project_context,
-                segment_context=_term_context(segment.source_text, relevant),
+                segment_context=context_by_id[segment.id],
                 task=stage,
-                existing_translation=masked_existing,
-                issue_summary=issue_summary,
+                existing_translation=None,
+                issue_summary="",
             )
         )
     started = time.monotonic()
     translations: dict[str, str] = {}
     usage_results: list[TranslationResult] = []
-    thinking = (
-        job.recipe.review_thinking if stage is CandidateStage.REVIEW else job.recipe.draft_thinking
-    )
-    reasoning_effort = (
-        job.recipe.review_reasoning_effort
-        if stage is CandidateStage.REVIEW
-        else job.recipe.draft_reasoning_effort
-    )
-    compute_mode = (
-        job.recipe.review_compute_mode
-        if stage is CandidateStage.REVIEW
-        else job.recipe.draft_compute_mode
-    )
+    thinking = job.recipe.draft_thinking
+    reasoning_effort = job.recipe.draft_reasoning_effort
+    compute_mode = job.recipe.draft_compute_mode
 
     async def translate_one(request: TranslationRequest) -> tuple[str, TranslationResult]:
         source_chars = len(request.segment.source_text) + len(request.existing_translation or "")
@@ -316,23 +287,11 @@ async def _translate_group(
                 max_output_tokens=job.recipe.max_output_tokens,
             )
         result = await limiter.complete(operation)
-        if stage is CandidateStage.REVIEW:
-            raw_review_text = result.text
-            reviewed_text, findings = parse_review_response(raw_review_text)
-            if not reviewed_text:
-                raise ValueError("Reviewer response did not contain a translation")
-            result = replace(
-                result,
-                text=reviewed_text,
-                raw_response=result.raw_response or raw_review_text,
-                review_findings=findings,
-            )
         return request.segment.id, result
 
     # Resolve every segment independently so one provider refusal does not discard
     # successful siblings from the same batch.
     failures: dict[str, BaseException] = {}
-    review_findings_by_id: dict[str, tuple[str, ...]] = {}
     completed = await asyncio.gather(
         *(translate_one(request) for request in requests),
         return_exceptions=True,
@@ -345,7 +304,6 @@ async def _translate_group(
             continue
         segment_id, result = outcome
         translations[segment_id] = result.text
-        review_findings_by_id[segment_id] = result.review_findings
         usage_results.append(result)
     restored: dict[str, str] = {}
     candidate_stages: dict[str, CandidateStage] = {}
@@ -360,7 +318,7 @@ async def _translate_group(
                 engine.store.capture_epub_translation(
                     segment.id,
                     restored_value,
-                    "review" if stage is CandidateStage.REVIEW else "draft",
+                    "draft",
                 )
                 if structured_by_id[segment.id]
                 else restored_value
@@ -377,7 +335,7 @@ async def _translate_group(
                         engine.store.capture_epub_translation(
                             segment.id,
                             restored_value,
-                            "review" if stage is CandidateStage.REVIEW else "draft",
+                            "draft",
                         )
                         if structured_by_id[segment.id]
                         else restored_value
@@ -405,7 +363,7 @@ async def _translate_group(
                     segment=replace(segment, source_text=protected.masked),
                     atom_boundaries=protected.atom_boundaries if structured_by_id[segment.id] else (),
                     context=project_context,
-                    segment_context=_term_context(segment.source_text, terms_by_id[segment.id]),
+                    segment_context=context_by_id[segment.id],
                     task=CandidateStage.REPAIR,
                     # Always repair the original draft. A failed repair commonly strips every
                     # marker, so chaining repair outputs destroys useful placement information.
@@ -477,39 +435,8 @@ async def _translate_group(
         usage,
         elapsed,
         terms_by_id,
-        review_findings_by_id,
         failures,
     )
-
-
-def _review_candidates(
-    engine, job: Job, segments: list[Segment], approved_terms: list[TermEntry]
-) -> list[Segment]:
-    sample_rate = job.recipe.review_sample_rate
-    stride = max(1, round(1 / sample_rate)) if sample_rate > 0 else 0
-    selected: list[Segment] = []
-    for segment in segments:
-        existing = _visible_translation(segment)
-        if not existing and deferred_translation_message(engine.store, segment.id):
-            selected.append(segment)
-            continue
-        if not existing:
-            continue
-        if job.recipe.review_policy == "all":
-            selected.append(segment)
-            continue
-        terms = matching_terms(segment.source_text, approved_terms)
-        issues = run_deterministic_checks(
-            segment.source_text,
-            existing,
-            terms,
-            segment_kind=segment.kind,
-        )
-        sampled = bool(stride and segment.ordinal % stride == 0)
-        blocking = any(issue.severity is IssueSeverity.ERROR for issue in issues)
-        if blocking or sampled:
-            selected.append(segment)
-    return selected
 
 
 def _can_defer_segment_failure(error: BaseException) -> bool:
@@ -610,6 +537,9 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
     project = engine.store.get_project_for_document(job.document_id)
     document = engine.store.get_document(job.document_id)
     all_segments = engine.store.list_segments(job.document_id)
+    # A stable reference snapshot includes neighbors outside the selected range so
+    # concurrent batch results cannot change another request's context.
+    segments_by_ordinal = {segment.ordinal: segment for segment in all_segments}
     selected_ranges = job.recipe.segment_ranges
     pending = [
         segment
@@ -623,15 +553,12 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
     approved_terms = [
         term for term in engine.store.list_terms(project.id) if term.status.value == "approved"
     ]
-    if job.recipe.task_mode == "review":
-        eligible = _review_candidates(engine, job, pending, approved_terms)
-    else:
-        eligible = [
-            segment
-            for segment in pending
-            if segment.status is not SegmentStatus.HUMAN_CONFIRMED
-            and not _visible_translation(segment)
-        ]
+    eligible = [
+        segment
+        for segment in pending
+        if segment.status is not SegmentStatus.HUMAN_CONFIRMED
+        and not _visible_translation(segment)
+    ]
     groups = _groups(eligible, job.recipe.batch_size, job.recipe.max_batch_chars)
     project_context = _project_context(project, job.recipe.max_context_chars)
     limiter = _AdaptiveConcurrencyLimiter(
@@ -664,6 +591,7 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                 group,
                 project_context=project_context,
                 approved_terms=approved_terms,
+                segments_by_ordinal=segments_by_ordinal,
                 limiter=limiter,
             ),
             name=f"jieyi-{job.id}-group-{group_index}",
@@ -729,7 +657,6 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                     usage,
                     elapsed,
                     terms_by_id,
-                    review_findings_by_id,
                     segment_failures,
                 ) = result
                 for segment in group:
@@ -750,12 +677,6 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                         terms_by_id[segment.id],
                         segment_kind=segment.kind,
                     )
-                    if stage is CandidateStage.REVIEW:
-                        issues.extend(
-                            reviewer_attention_issues(
-                                review_findings_by_id.get(segment.id, ())
-                            )
-                        )
                     engine.store.replace_issues(
                         job.id,
                         segment.id,
@@ -763,10 +684,7 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                         target_text=text,
                         detector_version=DETECTOR_VERSION,
                     )
-                    if stage is CandidateStage.REVIEW:
-                        engine.store.set_reviewed_translation(segment.id, text)
-                    else:
-                        engine.store.set_machine_translation(segment.id, text)
+                    engine.store.set_machine_translation(segment.id, text)
                 engine.store.record_batch(
                     job_id=job.id,
                     stage=stage,
