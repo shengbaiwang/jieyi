@@ -20,9 +20,14 @@ def build_system_prompt(request: TranslationRequest) -> str:
     if request.task is CandidateStage.REVIEW:
         if request.existing_translation:
             instruction = (
-                "Revise the current translation only where necessary. Preserve meaning, modality, "
-                "attribution and every mandatory terminology constraint. Actively correct any "
-                "terminology issue listed below. Return only the revised translation."
+                "Independently compare the source and current translation sentence by sentence; "
+                "do not assume the draft is correct. Check for omissions, additions, mistranslations, "
+                "distorted modality or attribution, terminology errors, and unnatural target-language "
+                "wording. Revise only where justified, preserve genuine source ambiguity, and actively "
+                "correct every clear issue listed below. Return the complete revised translation first. "
+                "Only when a material ambiguity or factual decision cannot be resolved from the source "
+                "and supplied context, append a blank line, the exact line JY_REVIEW_ISSUES:, and one "
+                "concise bullet per question for a human. Omit this appendix when no human decision is needed."
             )
         else:
             instruction = (

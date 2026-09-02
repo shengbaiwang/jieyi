@@ -18,7 +18,11 @@ from jieyi.domain.models import (
 )
 from jieyi.prompting import build_messages
 from jieyi.protection import PlaceholderIntegrityError
-from jieyi.quality.checks import DETECTOR_VERSION, run_deterministic_checks
+from jieyi.quality.checks import (
+    DETECTOR_VERSION,
+    reviewer_attention_issues,
+    run_deterministic_checks,
+)
 from jieyi.terminology import matching_terms, render_terminology_constraints
 from jieyi.workflow.provider_responses import (
     EmptyProviderResponseError,
@@ -26,6 +30,7 @@ from jieyi.workflow.provider_responses import (
     deferred_translation_message,
     inspect_empty_result,
     is_content_filtered_error,
+    parse_review_response,
     should_expand_output_budget,
 )
 
@@ -310,11 +315,23 @@ async def _translate_group(
                 max_output_tokens=job.recipe.max_output_tokens,
             )
         result = await limiter.complete(operation)
+        if stage is CandidateStage.REVIEW:
+            raw_review_text = result.text
+            reviewed_text, findings = parse_review_response(raw_review_text)
+            if not reviewed_text:
+                raise ValueError("Reviewer response did not contain a translation")
+            result = replace(
+                result,
+                text=reviewed_text,
+                raw_response=result.raw_response or raw_review_text,
+                review_findings=findings,
+            )
         return request.segment.id, result
 
     # Resolve every segment independently so one provider refusal does not discard
     # successful siblings from the same batch.
     failures: dict[str, BaseException] = {}
+    review_findings_by_id: dict[str, tuple[str, ...]] = {}
     completed = await asyncio.gather(
         *(translate_one(request) for request in requests),
         return_exceptions=True,
@@ -327,6 +344,7 @@ async def _translate_group(
             continue
         segment_id, result = outcome
         translations[segment_id] = result.text
+        review_findings_by_id[segment_id] = result.review_findings
         usage_results.append(result)
     restored: dict[str, str] = {}
     candidate_stages: dict[str, CandidateStage] = {}
@@ -454,6 +472,7 @@ async def _translate_group(
         usage,
         elapsed,
         terms_by_id,
+        review_findings_by_id,
         failures,
     )
 
@@ -698,6 +717,7 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                     usage,
                     elapsed,
                     terms_by_id,
+                    review_findings_by_id,
                     segment_failures,
                 ) = result
                 for segment in group:
@@ -718,6 +738,12 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                         terms_by_id[segment.id],
                         segment_kind=segment.kind,
                     )
+                    if stage is CandidateStage.REVIEW:
+                        issues.extend(
+                            reviewer_attention_issues(
+                                review_findings_by_id.get(segment.id, ())
+                            )
+                        )
                     engine.store.replace_issues(
                         job.id,
                         segment.id,

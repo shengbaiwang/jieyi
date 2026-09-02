@@ -78,6 +78,14 @@ _READER_STYLE = """
   border-inline-start: 1px solid rgba(40,100,190,.28) !important;
   color: inherit !important;
 }
+.jy-translation.jy-source-italic,
+[data-jy-atoms].jy-source-italic,
+.jy-translation :is(em, i),
+[data-jy-atoms] :is(em, i) {
+  font-family: "Kaiti SC", STKaiti, KaiTi, "楷体", serif !important;
+  font-style: normal !important;
+  font-synthesis: none !important;
+}
 .jy-bilingual-pair > :is(.jy-original, .jy-translation) > :first-child { margin-block-start: 0 !important; }
 .jy-bilingual-pair > :is(.jy-original, .jy-translation) > :last-child { margin-block-end: 0 !important; }
 .jy-translation.jy-missing-translation {
@@ -118,7 +126,15 @@ _FAITHFUL_FIXED_STYLE = """
   background: rgba(255,255,255,.88) !important;
 }
 """
-_RESIZE_SCRIPT = """(()=>{let pending=false;const send=()=>{pending=false;const root=document.documentElement;const body=document.body;const height=body?Math.max(body.offsetHeight,Math.ceil(body.getBoundingClientRect().height)):root.offsetHeight;parent.postMessage({type:"jy-epub-resize",documentId:root.getAttribute("data-jy-document-id"),spineIndex:Number(root.getAttribute("data-jy-spine-index")),height:Math.ceil(height)},"*");};const queue=()=>{if(pending)return;pending=true;requestAnimationFrame(send);};addEventListener("load",queue);if(document.fonts){document.fonts.ready.then(queue);}if("ResizeObserver" in window){new ResizeObserver(queue).observe(document.body||document.documentElement);}queue();})();"""
+_RESIZE_SCRIPT = (
+    """(()=>{let pending=false;const root=document.documentElement;"""
+    """const documentId=root.getAttribute("data-jy-document-id");"""
+    """const spineIndex=Number(root.getAttribute("data-jy-spine-index"));"""
+    """const send=()=>{pending=false;const body=document.body;const height=body?Math.max(body.offsetHeight,Math.ceil(body.getBoundingClientRect().height)):root.offsetHeight;parent.postMessage({type:"jy-epub-resize",documentId,spineIndex,height:Math.ceil(height)},"*");};"""
+    """const queue=()=>{if(pending)return;pending=true;requestAnimationFrame(send);};"""
+    """addEventListener("message",event=>{const data=event.data||{};const ordinal=Number(data.segmentOrdinal);if(data.type!=="jy-epub-locate"||data.documentId!==documentId||Number(data.spineIndex)!==spineIndex||!Number.isInteger(ordinal))return;const target=document.querySelector('[data-jy-segment-ordinals~="'+ordinal+'"]');if(!target)return;const top=target.getBoundingClientRect().top+(window.scrollY||0);parent.postMessage({type:"jy-epub-location",documentId,spineIndex,segmentOrdinal:ordinal,top:Math.max(0,Math.round(top))},"*");});"""
+    """addEventListener("load",queue);if(document.fonts){document.fonts.ready.then(queue);}if("ResizeObserver" in window){new ResizeObserver(queue).observe(document.body||document.documentElement);}queue();})();"""
+)
 _RESIZE_SCRIPT_HASH = base64.b64encode(
     hashlib.sha256(_RESIZE_SCRIPT.encode("utf-8")).digest()
 ).decode("ascii")
@@ -336,6 +352,7 @@ def _pair_translation(
     atom_ids: list[str],
     *,
     missing: bool = False,
+    source_italic: bool = False,
 ) -> None:
     namespace = _element_namespace(element)
     original = ET.Element(namespace + "span", {"class": "jy-original"})
@@ -348,7 +365,9 @@ def _pair_translation(
     translated = ET.Element(
         namespace + "span",
         {
-            "class": "jy-translation" + (" jy-missing-translation" if missing else ""),
+            "class": "jy-translation"
+            + (" jy-source-italic" if source_italic else "")
+            + (" jy-missing-translation" if missing else ""),
             "lang": "zh",
             "data-jy-for": " ".join(atom_ids),
         },
@@ -362,6 +381,16 @@ def _pair_translation(
     ).strip()
     element.append(original)
     element.append(translated)
+
+
+def _source_uses_italic(atoms: list[dict]) -> bool:
+    """Return whether the source styling marks any atom as italic or oblique."""
+    for atom in atoms:
+        fields = str(atom.get("style_signature") or "").split("\x1f")
+        font_style = fields[6].strip().casefold() if len(fields) > 6 else ""
+        if font_style.startswith(("italic", "oblique")):
+            return True
+    return False
 
 
 def _inject_style(root: ET.Element, css: str) -> None:
@@ -418,17 +447,28 @@ def render_spine(
     paths = _path_map(root)
     root = _sanitize_tree(root, document_id=document_id, base_path=item["path"])
 
+    atoms = (
+        store.list_epub_atoms_for_spine(document_id, spine_index)
+        if mode != "original"
+        else store.list_epub_locations_for_spine(document_id, spine_index)
+    )
+    grouped: dict[str, list[dict]] = {}
+    for atom in atoms:
+        grouped.setdefault(atom["dom_path"], []).append(atom)
+    for dom_path, group in grouped.items():
+        element = paths.get(dom_path)
+        if element is None:
+            continue
+        ordinals = sorted({int(atom["segment_ordinal"]) for atom in group})
+        element.attrib["data-jy-segment-ordinals"] = " ".join(map(str, ordinals))
+
     if mode != "original":
-        atoms = store.list_epub_atoms_for_spine(document_id, spine_index)
         node_rows = {
             item["node_id"]: item
             for item in store.list_epub_text_nodes_for_spine(
                 document_id, spine_index
             )
         }
-        grouped: dict[str, list[dict]] = {}
-        for atom in atoms:
-            grouped.setdefault(atom["dom_path"], []).append(atom)
         for dom_path, group in grouped.items():
             element = paths.get(dom_path)
             if element is None:
@@ -451,11 +491,17 @@ def render_spine(
                     )
                 continue
             markup = " ".join(atom["translation_markup"] for atom in translated)
+            source_italic = _source_uses_italic(translated)
             if mode == "translated":
                 if len(group) == 1:
                     _replace_inner(element, markup)
                 else:
                     _replace_text_nodes(paths, group, node_rows)
+                element.attrib["lang"] = "zh"
+                if source_italic:
+                    element.attrib["class"] = (
+                        element.attrib.get("class", "") + " jy-source-italic"
+                    ).strip()
                 element.attrib["data-jy-atoms"] = " ".join(
                     atom["atom_id"] for atom in translated
                 )
@@ -464,6 +510,7 @@ def render_spine(
                     element,
                     markup,
                     [atom["atom_id"] for atom in translated],
+                    source_italic=source_italic,
                 )
 
     root = _sanitize_tree(root, document_id=document_id, base_path=item["path"])

@@ -67,12 +67,13 @@ build_asset() {
   "$python_bin" -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]]["file"])' "$manifest" "$key" 2>/dev/null
 }
 
-build_is_fresh() {
+web_build_is_fresh() {
   local manifest="$WEB_DIR/dist/client/.vite/manifest.json"
   local input
   [[ -f "$manifest" ]] || return 1
-  for input in "$SCRIPT_DIR/src" "$SCRIPT_DIR/pyproject.toml" "$SCRIPT_DIR/uv.lock" "$SCRIPT_DIR/启动介译.command" \
-    "$WEB_DIR/app" "$WEB_DIR/package.json" "$WEB_DIR/package-lock.json" "$WEB_DIR/vinext.config.ts" "$WEB_DIR/next.config.ts" "$WEB_DIR/tsconfig.json"; do
+  for input in "$WEB_DIR/app" "$WEB_DIR/public" "$WEB_DIR/worker" \
+    "$WEB_DIR/package.json" "$WEB_DIR/package-lock.json" "$WEB_DIR/vite.config.ts" \
+    "$WEB_DIR/vinext.config.ts" "$WEB_DIR/next.config.ts" "$WEB_DIR/tsconfig.json"; do
     [[ -e "$input" ]] || continue
     if find "$input" -type f -newer "$manifest" -print -quit 2>/dev/null | grep -q .; then
       return 1
@@ -81,10 +82,34 @@ build_is_fresh() {
   return 0
 }
 
+running_stack_is_fresh() {
+  local runtime_marker="$RUNTIME_FILE"
+  local input
+  [[ -f "$runtime_marker" ]] || return 1
+  web_build_is_fresh || return 1
+  for input in "$SCRIPT_DIR/src" "$SCRIPT_DIR/pyproject.toml" "$SCRIPT_DIR/uv.lock" "$SCRIPT_DIR/启动介译.command"; do
+    [[ -e "$input" ]] || continue
+    if find "$input" -type f -newer "$runtime_marker" -print -quit 2>/dev/null | grep -q .; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+web_build_targets_api() {
+  local api_port="$1"
+  local page_asset page_file
+  page_asset="$(build_asset 'app/page.tsx' || true)"
+  [[ -n "$page_asset" ]] || return 1
+  page_file="$WEB_DIR/dist/client/$page_asset"
+  [[ -s "$page_file" ]] || return 1
+  grep -Fq "http://127.0.0.1:${api_port}" "$page_file"
+}
+
 web_matches_current_build() {
   local web_port="$1"
   local api_port="$2"
-  local html entry_asset page_asset page_file asset
+  local html entry_asset page_asset asset
   local -a referenced_assets
   entry_asset="$(build_asset 'virtual:vinext-app-browser-entry' || true)"
   page_asset="$(build_asset 'app/page.tsx' || true)"
@@ -97,9 +122,7 @@ web_matches_current_build() {
   for asset in "${referenced_assets[@]}"; do
     curl -fsS --connect-timeout 1 --max-time 5 "http://127.0.0.1:${web_port}${asset}" -o /dev/null 2>/dev/null || return 1
   done
-  page_file="$WEB_DIR/dist/client/$page_asset"
-  [[ -s "$page_file" ]] || return 1
-  grep -Fq "http://127.0.0.1:${api_port}" "$page_file" || return 1
+  web_build_targets_api "$api_port" || return 1
   curl -fsS --connect-timeout 1 --max-time 5 "http://127.0.0.1:${api_port}/projects" -o /dev/null 2>/dev/null || return 1
 }
 
@@ -172,7 +195,7 @@ saved_owner_pid="$(runtime_value OWNER_PID || true)"
 saved_web_port="$(runtime_value WEB_PORT || true)"
 saved_api_port="$(runtime_value API_PORT || true)"
 if [[ -n "$saved_web_port" && -n "$saved_api_port" ]]; then
-  if build_is_fresh && api_is_current_project "$saved_api_port" && web_matches_current_build "$saved_web_port" "$saved_api_port"; then
+  if running_stack_is_fresh && api_is_current_project "$saved_api_port" && web_matches_current_build "$saved_web_port" "$saved_api_port"; then
     LOCAL_URL="http://localhost:${saved_web_port}/"
     print "  当前项目的工作台已经通过完整检查，正在打开…"
     release_launch_lock
@@ -268,8 +291,12 @@ if [[ ! -d node_modules ]]; then
   print ""
 fi
 
-print "  正在构建最新工作台…"
-NEXT_PUBLIC_JIEYI_API="$API_ROOT" npm run build
+if web_build_is_fresh && web_build_targets_api "$API_PORT"; then
+  print "  已找到有效工作台构建，直接启动…"
+else
+  print "  正在构建最新工作台…"
+  NEXT_PUBLIC_JIEYI_API="$API_ROOT" npm run build
+fi
 
 print ""
 print "  正在启动并验证完整工作台…"

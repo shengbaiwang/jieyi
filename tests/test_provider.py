@@ -25,6 +25,34 @@ class FakeResponse:
 
 
 class ProviderUsageTests(unittest.TestCase):
+    def test_openrouter_attribution_headers_are_http_encodable(self):
+        payload = {"choices": [{"message": {"content": "译文"}}]}
+        provider = OpenAICompatibleProvider(
+            "https://openrouter.ai/api/v1", api_key="test-key"
+        )
+        model = ModelSpec(provider="openai-compatible", model="anthropic/test")
+        captured_headers = {}
+
+        def respond(request, timeout):
+            del timeout
+            captured_headers.update(request.header_items())
+            for name, value in request.header_items():
+                name.encode("ascii")
+                value.encode("latin-1")
+            return FakeResponse(payload)
+
+        with patch("urllib.request.urlopen", side_effect=respond):
+            result = provider._complete_sync(
+                [{"role": "user", "content": "source"}],
+                model,
+                thinking=False,
+                reasoning_effort=None,
+                max_tokens=512,
+            )
+
+        self.assertEqual(result.text, "译文")
+        self.assertEqual(captured_headers["X-openrouter-title"], "Jieyi")
+
     def test_recognizes_glm_http_1301_safety_rejection_for_workflow_deferral(self):
         error = ProviderError(
             "Provider request failed: HTTP 400: "

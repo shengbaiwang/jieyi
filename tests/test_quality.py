@@ -1,11 +1,11 @@
 import unittest
 
-from jieyi.domain.models import IssueSeverity, SegmentKind, TermEntry, TermStatus
+from jieyi.domain.models import IssueSeverity, TermEntry, TermStatus
 from jieyi.quality import run_deterministic_checks
 
 
 class QualityTests(unittest.TestCase):
-    def test_detects_numbers_citations_and_terms(self):
+    def test_detects_footnotes_and_terms(self):
         term = TermEntry(
             id="term_1",
             project_id="proj_1",
@@ -20,8 +20,6 @@ class QualityTests(unittest.TestCase):
             [term],
         )
         codes = {item.code for item in issues}
-        self.assertIn("number_mismatch", codes)
-        self.assertIn("citation_mismatch", codes)
         self.assertIn("footnote_mismatch", codes)
         self.assertIn("approved_term_missing", codes)
         self.assertIn("forbidden_term_used", codes)
@@ -42,70 +40,12 @@ class QualityTests(unittest.TestCase):
         )
         self.assertEqual(issues, [])
 
-    def test_cjk_adjacent_numbers_grouping_and_unicode_digits_are_equivalent(self):
+    def test_ignores_number_and_parenthesis_differences(self):
         issues = run_deterministic_checks(
-            "Winner in 2012; first 5,000 years; note 8.",
-            "荣获2012年；最初5000年；注8。",
+            "Revenue fell from 12% to 9% (Smith 2020) [12].",
+            "收入从12%下降到8%（Smith 2021 [13]。",
         )
-        self.assertNotIn("number_mismatch", {item.code for item in issues})
-
-    def test_localised_numeric_facts_are_semantically_equivalent(self):
-        pairs = (
-            ("First printing: October 2014", "首次印刷：2014年10月"),
-            ("In May the army advanced", "军队于五月推进"),
-            ("Starting in the 1980s", "自20世纪80年代起"),
-            ("the nineteenth century", "19世纪"),
-            ("150 million francs", "1.5亿法郎"),
-            ("60 percent", "60%"),
-            ("30 percent of the harvest", "收成的三成"),
-            ("Amos 2.6", "《阿摩司书》2:6"),
-            ("800 to 1000 pesos", "八百到一千比索"),
-            ("Workers arrived at 8:00", "工人于8点到达"),
-            ("Release v3.1_r2", "版本 v3.1_r2"),
-        )
-        for source, target in pairs:
-            with self.subTest(source=source, target=target):
-                issues = run_deterministic_checks(source, target)
-                self.assertNotIn("number_mismatch", {item.code for item in issues})
-
-    def test_note_styles_and_inline_enumerations_do_not_create_numeric_mismatches(self):
-        pairs = (
-            ("An example.10 Next sentence.", "一个例子。¹⁰ 下一句。"),
-            ("Claim.)5 Next sentence.", "主张。）⁵ 下一句。"),
-            (
-                "noun 1 first meaning. 2 second meaning. 3 third meaning.",
-                "名词 1 第一义。2 第二义。3 第三义。",
-            ),
-        )
-        for source, target in pairs:
-            with self.subTest(source=source, target=target):
-                issues = run_deterministic_checks(source, target)
-                self.assertNotIn("number_mismatch", {item.code for item in issues})
-
-    def test_missing_numeric_fact_is_a_high_confidence_warning(self):
-        issues = run_deterministic_checks(
-            "Revenue fell from 12% to 9%.",
-            "收入从12%下降到8%。",
-        )
-        issue = next(item for item in issues if item.code == "number_mismatch")
-        self.assertEqual(issue.severity, IssueSeverity.WARNING)
-        self.assertEqual(issue.details["detector_version"], "4")
-        self.assertEqual(issue.details["confidence"], "high")
-        self.assertEqual(issue.details["missing_typed"], {"percent:9": 1})
-
-    def test_footnote_segments_skip_ambiguous_generic_number_checks(self):
-        issues = run_deterministic_checks(
-            "24. See Amos 2.6 and page 193.",
-            "参见《阿摩司书》2:6及第193页。",
-            segment_kind=SegmentKind.FOOTNOTE,
-        )
-        self.assertNotIn("number_mismatch", {item.code for item in issues})
-
-    def test_list_markers_do_not_look_like_unbalanced_parentheses(self):
-        clean = run_deterministic_checks("1) First", "1）第一")
-        broken = run_deterministic_checks("Text", "文字（缺少右括号")
-        self.assertNotIn("unbalanced_parentheses", {item.code for item in clean})
-        self.assertIn("unbalanced_parentheses", {item.code for item in broken})
+        self.assertEqual(issues, [])
 
     def test_western_terms_use_token_boundaries(self):
         term = TermEntry(

@@ -179,6 +179,72 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS term_discovery_runs (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    coverage_json TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    reasoning_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    error TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS term_lexeme_candidates (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES term_discovery_runs(id) ON DELETE CASCADE,
+    lexeme_key TEXT NOT NULL,
+    canonical_form TEXT NOT NULL,
+    forms_json TEXT NOT NULL,
+    frequency INTEGER NOT NULL,
+    segment_frequency INTEGER NOT NULL,
+    risk_score REAL NOT NULL,
+    rank INTEGER NOT NULL,
+    candidate_type TEXT NOT NULL DEFAULT 'unclassified',
+    boundary_confidence REAL NOT NULL DEFAULT 0,
+    score_components_json TEXT NOT NULL,
+    extraction_methods_json TEXT NOT NULL,
+    UNIQUE(run_id, lexeme_key)
+);
+
+CREATE TABLE IF NOT EXISTS term_candidate_senses (
+    id TEXT PRIMARY KEY,
+    lexeme_id TEXT NOT NULL REFERENCES term_lexeme_candidates(id) ON DELETE CASCADE,
+    sense_key TEXT NOT NULL,
+    sense TEXT NOT NULL,
+    concept_definition TEXT NOT NULL,
+    proposed_target TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    disambiguation TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    ai_recommended INTEGER,
+    evidence_ids_json TEXT NOT NULL,
+    proposer TEXT NOT NULL,
+    status TEXT NOT NULL,
+    approved_term_id TEXT REFERENCES terms(id) ON DELETE SET NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS term_candidate_evidence (
+    id TEXT PRIMARY KEY,
+    lexeme_id TEXT NOT NULL REFERENCES term_lexeme_candidates(id) ON DELETE CASCADE,
+    segment_id TEXT NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    source_form TEXT NOT NULL,
+    quote TEXT NOT NULL,
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    heading_path TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS epub_packages (
     document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
     original_epub BLOB NOT NULL,
@@ -264,6 +330,10 @@ CREATE INDEX IF NOT EXISTS idx_job_batches_job ON job_batches(job_id, created_at
 CREATE INDEX IF NOT EXISTS idx_issues_segment ON issues(segment_id, resolved);
 CREATE INDEX IF NOT EXISTS idx_tm_project_source ON tm_entries(project_id, source_normalized);
 CREATE INDEX IF NOT EXISTS idx_documents_source_hash ON documents(source_hash);
+CREATE INDEX IF NOT EXISTS idx_term_runs_document ON term_discovery_runs(document_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_term_lexemes_run ON term_lexeme_candidates(run_id, rank);
+CREATE INDEX IF NOT EXISTS idx_term_senses_status ON term_candidate_senses(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_term_evidence_lexeme ON term_candidate_evidence(lexeme_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_epub_resources_document ON epub_resources(document_id);
 CREATE INDEX IF NOT EXISTS idx_epub_atoms_segment ON epub_atoms(segment_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_epub_atoms_spine ON epub_atoms(document_id, spine_index, ordinal);
@@ -364,9 +434,7 @@ class SQLiteStore:
                 )
                 aliases_value = "aliases_json" if "aliases_json" in term_columns else "'[]'"
                 context_value = (
-                    "context_keywords_json"
-                    if "context_keywords_json" in term_columns
-                    else "'[]'"
+                    "context_keywords_json" if "context_keywords_json" in term_columns else "'[]'"
                 )
                 sense_value = "sense" if "sense" in term_columns else "''"
                 disambiguation_value = (
@@ -398,8 +466,25 @@ class SQLiteStore:
                 connection.execute(
                     "ALTER TABLE issues ADD COLUMN target_hash TEXT NOT NULL DEFAULT ''"
                 )
+            term_candidate_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(term_lexeme_candidates)"
+                ).fetchall()
+            }
+            if "candidate_type" not in term_candidate_columns:
+                connection.execute(
+                    "ALTER TABLE term_lexeme_candidates ADD COLUMN "
+                    "candidate_type TEXT NOT NULL DEFAULT 'unclassified'"
+                )
+            if "boundary_confidence" not in term_candidate_columns:
+                connection.execute(
+                    "ALTER TABLE term_lexeme_candidates ADD COLUMN "
+                    "boundary_confidence REAL NOT NULL DEFAULT 0"
+                )
             candidate_columns = {
-                row["name"] for row in connection.execute("PRAGMA table_info(candidates)").fetchall()
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(candidates)").fetchall()
             }
             for name in ("reasoning_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
                 if name not in candidate_columns:
@@ -414,12 +499,14 @@ class SQLiteStore:
                 try:
                     usage = (json.loads(row["raw_response"]) or {}).get("usage") or {}
                     details = usage.get("completion_tokens_details") or {}
-                    usage_updates.append((
-                        int(details.get("reasoning_tokens") or 0),
-                        int(usage.get("prompt_cache_hit_tokens") or 0),
-                        int(usage.get("prompt_cache_miss_tokens") or 0),
-                        row["id"],
-                    ))
+                    usage_updates.append(
+                        (
+                            int(details.get("reasoning_tokens") or 0),
+                            int(usage.get("prompt_cache_hit_tokens") or 0),
+                            int(usage.get("prompt_cache_miss_tokens") or 0),
+                            row["id"],
+                        )
+                    )
                 except (TypeError, ValueError, AttributeError):
                     continue
             if usage_updates:
@@ -451,7 +538,9 @@ class SQLiteStore:
 
     def get_project(self, project_id: str) -> Project:
         with self._connect() as connection:
-            row = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
         if row is None:
             raise NotFoundError(f"Project not found: {project_id}")
         return self._project(row)
@@ -473,9 +562,7 @@ class SQLiteStore:
             )
         return self.get_project(project_id)
 
-    def find_document_by_source_hash(
-        self, project_id: str, source_hash: str
-    ) -> Document | None:
+    def find_document_by_source_hash(self, project_id: str, source_hash: str) -> Document | None:
         with self._connect() as connection:
             row = connection.execute(
                 """SELECT * FROM documents WHERE project_id = ? AND source_hash = ?
@@ -493,11 +580,7 @@ class SQLiteStore:
             raise ValueError("EPUB SHA-256 does not match the imported document")
 
         segments = self.list_segments(document_id)
-        ref_to_segment = {
-            ref: segment.id
-            for segment in segments
-            for ref in segment.source_refs
-        }
+        ref_to_segment = {ref: segment.id for segment in segments for ref in segment.source_refs}
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             for table in (
@@ -666,12 +749,31 @@ class SQLiteStore:
                 (document_id,),
             ).fetchall()
         return [
-            dict(row) | {
+            dict(row)
+            | {
                 "linear": bool(row["linear"]),
                 "fixed_layout": bool(row["fixed_layout"]),
             }
             for row in rows
         ]
+
+    def list_epub_segment_locations(self, document_id: str) -> list[dict[str, int]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT s.ordinal AS segment_ordinal, a.spine_index
+                FROM epub_atoms a JOIN segments s ON s.id = a.segment_id
+                WHERE a.document_id = ? ORDER BY a.ordinal""",
+                (document_id,),
+            ).fetchall()
+        result: list[dict[str, int]] = []
+        seen: set[int] = set()
+        for row in rows:
+            ordinal = int(row["segment_ordinal"])
+            if ordinal in seen:
+                continue
+            seen.add(ordinal)
+            result.append({"segment_ordinal": ordinal, "spine_index": int(row["spine_index"])})
+        return result
 
     def get_epub_resource(self, document_id: str, path: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -689,14 +791,22 @@ class SQLiteStore:
                 """SELECT * FROM epub_atoms WHERE segment_id = ? ORDER BY ordinal""",
                 (segment_id,),
             ).fetchall()
-        return [
-            dict(row) | {"node_refs": json.loads(row["node_refs_json"])}
-            for row in rows
-        ]
+        return [dict(row) | {"node_refs": json.loads(row["node_refs_json"])} for row in rows]
 
-    def list_epub_atoms_for_spine(
+    def list_epub_locations_for_spine(
         self, document_id: str, spine_index: int
     ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT a.dom_path, s.ordinal AS segment_ordinal
+                FROM epub_atoms a JOIN segments s ON s.id = a.segment_id
+                WHERE a.document_id = ? AND a.spine_index = ?
+                ORDER BY a.ordinal""",
+                (document_id, spine_index),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_epub_atoms_for_spine(self, document_id: str, spine_index: int) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
                 """SELECT a.*, s.ordinal AS segment_ordinal,
@@ -708,10 +818,11 @@ class SQLiteStore:
                 (document_id, spine_index),
             ).fetchall()
             translations = connection.execute(
-                """SELECT t.* FROM epub_atom_translations t
-                JOIN segments s ON s.id = t.segment_id
-                WHERE s.document_id = ?""",
-                (document_id,),
+                """SELECT DISTINCT t.* FROM epub_atom_translations t
+                JOIN epub_atoms a
+                  ON a.segment_id = t.segment_id AND a.atom_id = t.atom_id
+                WHERE a.document_id = ? AND a.spine_index = ?""",
+                (document_id, spine_index),
             ).fetchall()
         by_atom: dict[str, dict[str, sqlite3.Row]] = {}
         for row in translations:
@@ -800,13 +911,11 @@ class SQLiteStore:
                 return None
             pieces.append(
                 f'<jy-atom data-jy-id="{escape(atom["atom_id"], quote=True)}">'
-                f'{chosen["translation_markup"]}</jy-atom>'
+                f"{chosen['translation_markup']}</jy-atom>"
             )
         return "".join(pieces)
 
-    def capture_epub_translation(
-        self, segment_id: str, value: str, stage: str
-    ) -> str:
+    def capture_epub_translation(self, segment_id: str, value: str, stage: str) -> str:
         from jieyi.ingestion.epub_roundtrip import parse_structured_translation
 
         atoms = self.list_epub_atoms_for_segment(segment_id)
@@ -853,18 +962,14 @@ class SQLiteStore:
             ).fetchall()
         return {
             "atoms": [
-                dict(row) | {"node_refs": json.loads(row["node_refs_json"])}
-                for row in atoms
+                dict(row) | {"node_refs": json.loads(row["node_refs_json"])} for row in atoms
             ],
             "text_nodes": [dict(row) for row in nodes],
         }
 
-
     def list_projects(self) -> list[Project]:
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM projects ORDER BY created_at DESC"
-            ).fetchall()
+            rows = connection.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
         return [self._project(row) for row in rows]
 
     def get_project_for_document(self, document_id: str) -> Project:
@@ -934,7 +1039,9 @@ class SQLiteStore:
 
     def get_document(self, document_id: str) -> Document:
         with self._connect() as connection:
-            row = connection.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM documents WHERE id = ?", (document_id,)
+            ).fetchone()
         if row is None:
             raise NotFoundError(f"Document not found: {document_id}")
         return self._document(row)
@@ -983,9 +1090,7 @@ class SQLiteStore:
             ).fetchall()
         return total, [self._segment(row) for row in rows]
 
-    def search_segments(
-        self, document_id: str, query: str, *, limit: int = 30
-    ) -> list[Segment]:
+    def search_segments(self, document_id: str, query: str, *, limit: int = 30) -> list[Segment]:
         pattern = f"%{query.strip()}%"
         with self._connect() as connection:
             rows = connection.execute(
@@ -1009,7 +1114,9 @@ class SQLiteStore:
 
     def get_segment(self, segment_id: str) -> Segment:
         with self._connect() as connection:
-            row = connection.execute("SELECT * FROM segments WHERE id = ?", (segment_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM segments WHERE id = ?", (segment_id,)
+            ).fetchone()
         if row is None:
             raise NotFoundError(f"Segment not found: {segment_id}")
         return self._segment(row)
@@ -1110,9 +1217,7 @@ class SQLiteStore:
             )
         return updated
 
-    def set_job_status(
-        self, job_id: str, status: JobStatus, last_error: str | None = None
-    ) -> Job:
+    def set_job_status(self, job_id: str, status: JobStatus, last_error: str | None = None) -> Job:
         job = self.get_job(job_id)
         return self.save_job(replace(job, status=status, last_error=last_error))
 
@@ -1144,11 +1249,20 @@ class SQLiteStore:
                  elapsed_seconds, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    batch_id, job_id, stage.value, start_ordinal, end_ordinal,
-                    segment_count, result.prompt_tokens, result.completion_tokens,
-                    result.reasoning_tokens, result.prompt_cache_hit_tokens,
-                    result.prompt_cache_miss_tokens, result.cost_usd,
-                    max(0.0, elapsed_seconds), utc_now(),
+                    batch_id,
+                    job_id,
+                    stage.value,
+                    start_ordinal,
+                    end_ordinal,
+                    segment_count,
+                    result.prompt_tokens,
+                    result.completion_tokens,
+                    result.reasoning_tokens,
+                    result.prompt_cache_hit_tokens,
+                    result.prompt_cache_miss_tokens,
+                    result.cost_usd,
+                    max(0.0, elapsed_seconds),
+                    utc_now(),
                 ),
             )
         return batch_id
@@ -1157,7 +1271,8 @@ class SQLiteStore:
         job = self.get_job(job_id)
         document_segments = self.list_segments(job.document_id)
         scoped_segments = [
-            segment for segment in document_segments
+            segment
+            for segment in document_segments
             if not job.recipe.segment_ranges
             or any(start <= segment.ordinal <= end for start, end in job.recipe.segment_ranges)
         ]
@@ -1191,8 +1306,14 @@ class SQLiteStore:
                 (job_id,),
             ).fetchone()
             values = dict(batch)
-            for key in ("batches", "prompt_tokens", "completion_tokens", "reasoning_tokens",
-                        "cache_hit_tokens", "cache_miss_tokens"):
+            for key in (
+                "batches",
+                "prompt_tokens",
+                "completion_tokens",
+                "reasoning_tokens",
+                "cache_hit_tokens",
+                "cache_miss_tokens",
+            ):
                 values[key] = int(values[key] or 0) + int(legacy[key] or 0)
             if not values["batch_segments"]:
                 values["batch_segments"] = job.next_ordinal
@@ -1201,7 +1322,8 @@ class SQLiteStore:
         measured = int(values["batch_segments"] or 0)
         eta_seconds = (
             max(0, total_segments - processed) * elapsed / measured
-            if elapsed and measured else None
+            if elapsed and measured
+            else None
         )
         return asdict(job) | {
             "total_segments": total_segments,
@@ -1212,7 +1334,8 @@ class SQLiteStore:
             "reasoning_tokens": int(values["reasoning_tokens"] or 0),
             "cache_hit_tokens": int(values["cache_hit_tokens"] or 0),
             "cache_miss_tokens": int(values["cache_miss_tokens"] or 0),
-            "total_tokens": int(values["prompt_tokens"] or 0) + int(values["completion_tokens"] or 0),
+            "total_tokens": int(values["prompt_tokens"] or 0)
+            + int(values["completion_tokens"] or 0),
             "elapsed_seconds": elapsed,
             "eta_seconds": eta_seconds,
             "deferred_segments": int(deferred["deferred_segments"] or 0),
@@ -1418,7 +1541,9 @@ class SQLiteStore:
             candidate = row["source_normalized"]
             if candidate == query:
                 continue
-            max_possible = (2 * min(len(query), len(candidate))) / max(1, len(query) + len(candidate))
+            max_possible = (2 * min(len(query), len(candidate))) / max(
+                1, len(query) + len(candidate)
+            )
             if max_possible < threshold:
                 continue
             similarity = SequenceMatcher(None, query, candidate, autojunk=False).ratio()
@@ -1573,9 +1698,7 @@ class SQLiteStore:
         value["status"] = TermStatus(value["status"])
         value["forbidden_targets"] = tuple(json.loads(value.pop("forbidden_targets_json")))
         value["aliases"] = tuple(json.loads(value.pop("aliases_json", "[]")))
-        value["context_keywords"] = tuple(
-            json.loads(value.pop("context_keywords_json", "[]"))
-        )
+        value["context_keywords"] = tuple(json.loads(value.pop("context_keywords_json", "[]")))
         return TermEntry(**value)
 
     @staticmethod

@@ -233,6 +233,7 @@ class TranslationResult:
     prompt_cache_hit_tokens: int = 0
     prompt_cache_miss_tokens: int = 0
     raw_response: str | None = None
+    review_findings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

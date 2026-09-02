@@ -4,6 +4,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from math import ceil
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -11,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from jieyi.api.term_routes import install_term_routes
 from jieyi.domain.models import JobStatus, TermEntry, TermStatus, new_id
 from jieyi.domain.reasoning import normalize_compute_mode
 from jieyi.ingestion import extract_epub, take_distributed_sample
@@ -373,6 +375,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         cover_path = package.get("cover_path")
         return package | {
             "spine": spine,
+            "segment_locations": store.list_epub_segment_locations(document_id),
             "modes": ["original", "translated", "bilingual"],
             "layout_strategies": ["faithful", "comfort"],
             "cover_url": (
@@ -605,6 +608,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                 )
                 for item in segments
             ),
+            "reviewed_count": sum(bool(item.reviewed_translation) for item in segments),
             "confirmed_count": sum(item.status.value == "human_confirmed" for item in segments),
             "chapters": chapters,
         }
@@ -751,6 +755,60 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     async def get_issues(document_id: str):
         store.get_document(document_id)
         return store.list_issues(document_id)
+
+    @app.get("/documents/{document_id}/human-review-queue")
+    async def get_human_review_queue(
+        document_id: str,
+        sample_rate: float = Query(default=0.08, ge=0, le=1),
+    ):
+        """Return unresolved findings plus a reproducible sample of clean AI-reviewed text."""
+        store.get_document(document_id)
+        segments = store.list_segments(document_id)
+        issues_by_segment: dict[str, list[dict]] = {}
+        for issue in store.list_issues(document_id):
+            issues_by_segment.setdefault(issue["segment_id"], []).append(issue)
+
+        unconfirmed = [
+            segment for segment in segments if segment.status.value != "human_confirmed"
+        ]
+        clean = [
+            segment
+            for segment in unconfirmed
+            if segment.reviewed_translation and segment.id not in issues_by_segment
+        ]
+        sample_count = min(len(clean), ceil(len(clean) * sample_rate)) if sample_rate else 0
+        sampled_ids: set[str] = set()
+        if sample_count:
+            # Midpoints of equal ordinal intervals give a stable, book-wide sample instead
+            # of over-representing the opening pages.
+            sampled_ids = {
+                clean[min(len(clean) - 1, int((index + 0.5) * len(clean) / sample_count))].id
+                for index in range(sample_count)
+            }
+
+        result = []
+        for segment in unconfirmed:
+            findings = issues_by_segment.get(segment.id, [])
+            if not findings and segment.id not in sampled_ids:
+                continue
+            has_error = any(item["severity"] == "error" for item in findings)
+            reason = "error" if has_error else "warning" if findings else "sample"
+            result.append(
+                {
+                    "segment_id": segment.id,
+                    "ordinal": segment.ordinal,
+                    "reason": reason,
+                    "issue_count": len(findings),
+                    "source_text": segment.source_text,
+                    "translation": (
+                        segment.reviewed_translation
+                        or segment.edited_translation
+                        or segment.machine_translation
+                        or ""
+                    ),
+                }
+            )
+        return result
 
     @app.get("/projects/{project_id}/translation-memory")
     async def get_translation_memory(project_id: str):
@@ -934,4 +992,5 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    install_term_routes(app, store, providers)
     return app

@@ -50,6 +50,7 @@ kbd { font: inherit; }
 
 .desktop-shell {
   min-height: 100vh;
+  color: var(--text);
   padding: 28px;
   display: grid;
   place-items: center;
@@ -183,6 +184,7 @@ nav { display: grid; gap: 3px; }
   font-size: 12.5px;
 }
 .nav-item .symbol { width: 16px; text-align: center; color: var(--icon); font-size: 15px; }
+.nav-item .symbol svg { width: 16px; height: 16px; display: block; fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
 .nav-item b { margin-left: auto; color: var(--muted); font-size: 10px; font-weight: 630; }
 .nav-item .issue-count { min-width: 17px; padding: 1px 5px; border-radius: 9px; color: white; background: var(--red-solid); text-align: center; }
 .nav-item kbd { display: none; margin-left: auto; color: var(--muted); font-size: 9px; }
@@ -423,7 +425,7 @@ nav { display: grid; gap: 3px; }
 .epub-reader-stack { width: min(900px, calc(100% - 36px)); display: flex; flex-direction: column; gap: 0; overflow: hidden; margin: 18px auto 48px; border: 1px solid color-mix(in srgb, var(--line) 78%, transparent); border-radius: 7px; background: white; box-shadow: 0 18px 54px rgba(20,24,31,.16); }
 .epub-cover-sheet { min-height: 62vh; display: grid; place-items: center; padding: 28px; background: white; }
 .epub-cover-sheet img { max-width: min(100%, 520px); max-height: 76vh; object-fit: contain; box-shadow: 0 18px 52px rgba(25,30,40,.18); }
-.epub-spine-sheet { min-width: 0; overflow: hidden; border: 0; border-radius: 0; background: white; box-shadow: none; }
+.epub-spine-sheet { min-width: 0; overflow: hidden; scroll-margin-top: 76px; border: 0; border-radius: 0; background: white; box-shadow: none; }
 .epub-spine-sheet.reflowable + .epub-spine-sheet.reflowable { border-top: 1px solid rgba(20,25,32,.08); }
 .epub-spine-sheet iframe { width: 100%; height: 96px; min-height: 0; display: block; border: 0; background: white; }
 .epub-reader-stack.layout-faithful .epub-spine-sheet.fixed-layout { margin: 12px; border: 1px solid rgba(20,25,32,.12); border-radius: 5px; box-shadow: 0 12px 34px rgba(30,35,45,.1); }

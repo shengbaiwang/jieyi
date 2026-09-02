@@ -1,0 +1,48 @@
+.panel { display: grid; gap: 14px; margin: 22px 0; border: 1px solid var(--line); border-radius: 12px; padding: 16px; background: color-mix(in srgb, var(--sidebar) 66%, transparent); }
+.heading { display: flex; align-items: start; justify-content: space-between; gap: 20px; }
+.heading > div { display: grid; gap: 4px; }
+.heading span { color: var(--accent-text); font-size: 9px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.heading h2 { margin: 0; font-size: 18px; }
+.heading p { max-width: 680px; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.heading button, .approve { border: 0; border-radius: 7px; padding: 8px 12px; color: white; background: var(--blue-solid); font-size: 10px; font-weight: 700; white-space: nowrap; }
+.heading button:disabled, .actions button:disabled { opacity: .5; }
+.metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--panel); }
+.metrics > div { display: grid; gap: 2px; padding: 10px 12px; border-right: 1px solid var(--line); }
+.metrics > div:last-child { border: 0; }
+.metrics strong { font-size: 15px; }
+.metrics span { color: var(--muted); font-size: 8px; }
+.modelError { border-radius: 7px; padding: 9px 11px; color: var(--danger-text); background: rgba(205,76,66,.08); font-size: 9px; }
+.running { border-radius: 7px; padding: 9px 11px; color: var(--accent-text); background: var(--blue-soft); font-size: 9px; }
+.omittedBar { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; color: var(--muted); background: var(--panel); font-size: 9px; }
+.omittedBar button { border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; color: var(--accent-text); background: transparent; font-size: 9px; white-space: nowrap; }
+.list { display: grid; gap: 10px; }
+.card { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel); }
+.card > header { display: flex; justify-content: space-between; gap: 16px; padding: 13px 14px; }
+.card > header > div:first-child { display: grid; gap: 3px; }
+.card header span, .card header small { color: var(--muted); font-size: 8px; }
+.card h3 { margin: 0; font-family: ui-serif, Georgia, serif; font-size: 18px; }
+.frequency { display: grid; align-content: center; justify-items: end; }
+.frequency strong { font-size: 15px; }
+.sense { display: grid; gap: 10px; border-top: 1px solid var(--line); padding: 13px 14px; }
+.senseMeta { display: flex; align-items: center; gap: 8px; }
+.senseMeta small { color: var(--muted); font-size: 8px; }
+.status { border-radius: 99px; padding: 3px 7px; font-size: 8px; font-weight: 700; }
+.pending { color: var(--accent-text); background: var(--blue-soft); }
+.approved { color: var(--success-text); background: rgba(55,169,93,.12); }
+.rejected { color: var(--muted); background: color-mix(in srgb, var(--muted) 10%, transparent); }
+.sense > p { margin: 0; font-size: 10px; line-height: 1.55; }
+.rationale { color: var(--muted); }
+.editors { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.editors label { display: grid; gap: 5px; }
+.editors span { color: var(--muted); font-size: 8px; font-weight: 650; }
+.editors input { height: 34px; border: 1px solid var(--line); border-radius: 7px; padding: 0 9px; color: var(--text); background: var(--panel); font-size: 10px; }
+.sense details { font-size: 9px; }
+.sense summary { color: var(--accent-text); cursor: pointer; }
+.sense blockquote { margin: 8px 0 0; border-left: 2px solid var(--line); padding: 7px 10px; color: var(--muted); background: color-mix(in srgb, var(--sidebar) 55%, transparent); }
+.sense blockquote small { font-size: 8px; }
+.sense blockquote p { margin: 4px 0 0; color: var(--text); font-family: ui-serif, Georgia, serif; font-size: 10px; line-height: 1.55; }
+.actions { display: flex; justify-content: flex-end; gap: 7px; }
+.actions button { font-size: 9px; }
+.reject { border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; color: var(--muted); background: transparent; }
+.empty { border: 1px dashed var(--line); border-radius: 9px; padding: 18px; color: var(--muted); text-align: center; font-size: 10px; line-height: 1.55; }
+@media (max-width: 760px) { .heading { display: grid; } .heading button { justify-self: start; } .metrics { grid-template-columns: repeat(2, 1fr); } .metrics > div { border-bottom: 1px solid var(--line); } .editors { grid-template-columns: 1fr; } }

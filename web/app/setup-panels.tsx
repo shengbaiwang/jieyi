@@ -679,8 +679,7 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
   return (
     <section className="setup-view import-view">
       <header className="setup-header">
-        <div><span className="page-kicker">新建项目</span><h1>导入书籍</h1><p>导入原文，介译会保留标题结构并生成稳定段落。</p></div>
-        <div className="import-steps"><span className={file ? "done" : "active"}><i>{file ? "✓" : "1"}</i>选择文件</span><b /><span className={file ? "active" : ""}><i>2</i>确认信息</span><b /><span className={result ? "done" : ""}><i>{result ? "✓" : "3"}</i>完成</span></div>
+        <div><span className="page-kicker">新建项目</span><h1>导入书籍</h1></div>
       </header>
 
       <div className="import-scroll">

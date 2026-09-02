@@ -18,6 +18,74 @@ class ApiTests(unittest.TestCase):
         self.client.close()
         self.tempdir.cleanup()
 
+    def test_human_review_queue_combines_required_checks_and_distributed_sampling(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "Review flow", "source_lang": "en", "target_lang": "zh-CN"},
+        ).json()
+        document = self.client.post(
+            f"/projects/{project['id']}/documents",
+            json={
+                "title": "Three paragraphs",
+                "text": "One paragraph.\n\nTwo paragraphs in 2020.\n\nThree paragraphs.",
+                "source_format": "txt",
+            },
+        ).json()
+        draft_job = self.client.post(
+            f"/documents/{document['id']}/jobs",
+            json={"draft_provider": "echo", "draft_model": "draft", "review_policy": "never"},
+        ).json()
+        self.assertEqual(self.client.post(f"/jobs/{draft_job['id']}/run").status_code, 200)
+
+        review_job = self.client.post(
+            f"/documents/{document['id']}/jobs",
+            json={
+                "draft_provider": "echo",
+                "draft_model": "unused",
+                "reviewer_provider": "echo",
+                "reviewer_model": "reviewer",
+                "task_mode": "review",
+                "review_policy": "all",
+                "review_sample_rate": 0,
+            },
+        ).json()
+        self.assertEqual(self.client.post(f"/jobs/{review_job['id']}/run").status_code, 200)
+
+        overview = self.client.get(f"/documents/{document['id']}/overview").json()
+        self.assertEqual(overview["reviewed_count"], 3)
+        queue = self.client.get(
+            f"/documents/{document['id']}/human-review-queue",
+            params={"sample_rate": 0.34},
+        ).json()
+        self.assertEqual(len(queue), 2)
+        self.assertEqual({item["reason"] for item in queue}, {"sample"})
+        self.assertEqual([item["ordinal"] for item in queue], sorted(item["ordinal"] for item in queue))
+
+        confirmed = queue[0]
+        response = self.client.patch(
+            f"/segments/{confirmed['segment_id']}/confirm",
+            json={"translation": confirmed["translation"], "rationale": "Human sample passed"},
+        )
+        self.assertEqual(response.status_code, 200)
+        remaining = self.client.get(
+            f"/documents/{document['id']}/human-review-queue",
+            params={"sample_rate": 0.34},
+        ).json()
+        self.assertNotIn(confirmed["segment_id"], {item["segment_id"] for item in remaining})
+
+        segments = self.client.get(f"/documents/{document['id']}/segments").json()
+        segment = next(item for item in segments if item["ordinal"] == 1)
+        edited = self.client.patch(
+            f"/segments/{segment['id']}/draft",
+            json={"translation": "人工改写但漏掉了数字。"},
+        )
+        self.assertEqual(edited.status_code, 200)
+        required = self.client.get(
+            f"/documents/{document['id']}/human-review-queue",
+            params={"sample_rate": 0},
+        ).json()
+        self.assertEqual(required, [])
+
     def test_epub_overview_uses_embedded_navigation_boundaries(self):
         project = self.client.post(
             "/projects",
@@ -58,7 +126,7 @@ class ApiTests(unittest.TestCase):
         health = self.client.get("/health")
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["api_version"], 2)
-        self.assertEqual(health.json()["quality_detector_version"], "4")
+        self.assertEqual(health.json()["quality_detector_version"], "5")
         self.assertTrue(health.json()["db_path"].endswith("api.db"))
         self.assertIn("echo", health.json()["providers"])
 

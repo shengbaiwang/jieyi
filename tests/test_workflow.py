@@ -140,6 +140,21 @@ class DuplicatePlaceholderProvider:
         )
 
 
+class ReviewerConcernProvider:
+    async def complete(self, messages, model, **kwargs):
+        del model, kwargs
+        content = messages[-1]["content"]
+        current = content.split("\n\nCURRENT TRANSLATION:\n", 1)[1]
+        current = current.split("\n\nKNOWN ISSUES:\n", 1)[0]
+        return TranslationResult(
+            text=(
+                current
+                + "\n\nJY_REVIEW_ISSUES:\n"
+                + "- 此处概念在现有上下文中仍有两个合理义项。"
+            )
+        )
+
+
 class CrossWiringBatchProvider:
     """Return a wrong source whenever a prompt contains more than one segment."""
 
@@ -800,6 +815,45 @@ class WorkflowTests(unittest.TestCase):
         )
         review_candidates = self.store.list_candidates(deferred.id)
         self.assertEqual(review_candidates[-1]["stage"], "review")
+
+    def test_optimized_reviewer_questions_become_human_attention_issues(self):
+        draft_job = create_job(
+            self.store,
+            document_id=self.document.id,
+            draft_provider="echo",
+            draft_model="draft-model",
+            review_policy="never",
+        )
+        asyncio.run(self.engine.run(draft_job.id))
+
+        registry = ProviderRegistry()
+        registry.register("concern-reviewer", ReviewerConcernProvider())
+        engine = TranslationEngine(self.store, registry)
+        review_job = create_job(
+            self.store,
+            document_id=self.document.id,
+            draft_provider="concern-reviewer",
+            draft_model="unused",
+            reviewer_provider="concern-reviewer",
+            reviewer_model="review-model",
+            task_mode="review",
+            review_policy="all",
+            review_sample_rate=0,
+        )
+        completed = asyncio.run(engine.run_optimized(review_job.id))
+
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        reviewed = self.store.list_segments(self.document.id)
+        self.assertTrue(all(item.reviewed_translation for item in reviewed))
+        self.assertTrue(
+            all("JY_REVIEW_ISSUES:" not in item.reviewed_translation for item in reviewed)
+        )
+        issues = self.store.list_issues(self.document.id)
+        reviewer_issues = [item for item in issues if item["code"] == "reviewer_attention"]
+        self.assertEqual(len(reviewer_issues), len(reviewed))
+        self.assertTrue(
+            all("提请人工判断" in item["message"] for item in reviewer_issues)
+        )
 
     def test_optimized_review_policy_all_reuses_every_existing_draft(self):
         draft_job = create_job(

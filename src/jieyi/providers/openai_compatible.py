@@ -15,6 +15,8 @@ from jieyi.domain.models import ModelSpec, TranslationRequest, TranslationResult
 from jieyi.domain.reasoning import resolve_reasoning_control
 from jieyi.prompting import build_messages
 
+_OPENROUTER_TITLE = "Jieyi"
+
 
 class ProviderError(RuntimeError):
     pass
@@ -302,7 +304,10 @@ class OpenAICompatibleProvider:
             headers["Authorization"] = f"Bearer {self.api_key}"
         if self.is_openrouter:
             headers["HTTP-Referer"] = "http://localhost:3000"
-            headers["X-OpenRouter-Title"] = "介译"
+            # urllib/http.client serializes header values as Latin-1. Keep the
+            # optional OpenRouter attribution title ASCII-safe; the Chinese UI
+            # name belongs in content, where the request body is UTF-8.
+            headers["X-OpenRouter-Title"] = _OPENROUTER_TITLE
         http_request = urllib.request.Request(
             self.endpoint, data=body, headers=headers, method="POST"
         )

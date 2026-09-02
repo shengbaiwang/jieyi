@@ -19,13 +19,18 @@ from jieyi.domain.models import (
 from jieyi.prompting import build_messages
 from jieyi.protection import PlaceholderIntegrityError, ProtectedText, ProtectedTextCodec
 from jieyi.providers.registry import ProviderRegistry
-from jieyi.quality.checks import DETECTOR_VERSION, run_deterministic_checks
+from jieyi.quality.checks import (
+    DETECTOR_VERSION,
+    reviewer_attention_issues,
+    run_deterministic_checks,
+)
 from jieyi.workflow.provider_responses import (
     EmptyProviderResponseError,
     content_filter_audit_payload,
     deferred_content_filter_message,
     inspect_empty_result,
     is_content_filtered_error,
+    parse_review_response,
 )
 
 _PLACEHOLDER_REPAIR_ATTEMPTS = 3
@@ -135,6 +140,9 @@ class TranslationEngine:
                         terms,
                         segment_kind=segment.kind,
                     )
+                    final_issues.extend(
+                        reviewer_attention_issues(reviewed.review_findings)
+                    )
                     self.store.replace_issues(
                         job.id,
                         segment.id,
@@ -224,6 +232,9 @@ class TranslationEngine:
                     final.text,
                     terms,
                     segment_kind=segment.kind,
+                )
+                final_issues.extend(
+                    reviewer_attention_issues(final.review_findings)
                 )
                 self.store.replace_issues(
                     job.id,
@@ -358,6 +369,23 @@ class TranslationEngine:
                 model_spec=model_spec,
                 result=result,
             )
+        if stage is CandidateStage.REVIEW:
+            raw_review_text = result.text
+            reviewed_text, findings = parse_review_response(raw_review_text)
+            result = replace(
+                result,
+                text=reviewed_text,
+                raw_response=result.raw_response or raw_review_text,
+                review_findings=findings,
+            )
+            if not result.text.strip():
+                self._raise_empty_result(
+                    job=job,
+                    segment=segment,
+                    stage=stage,
+                    model_spec=model_spec,
+                    result=result,
+                )
 
         try:
             restored_value = protected.restore(result.text)
@@ -447,6 +475,7 @@ class TranslationEngine:
                             if structured
                             else restored_value
                         ),
+                        review_findings=result.review_findings,
                     )
                     break
                 except (PlaceholderIntegrityError, ValueError) as repair_exc:

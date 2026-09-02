@@ -22,7 +22,7 @@ from jieyi.workflow import (
 )
 
 
-def build_roundtrip_epub(*, version: str = "3.0") -> bytes:
+def build_roundtrip_epub(*, version: str = "3.0", fixed_layout: bool = True) -> bytes:
     container = b"""<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
   <rootfiles><rootfile full-path="EPUB/package.opf"
@@ -31,11 +31,11 @@ def build_roundtrip_epub(*, version: str = "3.0") -> bytes:
     if version == "2.0":
         cover_metadata = '<meta name="cover" content="cover-art"/>'
         cover_properties = ""
-        fixed_metadata = '<meta name="fixed-layout" content="true"/>'
+        fixed_metadata = '<meta name="fixed-layout" content="true"/>' if fixed_layout else ""
     else:
         cover_metadata = ""
         cover_properties = ' properties="cover-image"'
-        fixed_metadata = '<meta property="rendition:layout">pre-paginated</meta>'
+        fixed_metadata = '<meta property="rendition:layout">pre-paginated</meta>' if fixed_layout else ""
     package = f"""<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="{version}">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -133,6 +133,20 @@ class EpubRoundTripTests(unittest.TestCase):
             all("::" in item["node_id"] for item in mappings["text_nodes"])
         )
 
+    def test_reflowable_reader_exposes_segment_locations_to_parent(self):
+        document = create_epub_document(
+            self.store,
+            project_id=self.project.id,
+            file_data=build_roundtrip_epub(fixed_layout=False),
+        )
+        rendered, _ = render_spine(
+            self.store, document.id, 0, mode="original", layout="comfort"
+        )
+        value = rendered.decode()
+        self.assertIn("data-jy-segment-ordinals", value)
+        self.assertIn("jy-epub-locate", value)
+        self.assertIn("jy-epub-location", value)
+
     def test_epub2_meta_cover_is_resolved(self):
         payload = build_roundtrip_epub(version="2.0")
         book = extract_epub(payload)
@@ -204,6 +218,7 @@ class EpubRoundTripTests(unittest.TestCase):
             layout="faithful",
         )
         self.assertIn(b"strong", translated)
+        self.assertIn(b"jy-source-italic", translated)
         self.assertIn(b"cover.svg", translated)
         self.assertIn(b"table", translated)
         bilingual, _ = render_spine(
@@ -217,6 +232,9 @@ class EpubRoundTripTests(unittest.TestCase):
         self.assertIn("jy-bilingual-pair", bilingual_text)
         self.assertIn("jy-original", bilingual_text)
         self.assertIn("jy-translation", bilingual_text)
+        self.assertIn("jy-source-italic", bilingual_text)
+        self.assertIn("font-family: \"Kaiti SC\"", bilingual_text)
+        self.assertIn("font-style: normal !important", bilingual_text)
         self.assertIn(
             "grid-template-columns: minmax(0, 1fr) minmax(0, 1fr)",
             bilingual_text,
@@ -288,6 +306,11 @@ class EpubReaderApiTests(unittest.TestCase):
         self.assertEqual(manifest.status_code, 200)
         self.assertTrue(manifest.json()["cover_url"].endswith("EPUB/Images/cover.svg"))
         self.assertEqual(manifest.json()["modes"], ["original", "translated", "bilingual"])
+        self.assertTrue(manifest.json()["segment_locations"])
+        self.assertEqual(
+            set(manifest.json()["segment_locations"][0]),
+            {"segment_ordinal", "spine_index"},
+        )
         original = self.client.get(
             f"/documents/{self.document['id']}/epub/original"
         )

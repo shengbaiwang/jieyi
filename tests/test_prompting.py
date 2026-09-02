@@ -10,6 +10,7 @@ from jieyi.domain.models import (
     TranslationRequest,
 )
 from jieyi.prompting import build_system_prompt
+from jieyi.workflow.provider_responses import parse_review_response
 
 
 class PromptingTests(unittest.TestCase):
@@ -58,6 +59,34 @@ class PromptingTests(unittest.TestCase):
 
         self.assertIn("[[JY_PH_0003]], [[JY_PH_0012]]", prompt)
         self.assertIn("Do not create any other placeholder tokens", prompt)
+
+    def test_review_prompt_requires_an_independent_source_comparison(self):
+        request = replace(
+            self.request("Original claim."),
+            task=CandidateStage.REVIEW,
+            existing_translation="现有译文。",
+        )
+
+        prompt = build_system_prompt(request)
+
+        self.assertIn("Independently compare the source and current translation", prompt)
+        self.assertIn("do not assume the draft is correct", prompt)
+        self.assertIn("JY_REVIEW_ISSUES:", prompt)
+        self.assertIn("Omit this appendix when no human decision is needed", prompt)
+
+    def test_review_response_separates_translation_and_human_questions(self):
+        translation, findings = parse_review_response(
+            "修订后的译文。\n\nJY_REVIEW_ISSUES:\n"
+            "- 此处代词指代可能有两种解释。\n"
+            "• 专名缺少可核实的标准译名。"
+        )
+
+        self.assertEqual(translation, "修订后的译文。")
+        self.assertEqual(
+            findings,
+            ("此处代词指代可能有两种解释。", "专名缺少可核实的标准译名。"),
+        )
+        self.assertEqual(parse_review_response("普通审校译文。"), ("普通审校译文。", ()))
 
     def test_review_without_draft_explicitly_requests_a_fresh_translation(self):
         request = replace(
