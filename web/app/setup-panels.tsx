@@ -140,36 +140,67 @@ function uniqueModels(items: string[]): string[] {
   return [...new Set(items.filter(Boolean))];
 }
 
-function ModelPicker({ value, options, disabled, onChange }: {
+function ModelSelect({ value, options, loading, disabled, onChange }: {
   value: string;
   options: string[];
+  loading?: boolean;
   disabled?: boolean;
   onChange: (value: string) => void;
 }) {
-  const known = options.includes(value);
-  const [manual, setManual] = useState(Boolean(value && !known));
-  const showManual = manual || Boolean(value && !known);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const root = useRef<HTMLDivElement>(null);
+  const search = useRef<HTMLInputElement>(null);
 
-  return <div className="model-picker">
-    <select
+  useEffect(() => {
+    if (!open) return undefined;
+    search.current?.focus();
+    function onPointerDown(event: MouseEvent) {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [open]);
+
+  const typed = query.trim();
+  const matches = options.filter((model) => model.toLowerCase().includes(typed.toLowerCase()));
+
+  function commit(model: string) {
+    onChange(model.trim());
+    setQuery("");
+    setOpen(false);
+  }
+
+  return <div className="model-select" ref={root}>
+    <button
+      type="button"
       aria-label="选择模型"
-      value={showManual ? "__manual__" : value}
+      aria-expanded={open}
+      className={value ? "" : "empty"}
       disabled={disabled}
-      onChange={(event) => {
-        if (event.target.value === "__manual__") {
-          setManual(true);
-          if (known) onChange("");
-        } else {
-          setManual(false);
-          onChange(event.target.value);
-        }
-      }}
+      onClick={() => { setQuery(""); setOpen((current) => !current); }}
     >
-      <option value="">选择模型</option>
-      {options.map((model) => <option value={model} key={model}>{model}</option>)}
-      <option value="__manual__">手动输入其他模型…</option>
-    </select>
-    {showManual && <input aria-label="自定义模型 ID" disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="输入服务端模型 ID" />}
+      <span>{value || "选择或输入模型"}</span><i />
+    </button>
+    {open && <div className="model-select-pop">
+      <input
+        ref={search}
+        aria-label="搜索或输入模型 ID"
+        value={query}
+        placeholder="搜索列表，或直接输入模型 ID 后回车"
+        onChange={(event) => setQuery(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && typed) commit(typed);
+          if (event.key === "Escape") setOpen(false);
+        }}
+      />
+      <div className="model-select-list">
+        {matches.map((model) => <button type="button" key={model} className={model === value ? "active" : ""} onClick={() => commit(model)}>{model}{model === value && <b>✓</b>}</button>)}
+        {typed && !options.includes(typed) && <button type="button" className="manual" onClick={() => commit(typed)}>使用“{typed}”</button>}
+        {!matches.length && !typed && <p>{loading ? "正在读取该连接的模型列表…" : "该连接未返回模型列表，直接输入模型 ID 即可。"}</p>}
+        {!matches.length && typed && options.length > 0 && <p>列表中没有匹配项，回车即可使用手动输入的 ID。</p>}
+      </div>
+    </div>}
   </div>;
 }
 
@@ -186,16 +217,21 @@ const STYLE_PRESETS = [
   { id: "faithful", label: "忠实直译", note: "贴近句法与措辞", guide: "尽量贴近原文句法、措辞和段落结构，不擅自增删或改写；歧义处保留原文的开放性。" },
 ] as const;
 
-function ComputeModePicker({ value, disabled, probe, onChange }: {
+function ComputeModeSelect({ value, disabled, probe, onChange }: {
   value: ComputeMode;
   disabled?: boolean;
   probe?: ModelProbeResult;
   onChange: (value: ComputeMode) => void;
 }) {
-  return <div className="model-picker">
-    <select aria-label="选择模式" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value as ComputeMode)}>
-      {COMPUTE_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}{probe ? ` · ${probe.mode_mapping[option.value]}` : ""}</option>)}
-    </select>
+  return <div className="mode-segment" role="group" aria-label="选择模式">
+    {COMPUTE_OPTIONS.map((option) => <button
+      type="button"
+      key={option.value}
+      className={option.value === value ? "active" : ""}
+      disabled={disabled}
+      aria-pressed={option.value === value}
+      onClick={() => onChange(option.value)}
+    ><strong>{option.label}</strong>{probe && <small>{probe.mode_mapping[option.value]}</small>}</button>)}
   </div>;
 }
 
@@ -225,6 +261,71 @@ function ModelCapabilityCard({ state }: { state: ModelProbeState }) {
   </div>;
 }
 
+function probeSummary(result: ModelProbeResult): string {
+  const control = result.reasoning.kind === "effort"
+    ? `强度可调（${result.reasoning.supported_efforts.join("/")}）`
+    : result.reasoning.kind === "thinking"
+      ? "思考可开关"
+      : "使用服务端默认思考";
+  return `${result.baseline.visible_output ? "短译正常" : "短译无可见文本"} · ${control} · ${result.requests} 次请求 · ${(result.duration_ms / 1000).toFixed(1)} 秒`;
+}
+
+function bindingStatus(model: string, probe?: ModelProbeState): { tone: string; text: string } {
+  if (!model.trim()) return { tone: "idle", text: "未选择模型" };
+  if (probe?.loading) return { tone: "busy", text: "正在实测" };
+  if (probe?.error) return { tone: "error", text: "实测失败" };
+  if (probe?.result) {
+    return probe.result.baseline.visible_output
+      ? { tone: "ready", text: probe.result.reasoning.verification === "verified" ? "能力已实测" : "参数待确认" }
+      : { tone: "warn", text: "无可见输出" };
+  }
+  return { tone: "idle", text: "未实测" };
+}
+
+function TaskBindingCard({ label, note, profiles, profileId, model, models, modelsLoading, mode, probe, mirror, onProfile, onModel, onMode, onTest, onRefresh }: {
+  label: string;
+  note: string;
+  profiles: ProviderProfileForm[];
+  profileId: string;
+  model: string;
+  models: string[];
+  modelsLoading: boolean;
+  mode: ComputeMode;
+  probe?: ModelProbeState;
+  mirror?: { label: string; disabled: boolean; onClick: () => void };
+  onProfile: (value: string) => void;
+  onModel: (value: string) => void;
+  onMode: (value: ComputeMode) => void;
+  onTest: () => void;
+  onRefresh: () => void;
+}) {
+  const [showDetails, setShowDetails] = useState(false);
+  const result = probe?.result;
+  const status = bindingStatus(model, probe);
+
+  return <section className={`binding-card ${status.tone}`}>
+    <header className="binding-head">
+      <div><strong>{label}</strong><small>{note}</small></div>
+      <div className="binding-head-actions">
+        {mirror && <button type="button" className="ghost-action" disabled={mirror.disabled} onClick={mirror.onClick}>{mirror.label}</button>}
+        <span className={`binding-status ${status.tone}`}><i />{status.text}</span>
+      </div>
+    </header>
+    <div className="binding-grid">
+      <label><span>连接</span><select value={profileId} onChange={(event) => onProfile(event.target.value)}>{profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
+      <div className="binding-field"><span>模型</span><ModelSelect value={model} options={models} loading={modelsLoading} onChange={onModel} /></div>
+      <div className="binding-field"><span>计算模式{result ? "（已按实测映射）" : ""}</span><ComputeModeSelect value={mode} probe={result} onChange={onMode} /></div>
+    </div>
+    <div className="binding-actions">
+      <button type="button" className="probe-action" onClick={onTest} disabled={!model.trim() || probe?.loading}>{probe?.loading ? "实测中…" : result ? "重新实测" : "实测能力"}</button>
+      <button type="button" className="ghost-action" onClick={onRefresh} disabled={modelsLoading}>{modelsLoading ? "读取模型列表…" : "刷新模型列表"}</button>
+      {result && <button type="button" className="ghost-action" onClick={() => setShowDetails((current) => !current)}>{showDetails ? "收起详情" : "查看详情"}</button>}
+      {result && !showDetails && <span className="binding-summary">{probeSummary(result)}</span>}
+    </div>
+    {probe && (probe.loading || probe.error || (result && showDetails)) && <ModelCapabilityCard state={probe} />}
+  </section>;
+}
+
 export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderForm) => void }) {
   const [form, setForm] = useState<ProviderForm>({
     version: 4,
@@ -251,7 +352,9 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
   const [showKey, setShowKey] = useState(false);
   const [status, setStatus] = useState<{ kind: "success" | "warning" | "error"; text: string } | null>(null);
   const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({});
+  const [modelLoading, setModelLoading] = useState<Record<string, boolean>>({});
   const [modelProbes, setModelProbes] = useState<Record<string, ModelProbeState>>({});
+  const autoListedProfiles = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     api<ProviderForm>("/settings/provider")
@@ -363,6 +466,61 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
     }));
   }
 
+
+  async function loadModels(profileId: string, silent = false) {
+    const profile = form.profiles.find((item) => item.id === profileId);
+    if (!profile?.base_url || modelLoading[profileId]) return;
+    setModelLoading((current) => ({ ...current, [profileId]: true }));
+    if (!silent) setStatus(null);
+    try {
+      const value = await api<{ models: string[] }>("/settings/provider/test", {
+        method: "POST",
+        body: JSON.stringify({
+          profile_id: profile.id,
+          provider_type: profile.provider_type,
+          base_url: profile.base_url,
+          models_path: profile.models_path,
+          protocol: profile.protocol,
+          api_key: profile.api_key,
+          required_models: [],
+        }),
+      });
+      setAvailableModels((current) => ({ ...current, [profileId]: value.models }));
+      if (!silent) {
+        setStatus(value.models.length
+          ? { kind: "success", text: `${profile.name} 已读取 ${value.models.length} 个可用模型。` }
+          : { kind: "warning", text: `${profile.name} 不提供模型列表，请在模型框中直接输入模型 ID。` });
+      }
+    } catch (error) {
+      if (!silent) setStatus({ kind: "error", text: error instanceof Error ? error.message : "读取模型列表失败" });
+    } finally {
+      setModelLoading((current) => ({ ...current, [profileId]: false }));
+    }
+  }
+
+  // Fetch each bound connection's model list once, so choosing a model never
+  // requires a detour through the connection tabs and the footer test button.
+  useEffect(() => {
+    if (loading) return;
+    for (const profileId of [form.draft_profile_id, form.term_discovery_profile_id]) {
+      const profile = form.profiles.find((item) => item.id === profileId);
+      if (!profile?.base_url || availableModels[profileId] || autoListedProfiles.current.has(profileId)) continue;
+      if (profile.auth_required && !profile.api_key_configured && !profile.api_key) continue;
+      autoListedProfiles.current.add(profileId);
+      void loadModels(profileId, true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, form.draft_profile_id, form.term_discovery_profile_id, form.profiles, availableModels]);
+
+  function mirrorDraftBinding() {
+    setForm((current) => ({
+      ...current,
+      term_discovery_profile_id: current.draft_profile_id,
+      term_discovery_model: current.draft_model,
+      term_discovery_compute_mode: current.draft_compute_mode,
+    }));
+    setStatus({ kind: "success", text: "术语发现已沿用草译的连接、模型与计算模式。" });
+  }
 
   function modelProbeKey(profileId: string, model: string): string {
     const profile = form.profiles.find((item) => item.id === profileId);
@@ -497,7 +655,9 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
 
   const draftProbeState = modelProbes[modelProbeKey(form.draft_profile_id, form.draft_model)];
   const discoveryProbeState = modelProbes[modelProbeKey(form.term_discovery_profile_id, form.term_discovery_model)];
-  const draftProbe = draftProbeState?.result;
+  const sameAsDraft = form.term_discovery_profile_id === form.draft_profile_id
+    && form.term_discovery_model === form.draft_model
+    && form.term_discovery_compute_mode === form.draft_compute_mode;
 
   return (
     <section className="setup-view settings-view">
@@ -535,16 +695,41 @@ export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderF
         </section>
 
         <section className="form-section">
-          <div className="form-section-title"><span>3</span><div><strong>任务模型</strong><small>草译和术语发现可分别选择连接、模型与计算模式</small></div></div>
-          <div className="settings-fields three-columns">
-            <label><span>草译连接</span><select value={form.draft_profile_id} onChange={(event) => changeBindingProfile("draft", event.target.value)}>{form.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
-            <div className="model-field"><span>草译模型</span><div className="model-control-row"><ModelPicker key={"draft-" + form.draft_profile_id} value={form.draft_model} options={draftModels} onChange={(model) => setForm((current) => ({ ...current, draft_model: model }))} /><button type="button" onClick={() => void testModel(form.draft_profile_id, form.draft_model)} disabled={!form.draft_model || draftProbeState?.loading}>{draftProbeState?.loading ? "实测中…" : draftProbeState?.result ? "重新实测" : "实测能力"}</button></div></div>
-            <div className="model-field"><span>草译模式</span><ComputeModePicker value={form.draft_compute_mode} probe={draftProbe} onChange={(draft_compute_mode) => setForm((current) => ({ ...current, draft_compute_mode }))} /></div>
-            {draftProbeState && <ModelCapabilityCard state={draftProbeState} />}
-            <label><span>术语发现连接</span><select value={form.term_discovery_profile_id} onChange={(event) => changeBindingProfile("term_discovery", event.target.value)}>{form.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
-            <div className="model-field"><span>术语发现模型</span><div className="model-control-row"><ModelPicker key={"discovery-" + form.term_discovery_profile_id} value={form.term_discovery_model} options={discoveryModels} onChange={(model) => setForm((current) => ({ ...current, term_discovery_model: model }))} /><button type="button" onClick={() => void testModel(form.term_discovery_profile_id, form.term_discovery_model)} disabled={!form.term_discovery_model || discoveryProbeState?.loading}>{discoveryProbeState?.loading ? "实测中…" : discoveryProbeState?.result ? "重新实测" : "实测能力"}</button></div><small>用于候选筛选、义项与译法建议；留空时仅做本地扫描。</small></div>
-            <div className="model-field"><span>术语发现模式</span><ComputeModePicker value={form.term_discovery_compute_mode} probe={discoveryProbeState?.result} onChange={(term_discovery_compute_mode) => setForm((current) => ({ ...current, term_discovery_compute_mode }))} /></div>
-            {discoveryProbeState && <ModelCapabilityCard state={discoveryProbeState} />}
+          <div className="form-section-title"><span>3</span><div><strong>任务模型</strong><small>草译和术语发现各自绑定连接、模型与计算模式；实测结果按“连接 + 模型”缓存复用</small></div></div>
+          <div className="binding-cards">
+            <TaskBindingCard
+              label="草译"
+              note="逐段生成译文草稿"
+              profiles={form.profiles}
+              profileId={form.draft_profile_id}
+              model={form.draft_model}
+              models={draftModels}
+              modelsLoading={Boolean(modelLoading[form.draft_profile_id])}
+              mode={form.draft_compute_mode}
+              probe={draftProbeState}
+              onProfile={(value) => changeBindingProfile("draft", value)}
+              onModel={(draft_model) => setForm((current) => ({ ...current, draft_model }))}
+              onMode={(draft_compute_mode) => setForm((current) => ({ ...current, draft_compute_mode }))}
+              onTest={() => void testModel(form.draft_profile_id, form.draft_model)}
+              onRefresh={() => void loadModels(form.draft_profile_id)}
+            />
+            <TaskBindingCard
+              label="术语发现"
+              note="候选筛选、义项与译法建议；留空时仅做本地扫描"
+              profiles={form.profiles}
+              profileId={form.term_discovery_profile_id}
+              model={form.term_discovery_model}
+              models={discoveryModels}
+              modelsLoading={Boolean(modelLoading[form.term_discovery_profile_id])}
+              mode={form.term_discovery_compute_mode}
+              probe={discoveryProbeState}
+              mirror={{ label: "沿用草译设置", disabled: sameAsDraft, onClick: mirrorDraftBinding }}
+              onProfile={(value) => changeBindingProfile("term_discovery", value)}
+              onModel={(term_discovery_model) => setForm((current) => ({ ...current, term_discovery_model }))}
+              onMode={(term_discovery_compute_mode) => setForm((current) => ({ ...current, term_discovery_compute_mode }))}
+              onTest={() => void testModel(form.term_discovery_profile_id, form.term_discovery_model)}
+              onRefresh={() => void loadModels(form.term_discovery_profile_id)}
+            />
           </div>
         </section>
       </div>
