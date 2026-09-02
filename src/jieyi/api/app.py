@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from math import ceil
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +15,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from jieyi.api.term_routes import install_term_routes
-from jieyi.domain.models import JobStatus, TermEntry, TermStatus, new_id
+from jieyi.domain.models import JobStatus, ModelSpec, TermEntry, TermStatus, new_id
 from jieyi.domain.reasoning import normalize_compute_mode
 from jieyi.ingestion import extract_epub, take_distributed_sample
 from jieyi.ingestion.epub_navigation import (
@@ -37,6 +39,8 @@ from jieyi.quality import (
     reindex_all_quality,
     reindex_project_quality,
 )
+from jieyi.quality.service import document_issues, requires_human_review
+from jieyi.quality.terminology_review import TerminologyReviewManager
 from jieyi.settings import (
     LocalSettingsStore,
     ModelBinding,
@@ -87,6 +91,11 @@ class TermCreate(BaseModel):
     context_keywords: list[str] = Field(default_factory=list)
     sense: str = ""
     disambiguation: str = ""
+    enforcement: Literal["auto", "global", "contextual"] = "auto"
+
+
+class TerminologyReviewCreate(BaseModel):
+    token_budget: int = Field(default=200_000, ge=10_000, le=2_000_000)
 
 
 class JobCreate(BaseModel):
@@ -219,11 +228,25 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     providers = _provider_registry(settings_store)
     engine = TranslationEngine(store, providers)
     manager = JobManager(store, engine)
+    terminology_manager = TerminologyReviewManager(store, providers)
+    terminology_manager.repository.fail_interrupted()
+
+    def start_terminology_review(document_id, token_budget=200_000):
+        settings = settings_store.load()
+        binding = settings.reviewer if settings.reviewer.model else settings.draft
+        profile = settings.profile(binding.profile_id)
+        if not binding.model or profile is None:
+            raise ValueError("请先在设置中配置审校模型或草译模型。")
+        return terminology_manager.start(
+            document_id, ModelSpec(profile.registry_name, binding.model, 0.0),
+            binding.compute_mode, token_budget,
+        )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
         await manager.shutdown()
+        await terminology_manager.shutdown()
 
     app = FastAPI(title="介译 API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
@@ -239,6 +262,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     app.state.engine = engine
     app.state.job_manager = manager
     app.state.settings_store = settings_store
+    app.state.terminology_manager = terminology_manager
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_, exc: NotFoundError):
@@ -754,7 +778,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     @app.get("/documents/{document_id}/issues")
     async def get_issues(document_id: str):
         store.get_document(document_id)
-        return store.list_issues(document_id)
+        return document_issues(store, document_id)
 
     @app.get("/documents/{document_id}/human-review-queue")
     async def get_human_review_queue(
@@ -765,8 +789,12 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         store.get_document(document_id)
         segments = store.list_segments(document_id)
         issues_by_segment: dict[str, list[dict]] = {}
-        for issue in store.list_issues(document_id):
-            issues_by_segment.setdefault(issue["segment_id"], []).append(issue)
+        all_findings = document_issues(store, document_id)
+        pending_ids = {issue["segment_id"] for issue in all_findings
+                       if not requires_human_review(issue)}
+        for issue in all_findings:
+            if requires_human_review(issue):
+                issues_by_segment.setdefault(issue["segment_id"], []).append(issue)
 
         unconfirmed = [
             segment for segment in segments if segment.status.value != "human_confirmed"
@@ -775,6 +803,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
             segment
             for segment in unconfirmed
             if segment.reviewed_translation and segment.id not in issues_by_segment
+            and segment.id not in pending_ids
         ]
         sample_count = min(len(clean), ceil(len(clean) * sample_rate)) if sample_rate else 0
         sampled_ids: set[str] = set()
@@ -991,6 +1020,25 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/documents/{document_id}/terminology-review")
+    async def get_terminology_review(document_id: str):
+        summary = terminology_manager.repository.summary(document_id)
+        settings = settings_store.load()
+        binding = settings.reviewer if settings.reviewer.model else settings.draft
+        profile = settings.profile(binding.profile_id)
+        return summary | {
+            "configured_model": binding.model,
+            "service_host": urlsplit(profile.base_url).hostname if profile else "",
+        }
+
+    @app.post("/documents/{document_id}/terminology-review", status_code=202)
+    async def post_terminology_review(document_id: str, body: TerminologyReviewCreate):
+        store.get_document(document_id)
+        try:
+            return start_terminology_review(document_id, body.token_budget)
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     install_term_routes(app, store, providers)
     return app

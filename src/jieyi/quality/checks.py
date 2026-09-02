@@ -7,7 +7,7 @@ from collections import Counter
 from jieyi.domain.models import IssueSeverity, QualityIssue, SegmentKind, TermEntry
 from jieyi.terminology import resolve_terminology, term_appears
 
-DETECTOR_VERSION = "5"
+DETECTOR_VERSION = "6"
 
 _FOOTNOTE_REF = re.compile(r"\[\^[^]]+\]")
 
@@ -112,11 +112,13 @@ def run_deterministic_checks(
     for ambiguity in terminology.ambiguous:
         issues.append(
             _issue(
-                "ambiguous_term_unresolved",
-                f"术语“{ambiguity.source_form}”存在多个义项，当前语境不足以自动确定译法。",
-                IssueSeverity.WARNING,
+                "terminology_pending",
+                f"术语“{ambiguity.source_form}”待逐处核验义项与译法，尚未判定为错误。",
+                IssueSeverity.INFO,
                 {
                     "source_form": ambiguity.source_form,
+                    "requires_human": False,
+                    "source": "terminology_rule",
                     "candidates": [
                         {
                             "term_id": item.term.id,
@@ -129,7 +131,7 @@ def run_deterministic_checks(
                         for item in ambiguity.candidates
                     ],
                 },
-                confidence="medium",
+                confidence="unverified",
             )
         )
 

@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ImportBookPanel, ProviderSettingsPanel } from "./setup-panels";
 import { TermDiscoveryPanel } from "./term-discovery-panel";
+import { TerminologyReviewPanel } from "./terminology-review-panel";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
 const PAGE_SIZE = 120;
@@ -23,11 +24,11 @@ type Overview = { document: Document; project: Project; segment_count: number; t
 type SegmentPage = { document: Document; project: Project; total: number; offset: number; limit: number; items: Segment[] };
 type Term = {
   id: string; source: string; target: string; status: string; scope: string; rationale: string;
-  aliases: string[]; context_keywords: string[]; sense: string; disambiguation: string;
+  aliases: string[]; context_keywords: string[]; sense: string; disambiguation: string; enforcement?: string;
 };
 type Issue = { id: string; segment_id: string; ordinal: number; code: string; message: string; severity: string; resolved: number };
 type HumanReviewItem = { segment_id: string; ordinal: number; reason: "error" | "warning" | "sample"; issue_count: number; source_text: string; translation: string };
-type Candidate = { id: string; stage: string; provider: string; model: string; prompt_tokens: number; completion_tokens: number; cost_usd: number; created_at: string };
+type Candidate = { id: string; job_id: string; stage: string; provider: string; model: string; prompt_tokens: number; completion_tokens: number; cost_usd: number; created_at: string };
 type Job = {
   id: string; status: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
   next_ordinal: number; total_cost_usd: number; last_error: string | null;
@@ -85,7 +86,7 @@ function ThemeIcon({ dark }: { dark: boolean }) {
 }
 function segmentTranslation(segment: Segment | null) { return segment?.accepted_translation || segment?.reviewed_translation || segment?.edited_translation || segment?.machine_translation || ""; }
 function statusLabel(segment: Segment | null) { return segment?.status === "human_confirmed" ? "人工已确认" : segment?.reviewed_translation ? "AI 已审校" : segment?.status === "machine_translated" ? "机器草译" : "待翻译"; }
-function jobStatusLabel(status: Job["status"]) { return ({ pending: "等待中", running: "运行中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" } as const)[status]; }
+function jobStatusLabel(status: Job["status"], deferredSegments = 0) { if (status === "completed" && deferredSegments > 0) return `已结束 · ${deferredSegments} 段未成功`; return ({ pending: "等待中", running: "运行中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" } as const)[status]; }
 function formatTokens(value = 0) { return value >= 1_000_000 ? (value / 1_000_000).toFixed(2) + "M" : value >= 1_000 ? (value / 1_000).toFixed(1) + "K" : String(value); }
 function formatDuration(value?: number | null) { if (value == null) return "测算中"; if (value < 60) return Math.max(1, Math.round(value)) + " 秒"; const minutes = Math.round(value / 60); return minutes < 60 ? minutes + " 分钟" : Math.floor(minutes / 60) + " 小时 " + (minutes % 60) + " 分"; }
 const STYLE_PRESETS = [
@@ -197,6 +198,7 @@ export default function Home() {
   const [draftPicker, setDraftPicker] = useState<{ document: Document; overview: Overview } | null>(null);
   const [selectedChapterStarts, setSelectedChapterStarts] = useState<number[]>([]);
   const [draftPickerLoading, setDraftPickerLoading] = useState(false);
+  const [segmentDraft, setSegmentDraft] = useState<{ documentId: string; segmentId: string; ordinal: number; jobId: string } | null>(null);
   const [readerSegments, setReaderSegments] = useState<Segment[]>([]);
   const [readerLoading, setReaderLoading] = useState(false);
   const [readerMode, setReaderMode] = useState<ReaderMode>("bilingual");
@@ -220,6 +222,7 @@ export default function Home() {
   const [termTarget, setTermTarget] = useState("");
   const [termAliases, setTermAliases] = useState("");
   const [termContext, setTermContext] = useState("");
+  const [termEnforcement, setTermEnforcement] = useState("contextual");
   const [termSense, setTermSense] = useState("");
   const [termDisambiguation, setTermDisambiguation] = useState("");
   const [libraryError, setLibraryError] = useState("");
@@ -236,10 +239,11 @@ export default function Home() {
   }, [ordinal, overview, panel, readerOrdinal]);
   const currentIssues = useMemo(() => issues.filter((item) => item.segment_id === currentSegment?.id), [currentSegment, issues]);
   const errorIssues = useMemo(() => issues.filter((item) => item.severity === "error"), [issues]);
-  const displayIssues = useMemo(() => [...issues].sort((a, b) => Number(a.severity !== "error") - Number(b.severity !== "error") || a.ordinal - b.ordinal), [issues]);
+  const displayIssues = useMemo(() => issues.filter((item) => item.severity !== "info").sort((a, b) => Number(a.severity !== "error") - Number(b.severity !== "error") || a.ordinal - b.ordinal), [issues]);
   const requiredHumanChecks = useMemo(() => humanReviewQueue.filter((item) => item.reason !== "sample").length, [humanReviewQueue]);
   const currentErrorIssues = useMemo(() => currentIssues.filter((item) => item.severity === "error"), [currentIssues]);
-  const currentWarningIssues = useMemo(() => currentIssues.filter((item) => item.severity !== "error"), [currentIssues]);
+  const currentWarningIssues = useMemo(() => currentIssues.filter((item) => item.severity === "warning"), [currentIssues]);
+  const pendingTermSegments = new Set(issues.filter((item) => item.code === "terminology_pending").map((item) => item.segment_id)).size;
   const relevantTerms = useMemo(() => {
     const source = currentSegment?.source_text.toLocaleLowerCase() || "";
     return terms.filter((term) => [term.source, ...(term.aliases || [])].some((form) => source.includes(form.toLocaleLowerCase()))).slice(0, 12);
@@ -250,13 +254,26 @@ export default function Home() {
   const selectedDraftJob = jobsDocumentId === selectedDocumentId ? jobs.find((item) => (item.recipe.task_mode || "draft") === "draft" && item.status !== "cancelled") || null : null;
   const selectedReviewJob = jobsDocumentId === selectedDocumentId ? jobs.find((item) => item.recipe.task_mode === "review" && item.status !== "cancelled") || null : null;
   const activeJobId = jobs.find((item) => item.status === "running" || item.status === "pending")?.id || "";
+  const draftingCurrentSegment = Boolean(segmentDraft && segmentDraft.segmentId === currentSegment?.id);
+  const latestCandidate = candidates.at(-1);
+  const candidateJob = jobs.find((job) => job.id === latestCandidate?.job_id);
+  const candidateJobIsSingleSegment = candidateJob?.recipe.segment_ranges?.length === 1
+    && candidateJob.recipe.segment_ranges[0][0] === currentSegment?.ordinal
+    && candidateJob.recipe.segment_ranges[0][1] === currentSegment?.ordinal;
+  const generationUsage = candidateJobIsSingleSegment && (candidateJob?.batch_count || 0) > 0
+    ? { prompt: candidateJob?.prompt_tokens || 0, completion: candidateJob?.completion_tokens || 0, cost: candidateJob?.total_cost_usd || 0, task: true }
+    : latestCandidate && (latestCandidate.prompt_tokens > 0 || latestCandidate.completion_tokens > 0)
+      ? { prompt: latestCandidate.prompt_tokens, completion: latestCandidate.completion_tokens, cost: latestCandidate.cost_usd, task: false }
+      : null;
+  const currentDocumentBusy = jobsDocumentId === overview?.document.id && jobs.some((job) => job.status === "pending" || job.status === "running");
+  const hasCurrentTranslation = Boolean(translation.trim() || segmentTranslation(currentSegment).trim());
   const completion = overview?.segment_count ? Math.round((overview.confirmed_count / overview.segment_count) * 100) : 0;
   const translationProgress = overview?.segment_count ? Math.round((overview.translated_count / overview.segment_count) * 100) : 0;
   const selectedDraftChapters = draftPicker?.overview.chapters.filter((chapter) => selectedChapterStarts.includes(chapter.start_ordinal)) || [];
   const selectedDraftRanges = normalizeSegmentRanges(selectedDraftChapters.map((chapter) => [chapter.start_ordinal, chapter.end_ordinal]));
   const selectedDraftSegmentCount = selectedDraftRanges.reduce((total, [start, end]) => total + end - start + 1, 0);
 
-  function notify(message: string) { setToast(message); window.setTimeout(() => setToast(""), 2800); }
+  const notify = useCallback((message: string) => { setToast(message); window.setTimeout(() => setToast(""), 2800); }, []);
 
   function settingsForBook(documentId: string, providerSettings: ProviderSettings): BookTranslationSettings {
     return bookSettings[documentId] || defaultBookSettings(providerSettings);
@@ -320,6 +337,18 @@ export default function Home() {
     localStorage.setItem(`jieyi.ordinal.${documentId}`, String(safeOrdinal));
   }, [documents, loadAllSegments, projects]);
 
+  const refreshQuality = useCallback(async () => {
+    const documentId = overview?.document.id;
+    if (!documentId) return;
+    try {
+      const [issueItems, reviewItems] = await Promise.all([
+        api<Issue[]>(`/documents/${documentId}/issues`),
+        api<HumanReviewItem[]>(`/documents/${documentId}/human-review-queue`),
+      ]);
+      setIssues(issueItems); setHumanReviewQueue(reviewItems);
+    } catch { /* Preserve the previous result while the status panel exposes connection errors. */ }
+  }, [overview?.document.id]);
+
   const openDocument = useCallback(async (document: Document, targetOrdinal?: number) => {
     setLoading(true);
     setSelectedDocumentId(document.id);
@@ -346,7 +375,7 @@ export default function Home() {
       setPanel("translate");
     } catch (error) { const message = error instanceof Error ? error.message : "无法打开书籍"; setLibraryError(message); notify(message); }
     finally { setLoading(false); }
-  }, [loadAllSegments, loadPageAt, projects]);
+  }, [loadAllSegments, loadPageAt, projects, notify]);
 
   const loadLibrary = useCallback(async () => {
     setLoading(true);
@@ -373,7 +402,7 @@ export default function Home() {
       if (initial) await openDocument(initial); else setPanel("library");
     } catch { notify("无法连接本地 API，请使用“启动介译.command”重新启动。"); }
     finally { setLoading(false); }
-  }, [openDocument]);
+  }, [openDocument, notify]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void loadLibrary(), 0);
@@ -481,6 +510,51 @@ export default function Home() {
   }, [activeJobId, jobsDocumentId, overview?.document.id]);
 
   useEffect(() => {
+    if (!segmentDraft?.jobId) return;
+    let disposed = false;
+    let polling = false;
+    async function refreshSegmentDraft() {
+      if (!segmentDraft || polling) return;
+      polling = true;
+      try {
+        const job = await api<Job>(`/jobs/${segmentDraft.jobId}`);
+        if (disposed || job.status === "pending" || job.status === "running") return;
+        const [result, candidateItems, summary, issueItems, reviewItems] = await Promise.all([
+          api<SegmentPage>(`/documents/${segmentDraft.documentId}/segments/page?offset=${segmentDraft.ordinal}&limit=1`),
+          api<Candidate[]>(`/segments/${segmentDraft.segmentId}/candidates`),
+          api<Overview>(`/documents/${segmentDraft.documentId}/overview`),
+          api<Issue[]>(`/documents/${segmentDraft.documentId}/issues`),
+          api<HumanReviewItem[]>(`/documents/${segmentDraft.documentId}/human-review-queue`),
+        ]);
+        if (disposed) return;
+        const saved = result.items.find((item) => item.id === segmentDraft.segmentId);
+        if (!saved) throw new Error("无法读取本段译文");
+        legacySegments.current.delete(segmentDraft.documentId);
+        if (overview?.document.id === segmentDraft.documentId) {
+          setOverview(summary); setIssues(issueItems); setHumanReviewQueue(reviewItems);
+        }
+        setPage((current) => current ? { ...current, items: current.items.map((item) => item.id === saved.id ? saved : item) } : current);
+        if (currentSegment?.id === saved.id) {
+          setTranslation(segmentTranslation(saved));
+          setDraftDirty(false);
+          setSaveState("saved");
+          setCandidates(candidateItems);
+        }
+        setSegmentDraft(null);
+        const label = `第 ${segmentDraft.ordinal + 1} 段`;
+        notify(job.status === "completed"
+          ? segmentTranslation(saved) ? `${label}草译完成。` : `${label}未通过译文检查，可重试或查看检查器。`
+          : job.status === "failed" ? `${label}草译失败：${job.last_error || "请重试。"}`
+          : `${label}草译${job.status === "paused" ? "已暂停" : "已取消"}。`);
+      } catch { /* Keep polling after a temporary connection error. */ }
+      finally { polling = false; }
+    }
+    void refreshSegmentDraft();
+    const timer = window.setInterval(() => void refreshSegmentDraft(), 2000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [segmentDraft, currentSegment?.id, overview?.document.id, notify]);
+
+  useEffect(() => {
     const timer = window.setTimeout(() => {
       setTranslation(segmentTranslation(currentSegment)); setDraftDirty(false); setSaveState("idle");
       if (currentSegment) {
@@ -490,6 +564,12 @@ export default function Home() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, [currentSegment?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (panel !== "quality" && panel !== "translate") return;
+    const timer = window.setTimeout(() => void refreshQuality(), 0);
+    return () => window.clearTimeout(timer);
+  }, [panel, refreshQuality, currentSegment?.edited_translation, currentSegment?.reviewed_translation]);
 
   useEffect(() => {
     if (!draftDirty || !currentSegment) return;
@@ -564,7 +644,7 @@ export default function Home() {
       const term = await api<Term>(`/projects/${overview.project.id}/terms`, { method: "POST", body: JSON.stringify({
         source: termSource, target: termTarget, status: "approved",
         aliases: splitList(termAliases), context_keywords: splitList(termContext),
-        sense: termSense, disambiguation: termDisambiguation,
+        sense: termSense, disambiguation: termDisambiguation, enforcement: termEnforcement,
       }) });
       setTerms((items) => [...items, term].sort((a, b) => a.source.localeCompare(b.source)));
       setTermSource(""); setTermTarget(""); setTermAliases(""); setTermContext(""); setTermSense(""); setTermDisambiguation("");
@@ -727,9 +807,23 @@ export default function Home() {
       : [...current, startOrdinal]);
   }
 
+  async function draftCurrentSegment() {
+    if (!overview || !currentSegment || segmentDraft || wholeBookAction || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving") return;
+    const target = { documentId: overview.document.id, segmentId: currentSegment.id, ordinal: currentSegment.ordinal, jobId: "" };
+    setSegmentDraft(target);
+    try {
+      const job = await runWholeBook(overview.document, "draft", [[target.ordinal, target.ordinal]]);
+      setSegmentDraft(job ? { ...target, jobId: job.id } : null);
+    } catch (error) {
+      setSegmentDraft(null);
+      notify(error instanceof Error ? error.message : "本段草译启动失败");
+    }
+  }
+
   async function runWholeBook(document: Document, mode: "draft" | "review", segmentRanges: [number, number][] = []) {
     if (wholeBookAction) return;
     const normalizedRanges = normalizeSegmentRanges(segmentRanges);
+    const singleOrdinal = mode === "draft" && normalizedRanges.length === 1 && normalizedRanges[0][0] === normalizedRanges[0][1] ? normalizedRanges[0][0] : null;
     const providerSettings = settings || await api<ProviderSettings>("/settings/provider").catch(() => null);
     if (!providerSettings) { setPanel("settings"); notify("请先配置并测试草译模型。"); return; }
     const bookConfig = settingsForBook(document.id, providerSettings);
@@ -760,7 +854,7 @@ export default function Home() {
           reviewer_provider: mode === "review" ? (currentSettings.reviewer_provider || currentSettings.draft_provider || "openai-compatible") : null,
           reviewer_model: mode === "review" ? currentSettings.reviewer_model : null,
           review_policy: mode === "review" ? "all" : "never",
-          batch_size: 10, concurrency: 3, max_concurrency: 5, max_batch_chars: 4000,
+          batch_size: singleOrdinal !== null ? 1 : 10, concurrency: singleOrdinal !== null ? 1 : 3, max_concurrency: singleOrdinal !== null ? 1 : 5, max_batch_chars: 4000,
           draft_thinking: currentSettings.draft_compute_mode !== "economy", review_thinking: currentSettings.reviewer_compute_mode !== "economy",
           draft_compute_mode: currentSettings.draft_compute_mode, review_compute_mode: currentSettings.reviewer_compute_mode, review_sample_rate: 0,
           max_output_tokens: 6000, token_budget: 2000000, segment_ranges: normalizedRanges,
@@ -771,9 +865,10 @@ export default function Home() {
       setJobsDocumentId(document.id);
       if (mode === "draft") setDraftPicker(null);
       notify(mode === "draft"
-        ? normalizedRanges.length ? "已启动所选范围的草译，共 " + normalizedRanges.reduce((total, range) => total + range[1] - range[0] + 1, 0) + " 段；已有译文的段落会自动跳过。" : "全书草译已在后台启动；已有译文的段落会自动跳过。"
+        ? singleOrdinal !== null ? `正在草译第 ${singleOrdinal + 1} 段。` : normalizedRanges.length ? "已启动所选范围的草译，共 " + normalizedRanges.reduce((total, range) => total + range[1] - range[0] + 1, 0) + " 段；已有译文的段落会自动跳过。" : "全书草译已在后台启动；已有译文的段落会自动跳过。"
         : "全量独立审校已在后台启动；审校 AI 会逐段对照原文，人工抽检队列将在完成后生成。");
-    } catch (error) { notify(error instanceof Error ? error.message : mode === "draft" ? "全书草译启动失败" : "全书审校启动失败"); }
+      return started;
+    } catch (error) { notify(error instanceof Error ? error.message : mode === "draft" ? "草译启动失败" : "全书审校启动失败"); }
     finally { setWholeBookAction(null); }
   }
 
@@ -851,12 +946,12 @@ export default function Home() {
           {selectedDocument && <div className="library-quick-actions"><span>{settings ? <>本书草译模型：<strong>{settingsForBook(selectedDocument.id, settings).draft_model || "未选择"}</strong> · 可与其他书使用不同模型同时运行</> : "当前书籍可单独配置翻译风格与模型。"}</span><button onClick={() => openBookSettings(selectedDocument)}>翻译设置</button><a href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book`} download={exportName(selectedDocument)}>一键导出译后书籍</a></div>}
           <div className="library-header"><div><span className="page-kicker">本机项目</span><h1>我的书库</h1><p>{documents.length ? "共 " + projects.length + " 个项目、" + documents.length + " 本书或文档。" : "导入第一本书，开始可追溯的长文本翻译。"}</p></div><button className="primary-button" onClick={() => setPanel("import")}>＋ 导入书籍</button></div>
           {libraryError && <div className="library-error"><i>!</i><span><strong>书籍打开失败</strong><small>{libraryError}</small></span><button onClick={() => void loadLibrary()}>重新连接</button></div>}
-          {selectedDocument && <><div className="book-actions" aria-label="所选书目操作"><div><span>已选中</span><strong>《{selectedDocument.title}》</strong></div><button onClick={() => void openDocument(selectedDocument)}>打开工作台</button><button onClick={() => void openReader(selectedDocument)} disabled={readerLoading}>{readerLoading ? "正在载入…" : "阅读整本"}</button><button className="accent" onClick={() => void openDraftPicker(selectedDocument)} disabled={wholeBookAction !== null || draftPickerLoading || selectedDraftJob?.status === "running"}>{draftPickerLoading ? "正在读取目录…" : selectedDraftJob?.status === "running" ? "草译运行中" : "选择篇章草译"}</button><button onClick={() => void runWholeBook(selectedDocument, "review")} disabled={wholeBookAction !== null || selectedReviewJob?.status === "running"}>{wholeBookAction === "review" ? "正在启动…" : selectedReviewJob?.status === "paused" || selectedReviewJob?.status === "failed" ? "继续全量审校" : selectedReviewJob?.status === "running" ? "审校运行中" : "全量独立审校"}</button><button className="danger" onClick={() => setPendingDelete(selectedDocument)}>删除</button></div>{selectedJob && <div className={"job-progress-card status-" + selectedJob.status}><div className="job-progress-head"><div><span>{selectedJob.recipe.task_mode === "review" ? "全量独立审校" : selectedJob.recipe.segment_ranges?.length ? "篇章草译" : "全书草译"}</span><strong>{jobStatusLabel(selectedJob.status)}</strong></div><small>{selectedJob.processed_segments ?? selectedJob.next_ordinal} / {selectedJob.total_segments ?? "—"} 段</small></div><div className="job-progress-track"><span style={{ width: String(Math.min(100, Math.round(((selectedJob.processed_segments ?? selectedJob.next_ordinal) / Math.max(1, selectedJob.total_segments || 1)) * 100))) + "%" }} /></div><div className="job-metrics"><span><b>{selectedJob.batch_count || 0}</b> 批</span><span><b>{formatTokens(selectedJob.total_tokens)}</b> token</span><span><b>{formatTokens(selectedJob.reasoning_tokens)}</b> 推理</span>{Boolean(selectedJob.deferred_segments) && <span><b>{selectedJob.deferred_segments}</b> 隔离待复核</span>}<span><b>{formatDuration(selectedJob.eta_seconds)}</b> 预计剩余</span></div><p>{selectedJob.recipe.task_mode === "review" ? "审校 AI 逐段独立对照原文；清晰问题直接修订，未解决的确定性风险进入人工必检队列。" : `单段隔离、${selectedJob.recipe.concurrency || 3}→${selectedJob.recipe.max_concurrency || selectedJob.recipe.concurrency || 3} 路自适应并发；异常段不会覆盖正文。`}</p>{selectedJob.last_error && <div className="job-progress-error">{selectedJob.last_error}</div>}<div className="job-controls">{selectedJob.status === "running" && <button onClick={() => void controlJob(selectedJob, "pause")}>暂停</button>}{(selectedJob.status === "paused" || selectedJob.status === "failed") && selectedDocument && <button className="accent" onClick={() => void runWholeBook(selectedDocument, selectedJob.recipe.task_mode === "review" ? "review" : "draft", selectedJob.recipe.segment_ranges || [])}>继续</button>}{!["completed", "cancelled"].includes(selectedJob.status) && <button className="danger" onClick={() => void controlJob(selectedJob, "cancel")}>取消任务</button>}</div></div>}</>}
+          {selectedDocument && <><div className="book-actions" aria-label="所选书目操作"><div><span>已选中</span><strong>《{selectedDocument.title}》</strong></div><button onClick={() => void openDocument(selectedDocument)}>打开工作台</button><button onClick={() => void openReader(selectedDocument)} disabled={readerLoading}>{readerLoading ? "正在载入…" : "阅读整本"}</button><button className="accent" onClick={() => void openDraftPicker(selectedDocument)} disabled={wholeBookAction !== null || draftPickerLoading || selectedDraftJob?.status === "running"}>{draftPickerLoading ? "正在读取目录…" : selectedDraftJob?.status === "running" ? "草译运行中" : "选择篇章草译"}</button><button onClick={() => void runWholeBook(selectedDocument, "review")} disabled={wholeBookAction !== null || selectedReviewJob?.status === "running"}>{wholeBookAction === "review" ? "正在启动…" : selectedReviewJob?.status === "paused" || selectedReviewJob?.status === "failed" ? "继续全量审校" : selectedReviewJob?.status === "running" ? "审校运行中" : "全量独立审校"}</button><button className="danger" onClick={() => setPendingDelete(selectedDocument)}>删除</button></div>{selectedJob && <div className={"job-progress-card status-" + selectedJob.status}><div className="job-progress-head"><div><span>{selectedJob.recipe.task_mode === "review" ? "全量独立审校" : selectedJob.recipe.segment_ranges?.length ? "篇章草译" : "全书草译"}</span><strong>{jobStatusLabel(selectedJob.status, selectedJob.deferred_segments)}</strong></div><small>{selectedJob.processed_segments ?? selectedJob.next_ordinal} / {selectedJob.total_segments ?? "—"} 段</small></div><div className="job-progress-track"><span style={{ width: String(Math.min(100, Math.round(((selectedJob.processed_segments ?? selectedJob.next_ordinal) / Math.max(1, selectedJob.total_segments || 1)) * 100))) + "%" }} /></div><div className="job-metrics"><span><b>{selectedJob.batch_count || 0}</b> 批</span><span><b>{formatTokens(selectedJob.total_tokens)}</b> token</span><span><b>{formatTokens(selectedJob.reasoning_tokens)}</b> 推理</span>{Boolean(selectedJob.deferred_segments) && <span><b>{selectedJob.deferred_segments}</b> 隔离待复核</span>}<span><b>{formatDuration(selectedJob.eta_seconds)}</b> 预计剩余</span></div><p>{selectedJob.recipe.task_mode === "review" ? "审校 AI 逐段独立对照原文；清晰问题直接修订，未解决的确定性风险进入人工必检队列。" : `单段隔离、${selectedJob.recipe.concurrency || 3}→${selectedJob.recipe.max_concurrency || selectedJob.recipe.concurrency || 3} 路自适应并发；异常段不会覆盖正文。`}</p>{selectedJob.last_error && <div className="job-progress-error">{selectedJob.last_error}</div>}<div className="job-controls">{selectedJob.status === "running" && <button onClick={() => void controlJob(selectedJob, "pause")}>暂停</button>}{(selectedJob.status === "paused" || selectedJob.status === "failed") && selectedDocument && <button className="accent" onClick={() => void runWholeBook(selectedDocument, selectedJob.recipe.task_mode === "review" ? "review" : "draft", selectedJob.recipe.segment_ranges || [])}>继续</button>}{!["completed", "cancelled"].includes(selectedJob.status) && <button className="danger" onClick={() => void controlJob(selectedJob, "cancel")}>取消任务</button>}</div></div>}</>}
           {loading ? <div className="empty-workspace">正在读取书库…</div> : documents.length === 0 ? <div className="empty-workspace"><Mark>▦</Mark><h2>书库还是空的</h2><p>支持 EPUB、TXT 与 Markdown，原文保存在本机数据库。</p><button className="blue-action" onClick={() => setPanel("import")}>导入第一本书</button></div> : <div className="book-grid">{documents.map((document) => { const project = projects.find((item) => item.id === document.project_id); return <button key={document.id} className={"book-card " + (selectedDocumentId === document.id ? "active" : "")} aria-pressed={selectedDocumentId === document.id} onClick={() => void selectLibraryDocument(document)}><i className={document.cover_url ? "has-cover" : ""}>{document.cover_url ? <img src={API_BASE + document.cover_url} alt={`《${document.title}》封面`} loading="lazy" referrerPolicy="no-referrer" /> : document.source_format.toUpperCase()}</i><div><span>{project?.name}</span><strong>{document.title}</strong><small>{project?.source_lang} → {project?.target_lang} · 导入于 {new Date(document.created_at).toLocaleDateString()}</small></div><Mark>{selectedDocumentId === document.id ? "✓" : "›"}</Mark></button>; })}</div>}
         </section>}
 
         {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><a className="export-link" href={`${API_BASE}/documents/${overview?.document.id}/export?bilingual=true`} download={`${overview?.document.title || "jieyi"}-双语.txt`}>导出双语</a><div className="segmented" aria-label="编辑器视图"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>对照</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
-          <div className={`editor-columns ${view === "target" ? "target-only" : ""}`}>{view === "split" && <article className={`source-pane content-${currentSegment.kind}`}><div className="column-label"><span>原文 · {overview?.project.source_lang.toUpperCase()}</span><button onClick={() => navigator.clipboard?.writeText(currentSegment.source_text).then(() => notify("原文已复制"))}>复制</button></div>{currentSegment.kind === "heading" ? <h2>{currentSegment.source_text}</h2> : <p>{currentSegment.source_text}</p>}<div className="context-note"><Mark>¶</Mark><div><strong>结构位置</strong><span>{currentSegment.heading_path || "正文"}</span></div></div></article>}<article className="translation-pane"><div className="column-label"><span>译文 · {overview?.project.target_lang}</span><div className={`draft-state ${currentStatus === "human_confirmed" ? "confirmed" : ""}`}><i />{statusLabel(currentSegment)}</div></div><textarea aria-label="译文编辑器" value={translation} onChange={(event) => { setTranslation(event.target.value); setDraftDirty(true); setSaveState("idle"); }} placeholder={currentStatus === "source" ? "等待模型草译，或直接输入人工译文…" : "编辑译文…"} spellCheck={false} /><div className="editor-footer"><span>{translation.length} 字 · {saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : draftDirty ? "待保存" : "已保存"}</span><button className="confirm-button" onClick={() => void confirmCurrent()} disabled={!translation.trim() || saveState === "saving"}>{currentStatus === "human_confirmed" ? "更新确认" : "确认译文"}<kbd>⌘↵</kbd></button></div></article></div></>}</section>}
+          <div className={`editor-columns ${view === "target" ? "target-only" : ""}`}>{view === "split" && <article className={`source-pane content-${currentSegment.kind}`}><div className="column-label"><span>原文 · {overview?.project.source_lang.toUpperCase()}</span><button onClick={() => navigator.clipboard?.writeText(currentSegment.source_text).then(() => notify("原文已复制"))}>复制</button></div>{currentSegment.kind === "heading" ? <h2>{currentSegment.source_text}</h2> : <p>{currentSegment.source_text}</p>}<div className="context-note"><Mark>¶</Mark><div><strong>结构位置</strong><span>{currentSegment.heading_path || "正文"}</span></div></div></article>}<article className="translation-pane"><div className="column-label"><span>译文 · {overview?.project.target_lang}</span><div className={`draft-state ${currentStatus === "human_confirmed" ? "confirmed" : ""}`}><i />{statusLabel(currentSegment)}</div></div><textarea aria-label="译文编辑器" readOnly={draftingCurrentSegment} aria-busy={draftingCurrentSegment} value={translation} onChange={(event) => { setTranslation(event.target.value); setDraftDirty(true); setSaveState("idle"); }} placeholder={currentStatus === "source" ? "等待模型草译，或直接输入人工译文…" : "编辑译文…"} spellCheck={false} /><div className="editor-footer"><span>{translation.length} 字 · {saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : draftDirty ? "待保存" : "已保存"}</span><div className="editor-footer-actions"><button className="segment-draft-button" onClick={() => void draftCurrentSegment()} disabled={segmentDraft !== null || wholeBookAction !== null || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} title={hasCurrentTranslation ? "本段已有译文" : currentDocumentBusy ? "请等待当前任务完成" : "使用本书模型草译当前段落"} aria-busy={draftingCurrentSegment}>{draftingCurrentSegment ? "草译中…" : "草译本段"}</button><button className="confirm-button" onClick={() => void confirmCurrent()} disabled={!translation.trim() || saveState === "saving"}>{currentStatus === "human_confirmed" ? "更新确认" : "确认译文"}<kbd>⌘↵</kbd></button></div></div></article></div></>}</section>}
 
         {panel === "reader" && <section ref={readerView} className="reader-view" aria-label="原书排版阅读模式">
           <div className="reader-toolbar"><div>
@@ -886,20 +981,21 @@ export default function Home() {
               id={"reader-segment-" + segment.ordinal} data-reader-ordinal={segment.ordinal} className={"reader-block reader-" + segment.kind} key={segment.id}>{readerMode !== "translated" && <div className="reader-source"><small>原文</small>{segment.kind === "heading" ? <h2>{segment.source_text}</h2> : <p>{segment.source_text}</p>}</div>}{readerMode !== "original" && <div className={"reader-target " + (!target ? "missing" : "")}><small>{segment.status === "human_confirmed" ? "译文 · 已确认" : "译文"}</small>{segment.kind === "heading" ? <h2>{target || "本节尚未草译"}</h2> : <p>{target || "本段尚未草译"}</p>}</div>}</section>; })}</article>}
         </section>}
 
-        {panel === "terms" && <section className="library-view"><div className="library-header"><div><span className="page-kicker">翻译约束</span><h1>术语库</h1><p>当前项目共有 {terms.length} 条术语约束；系统会主动识别源词和同义词，在生成与校对阶段统一译法。</p></div></div><TermDiscoveryPanel documentId={overview.document.id} provider={settings?.draft_provider || ""} model={settings?.draft_model || ""} computeMode={settings?.draft_compute_mode || "balanced"} onApproved={(term) => setTerms((items) => [...items, term].sort((left, right) => left.source.localeCompare(right.source)))} notify={notify} /><form className="term-create" onSubmit={(event) => void addTerm(event)}><label><span>规范源词</span><input value={termSource} onChange={(event) => setTermSource(event.target.value)} placeholder="例如 bank" /></label><label><span>强制译法</span><input value={termTarget} onChange={(event) => setTermTarget(event.target.value)} placeholder="例如 银行" /></label><label><span>同义词 / 变体</span><input value={termAliases} onChange={(event) => setTermAliases(event.target.value)} placeholder="逗号分隔，例如 banking institution" /></label><label><span>语境关键词</span><input value={termContext} onChange={(event) => setTermContext(event.target.value)} placeholder="用于消歧，例如 loan, credit" /></label><label><span>义项</span><input value={termSense} onChange={(event) => setTermSense(event.target.value)} placeholder="例如 金融机构" /></label><label><span>消歧说明</span><input value={termDisambiguation} onChange={(event) => setTermDisambiguation(event.target.value)} placeholder="说明何时采用此译法" /></label><button className="primary-button" disabled={!termSource.trim() || !termTarget.trim()}>添加术语约束</button></form><div className="term-table" role="table" aria-label="术语列表"><div className="term-table-head" role="row"><span>源词与同义词</span><span>强制译法 / 义项</span><span>语境触发</span><span>状态</span></div>{terms.map((term) => <div className="term-table-row" role="row" key={term.id}><div className="term-cell"><strong>{term.source}</strong>{term.aliases?.length > 0 && <small>{term.aliases.join(" · ")}</small>}</div><div className="term-cell"><span>{term.target}</span>{term.sense && <small>{term.sense}</small>}</div><small>{term.context_keywords?.length ? term.context_keywords.join(" · ") : "默认义项"}</small><span className={`term-status ${term.status !== "approved" ? "pending" : ""}`}>{term.status === "approved" ? "强制执行" : term.status}</span></div>)}</div>{terms.length === 0 && <div className="empty-inline">还没有术语约束。添加后，命中的源词会直接参与译文生成和质量检查。</div>}</section>}
+        {panel === "terms" && overview && <section className="library-view"><div className="library-header"><div><span className="page-kicker">翻译约束</span><h1>术语库</h1><p>当前项目共有 {terms.length} 条术语约束；固定译法按词组检查；语境译法先逐处判定义项，再检查译文。</p></div></div><TermDiscoveryPanel documentId={overview.document.id} provider={settings?.draft_provider || ""} model={settings?.draft_model || ""} computeMode={settings?.draft_compute_mode || "balanced"} onApproved={(term) => setTerms((items) => [...items, term].sort((left, right) => left.source.localeCompare(right.source)))} notify={notify} /><form className="term-create" onSubmit={(event) => void addTerm(event)}><label><span>规范源词</span><input value={termSource} onChange={(event) => setTermSource(event.target.value)} placeholder="例如 bank" /></label><label><span>批准译法</span><input value={termTarget} onChange={(event) => setTermTarget(event.target.value)} placeholder="例如 银行" /></label><label><span>同义词 / 变体</span><input value={termAliases} onChange={(event) => setTermAliases(event.target.value)} placeholder="逗号分隔，例如 banking institution" /></label><label><span>适用范围</span><select value={termEnforcement} onChange={(event) => setTermEnforcement(event.target.value)}><option value="contextual">按语境采用此译法</option><option value="global">所有用法均采用此译法</option></select></label><label><span>语境关键词（仅作提示）</span><input value={termContext} onChange={(event) => setTermContext(event.target.value)} placeholder="用于消歧，例如 loan, credit" /></label><label><span>义项</span><input value={termSense} onChange={(event) => setTermSense(event.target.value)} placeholder="例如 金融机构" /></label><label><span>消歧说明</span><input value={termDisambiguation} onChange={(event) => setTermDisambiguation(event.target.value)} placeholder="说明何时采用此译法" /></label><button className="primary-button" disabled={!termSource.trim() || !termTarget.trim()}>添加术语约束</button></form><div className="term-table" role="table" aria-label="术语列表"><div className="term-table-head" role="row"><span>源词与同义词</span><span>批准译法 / 义项</span><span>语境触发</span><span>状态</span></div>{terms.map((term) => <div className="term-table-row" role="row" key={term.id}><div className="term-cell"><strong>{term.source}</strong>{term.aliases?.length > 0 && <small>{term.aliases.join(" · ")}</small>}</div><div className="term-cell"><span>{term.target}</span>{term.sense && <small>{term.sense}</small>}</div><small>{term.context_keywords?.length ? term.context_keywords.join(" · ") : term.sense || term.disambiguation || term.enforcement === "contextual" ? "逐处判断语境" : "固定译法"}</small><span className={`term-status ${term.status !== "approved" ? "pending" : ""}`}>{term.status === "approved" ? (term.enforcement === "global" || (term.enforcement !== "contextual" && !term.sense && !term.disambiguation && !term.context_keywords?.length) ? "固定译法" : "按义项采用") : term.status}</span></div>)}</div>{terms.length === 0 && <div className="empty-inline">还没有术语约束。添加后，命中的源词会直接参与译文生成和质量检查。</div>}</section>}
 
-        {panel === "quality" && <section className="library-view quality-view">
-          <div className="library-header"><div><span className="page-kicker">第三阶段 · 人工把关</span><h1>审校</h1><p>{requiredHumanChecks ? `${requiredHumanChecks} 段因未解决问题必须人工检查；另有 ${humanReviewQueue.length - requiredHumanChecks} 段来自约 8% 的全书分布式抽样。` : humanReviewQueue.length ? `没有遗留确定问题；请抽检 ${humanReviewQueue.length} 个已审校段落。` : overview?.reviewed_count ? "当前人工抽检队列已处理完成。" : "请先完成草译和全量独立审校。"}</p></div><div className="large-score"><span>{humanReviewQueue.length}</span><small>待人工检查</small></div></div>
+        {panel === "quality" && overview && <section className="library-view quality-view">
+          <div className="library-header"><div><span className="page-kicker">第三阶段 · 人工把关</span><h1>审校</h1><p>{requiredHumanChecks ? `${requiredHumanChecks} 段因未解决问题必须人工检查；另有 ${humanReviewQueue.length - requiredHumanChecks} 段来自约 8% 的全书分布式抽样。` : humanReviewQueue.length ? `当前人工队列没有遗留问题；请抽检 ${humanReviewQueue.length} 个已审校段落。` : pendingTermSegments ? "尚有术语用法待机器核验，不能视为审校完成。" : overview?.reviewed_count ? "当前人工抽检队列已处理完成。" : "请先完成草译和全量独立审校。"}</p></div><div className="large-score"><span>{humanReviewQueue.length}</span><small>待人工检查</small></div></div>
           <div className="quality-summary"><div><strong>{overview?.reviewed_count || 0}</strong><span>AI 已审校</span></div><div><strong>{requiredHumanChecks}</strong><span>问题必检</span></div><div><strong>{humanReviewQueue.length - requiredHumanChecks}</strong><span>分布抽检</span></div><div><strong>{overview?.confirmed_count || 0}</strong><span>人工确认</span></div></div>
+          <TerminologyReviewPanel key={overview.document.id} documentId={overview.document.id} onChange={refreshQuality} />
           <div className="issue-list">{humanReviewQueue.map((item) => <button key={item.segment_id} onClick={() => { setPanel("translate"); void navigateTo(item.ordinal); }}><i className={item.reason === "error" ? "warning-icon" : "format-icon"}>{item.reason === "error" ? "!" : item.reason === "warning" ? "?" : "抽"}</i><div><strong>{item.reason === "error" ? "确定问题 · 必检" : item.reason === "warning" ? "建议复核 · 必检" : "全书分布抽检"}</strong><span>第 {item.ordinal + 1} 段 · {item.source_text.slice(0, 90)}</span></div><Mark>›</Mark></button>)}</div>
-          {humanReviewQueue.length === 0 && <div className="empty-inline">{overview?.reviewed_count ? "抽检项已全部人工确认；仍可从工作台逐段终审。" : "完成全量独立审校后，这里会自动生成问题必检与约 8% 的抽检队列。"}</div>}
-          {displayIssues.length > 0 && <div className="issue-list">{displayIssues.map((issue) => <button key={issue.id} onClick={() => { setPanel("translate"); void navigateTo(issue.ordinal); }}><i className={issue.severity === "error" ? "warning-icon" : "format-icon"}>{issue.severity === "error" ? "!" : "?"}</i><div><strong>自动检查 · {issue.code}</strong><span>第 {issue.ordinal + 1} 段 · {issue.message}</span></div><Mark>›</Mark></button>)}</div>}
+          {humanReviewQueue.length === 0 && <div className="empty-inline">{pendingTermSegments ? "人工队列暂为空；请先完成上方的术语语境核验。" : overview?.reviewed_count ? "抽检项已全部人工确认；仍可从工作台逐段终审。" : "完成全量独立审校后，这里会自动生成问题必检与约 8% 的抽检队列。"}</div>}
+          {displayIssues.length > 0 && <div className="issue-list">{displayIssues.map((issue) => <button key={issue.id} onClick={() => { setPanel("translate"); void navigateTo(issue.ordinal); }}><i className={issue.severity === "error" ? "warning-icon" : "format-icon"}>{issue.severity === "error" ? "!" : issue.severity === "info" ? "待" : "?"}</i><div><strong>自动检查 · {issue.code}</strong><span>第 {issue.ordinal + 1} 段 · {issue.message}</span></div><Mark>›</Mark></button>)}</div>}
         </section>}
 
         {panel === "import" && <ImportBookPanel onImported={(result) => void handleImported(result)} />}
         {panel === "settings" && <ProviderSettingsPanel onSaved={(value) => { setSettings(value); notify("模型配置已更新。"); }} />}
 
-        <aside className="inspector"><div className="inspector-heading"><strong>检查器</strong><button aria-label="关闭检查器" onClick={() => setInspectorOpen(false)}>×</button></div><div className="inspector-scroll"><div className="quality-card"><div className={`segment-state-mark ${currentStatus}`}><Mark>{currentStatus === "human_confirmed" ? "✓" : currentSegment?.reviewed_translation ? "校" : currentStatus === "machine_translated" ? "AI" : "—"}</Mark></div><div><strong>{statusLabel(currentSegment)}</strong><small>{currentErrorIssues.length ? `${currentErrorIssues.length} 项确定问题` : currentWarningIssues.length ? `${currentWarningIssues.length} 项建议复核` : "本段没有质量问题"}</small></div></div>{currentIssues.length > 0 && <div className="inspector-section"><div className="eyebrow">问题</div>{currentIssues.map((issue) => <div className="issue-chip" key={issue.id}><i>{issue.severity === "error" ? "!" : "?"}</i><span>{issue.message}</span></div>)}</div>}<div className="inspector-section"><div className="eyebrow">本段术语 <button onClick={() => setPanel("terms")}>查看全部</button></div>{relevantTerms.length ? relevantTerms.map((term) => <div className="term-row" key={term.id}><span>{term.source}</span><strong>{term.target}</strong></div>) : <p className="inspector-empty">未命中已批准术语</p>}</div><div className="inspector-section"><div className="eyebrow">生成信息</div>{candidates.length ? <dl><div><dt>模型</dt><dd>{candidates.at(-1)?.model}</dd></div><div><dt>输入 / 输出</dt><dd>{candidates.at(-1)?.prompt_tokens} / {candidates.at(-1)?.completion_tokens}</dd></div><div><dt>费用</dt><dd>${(candidates.at(-1)?.cost_usd || 0).toFixed(6)}</dd></div></dl> : <p className="inspector-empty">本段还没有模型候选</p>}</div>{latestJob && <div className="inspector-section"><div className="eyebrow">当前任务</div><dl><div><dt>状态</dt><dd>{latestJob.status}</dd></div><div><dt>进度</dt><dd>{latestJob.next_ordinal} / {overview?.segment_count}</dd></div><div><dt>累计费用</dt><dd>${latestJob.total_cost_usd.toFixed(4)}</dd></div></dl>{latestJob.last_error && <p className="job-error">{latestJob.last_error}</p>}</div>}</div></aside>
+        <aside className="inspector"><div className="inspector-heading"><strong>检查器</strong><button aria-label="关闭检查器" onClick={() => setInspectorOpen(false)}>×</button></div><div className="inspector-scroll"><div className="quality-card"><div className={`segment-state-mark ${currentStatus}`}><Mark>{currentStatus === "human_confirmed" ? "✓" : currentSegment?.reviewed_translation ? "校" : currentStatus === "machine_translated" ? "AI" : "—"}</Mark></div><div><strong>{statusLabel(currentSegment)}</strong><small>{currentErrorIssues.length ? `${currentErrorIssues.length} 项确定问题` : currentWarningIssues.length ? `${currentWarningIssues.length} 项建议复核` : currentIssues.some((item) => item.severity === "info") ? "本段术语待机器核验" : "本段没有已报告的问题"}</small></div></div>{currentIssues.length > 0 && <div className="inspector-section"><div className="eyebrow">问题</div>{currentIssues.map((issue) => <div className="issue-chip" key={issue.id}><i>{issue.severity === "error" ? "!" : issue.severity === "info" ? "待" : "?"}</i><span>{issue.message}</span></div>)}</div>}<div className="inspector-section"><div className="eyebrow">本段术语 <button onClick={() => setPanel("terms")}>查看全部</button></div>{relevantTerms.length ? relevantTerms.map((term) => <div className="term-row" key={term.id}><span>{term.source}</span><strong>{term.target}</strong></div>) : <p className="inspector-empty">未命中已批准术语</p>}</div><div className="inspector-section"><div className="eyebrow">生成信息</div>{candidates.length ? <dl><div><dt>模型</dt><dd>{candidates.at(-1)?.model}</dd></div><div><dt>{generationUsage?.task ? "本段任务输入 / 输出" : "输入 / 输出"}</dt><dd>{generationUsage ? `${generationUsage.prompt} / ${generationUsage.completion}` : "用量见任务记录"}</dd></div>{generationUsage && <div><dt>{generationUsage.task ? "本段任务费用" : "费用"}</dt><dd>${generationUsage.cost.toFixed(6)}</dd></div>}</dl> : <p className="inspector-empty">本段还没有模型候选</p>}</div>{latestJob && <div className="inspector-section"><div className="eyebrow">当前任务</div><dl><div><dt>状态</dt><dd>{jobStatusLabel(latestJob.status, latestJob.deferred_segments)}</dd></div><div><dt>进度</dt><dd>{latestJob.processed_segments ?? latestJob.next_ordinal} / {latestJob.total_segments ?? overview?.segment_count}</dd></div><div><dt>任务输入 / 输出</dt><dd>{latestJob.prompt_tokens ?? "—"} / {latestJob.completion_tokens ?? "—"}</dd></div><div><dt>累计费用</dt><dd>${latestJob.total_cost_usd.toFixed(4)}</dd></div></dl>{latestJob.last_error && <p className="job-error">{latestJob.last_error}</p>}</div>}</div></aside>
       </div>
     </section>
 

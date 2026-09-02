@@ -1002,7 +1002,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("unrelated -> 无关", context)
         self.assertEqual([term.source for term in terms], ["Agency"])
 
-    def test_alias_and_context_sense_are_rendered_as_binding_constraints(self):
+    def test_alias_and_context_sense_are_rendered_as_conditional_constraints(self):
         self.store.add_term(
             TermEntry(
                 id=new_id("term"),
@@ -1027,8 +1027,10 @@ class WorkflowTests(unittest.TestCase):
         context, terms = self.engine.context_compiler.compile(
             self.project, segment, neighbor_radius=1, max_chars=10_000
         )
-        self.assertIn("APPROVED TERMINOLOGY — MANDATORY CONSTRAINTS", context)
-        self.assertIn("artificial intelligence | AI -> 人工智能 [MANDATORY]", context)
+        self.assertIn("CONDITIONALLY APPROVED TERMINOLOGY", context)
+        self.assertIn("NOT APPLICABLE", context)
+        self.assertIn("仅指计算机科学中的 AI", context)
+        self.assertIn("artificial intelligence | AI -> 人工智能 [CONDITIONAL]", context)
         self.assertEqual([term.source for term in terms], ["artificial intelligence"])
 
     def test_provider_failure_preserves_checkpoint_for_retry(self):

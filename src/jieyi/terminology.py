@@ -6,34 +6,40 @@ from dataclasses import dataclass
 
 from jieyi.domain.models import TermEntry, TermStatus
 
-_WESTERN_TERM_CHAR = re.compile(r"[A-Za-z0-9_]")
-
 
 def normalize_term_text(text: str) -> str:
     return unicodedata.normalize("NFKC", text).casefold().strip()
 
 
-def term_appears(text: str, term: str) -> bool:
-    """Match Western terms by token boundaries and CJK terms by substring."""
-    haystack = normalize_term_text(text)
+def term_spans(text: str, term: str) -> tuple[tuple[int, int], ...]:
+    """Return original offsets, including when casefold/NFKC changes string length."""
     needle = normalize_term_text(term)
     if not needle:
-        return False
-    western_start = bool(_WESTERN_TERM_CHAR.match(needle[0]))
-    western_end = bool(_WESTERN_TERM_CHAR.match(needle[-1]))
+        return ()
+    pieces = [unicodedata.normalize("NFKC", char).casefold() for char in text]
+    haystack = "".join(pieces)
+    offsets = [index for index, piece in enumerate(pieces) for _ in piece]
+    def western(char):
+        name = unicodedata.name(char, "")
+        return char.isdigit() or any(script in name for script in ("LATIN", "GREEK", "CYRILLIC"))
+    spans = []
     start = 0
-    while True:
-        index = haystack.find(needle, start)
-        if index < 0:
-            return False
-        before = haystack[index - 1] if index else ""
+    while (index := haystack.find(needle, start)) >= 0:
         end = index + len(needle)
+        before = haystack[index - 1] if index else ""
         after = haystack[end] if end < len(haystack) else ""
-        if not (western_start and before and _WESTERN_TERM_CHAR.match(before)) and not (
-            western_end and after and _WESTERN_TERM_CHAR.match(after)
+        if not (western(needle[0]) and before and (western(before) or before == "_")) and not (
+            western(needle[-1]) and after and (western(after) or after == "_")
         ):
-            return True
-        start = index + 1
+            span = (offsets[index], offsets[end - 1] + 1)
+            if normalize_term_text(text[span[0] : span[1]]) == needle and span not in spans:
+                spans.append(span)
+        start = end
+    return tuple(spans)
+
+
+def term_appears(text: str, term: str) -> bool:
+    return bool(term_spans(text, term))
 
 
 def source_forms(term: TermEntry) -> tuple[str, ...]:
@@ -47,11 +53,26 @@ def source_forms(term: TermEntry) -> tuple[str, ...]:
     return tuple(forms)
 
 
+def requires_context(term: TermEntry) -> bool:
+    if term.enforcement != "auto":
+        return term.enforcement != "global"
+    return bool(term.sense.strip() or term.disambiguation.strip() or term.context_keywords)
+
+
+@dataclass(frozen=True, slots=True)
+class TermOccurrence:
+    start: int
+    end: int
+    text: str
+    sentence: str
+
+
 @dataclass(frozen=True, slots=True)
 class TermEvidence:
     term: TermEntry
     matched_forms: tuple[str, ...]
     context_hits: tuple[str, ...]
+    occurrences: tuple[TermOccurrence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,72 +92,86 @@ class TerminologyResolution:
         return tuple(item.term for item in self.candidates)
 
 
+def _sentence(source: str, start: int, end: int) -> str:
+    left = list(re.finditer(r"[.!?。！？\n]", source[:start]))
+    right = re.search(r"[.!?。！？\n]", source[end:])
+    return source[
+        left[-1].end() if left else 0 : end + right.end() if right else len(source)
+    ].strip()
+
+
 def resolve_terminology(
     source: str,
     terms: list[TermEntry] | tuple[TermEntry, ...],
 ) -> TerminologyResolution:
-    """Resolve aliases and explicit context clues without forcing ambiguous senses."""
-    evidence: list[TermEvidence] = []
-    by_form: dict[str, list[TermEvidence]] = {}
-    display_form: dict[str, str] = {}
-    for term in terms:
-        if term.status is not TermStatus.APPROVED:
-            continue
-        matched = tuple(form for form in source_forms(term) if term_appears(source, form))
-        if not matched:
-            continue
-        context_hits = tuple(
-            keyword for keyword in term.context_keywords if term_appears(source, keyword)
+    """Approval fixes a translation for a sense, never proves that sense applies.
+
+    Keywords remain hints for a semantic check. A longer approved phrase owns its
+    span; independent short-word occurrences elsewhere in the paragraph remain.
+    """
+    matches = [
+        (term, form, start, end)
+        for term in terms
+        if term.status is TermStatus.APPROVED
+        for form in source_forms(term)
+        for start, end in term_spans(source, form)
+    ]
+    matches = [
+        match
+        for match in matches
+        if not any(
+            other[2] <= match[2]
+            and other[3] >= match[3]
+            and other[3] - other[2] > match[3] - match[2]
+            for other in matches
         )
-        item = TermEvidence(term=term, matched_forms=matched, context_hits=context_hits)
-        evidence.append(item)
-        for form in matched:
-            key = normalize_term_text(form)
-            display_form.setdefault(key, form)
-            by_form.setdefault(key, []).append(item)
-
-    enforced_ids: set[str] = set()
-    ambiguous: list[AmbiguousTerm] = []
-    for key, raw_candidates in by_form.items():
-        candidates = list({item.term.id: item for item in raw_candidates}.values())
-        contextual = [item for item in candidates if item.context_hits]
-        selected: TermEvidence | None = None
-        if contextual:
-            best_score = max(len(item.context_hits) for item in contextual)
-            best = [item for item in contextual if len(item.context_hits) == best_score]
-            if len(best) == 1:
-                selected = best[0]
-            else:
-                candidates = best
-        else:
-            defaults = [item for item in candidates if not item.term.context_keywords]
-            if len(defaults) == 1:
-                selected = defaults[0]
-            elif len(candidates) == 1 and not candidates[0].term.context_keywords:
-                selected = candidates[0]
-
-        if selected is not None:
-            enforced_ids.add(selected.term.id)
-        else:
-            ambiguous.append(
-                AmbiguousTerm(
-                    source_form=display_form[key],
-                    candidates=tuple(candidates),
-                )
+    ]
+    evidence = []
+    for term in terms:
+        hits = [match for match in matches if match[0].id == term.id]
+        if not hits:
+            continue
+        evidence.append(
+            TermEvidence(
+                term=term,
+                matched_forms=tuple(dict.fromkeys(hit[1] for hit in hits)),
+                context_hits=tuple(
+                    key for key in term.context_keywords if term_appears(source, key)
+                ),
+                occurrences=tuple(
+                    TermOccurrence(start, end, source[start:end], _sentence(source, start, end))
+                    for start, end in sorted({(hit[2], hit[3]) for hit in hits})
+                ),
             )
-
-    enforced = tuple(item for item in evidence if item.term.id in enforced_ids)
+        )
+    enforced, conditional = [], []
+    for item in evidence:
+        competing = any(
+            other.term.id != item.term.id
+            and any(
+                a.start == b.start and a.end == b.end
+                for a in item.occurrences
+                for b in other.occurrences
+            )
+            for other in evidence
+        )
+        if requires_context(item.term) or competing:
+            conditional.append(item)
+        else:
+            enforced.append(item)
+    by_form: dict[str, list[TermEvidence]] = {}
+    for item in conditional:
+        by_form.setdefault(normalize_term_text(item.term.source), []).append(item)
     return TerminologyResolution(
-        enforced=enforced,
-        ambiguous=tuple(ambiguous),
+        enforced=tuple(enforced),
+        ambiguous=tuple(
+            AmbiguousTerm(items[0].term.source, tuple(items)) for items in by_form.values()
+        ),
         candidates=tuple(evidence),
     )
 
 
-def matching_terms(
-    source: str,
-    terms: list[TermEntry] | tuple[TermEntry, ...],
-) -> list[TermEntry]:
+def matching_terms(source: str, terms: list[TermEntry] | tuple[TermEntry, ...]) -> list[TermEntry]:
     return list(resolve_terminology(source, terms).matched_terms)
 
 
@@ -147,38 +182,42 @@ def render_terminology_constraints(
     resolution = resolve_terminology(source, terms)
     sections: list[str] = []
     if resolution.enforced:
-        sections.append("# APPROVED TERMINOLOGY — MANDATORY CONSTRAINTS")
-        sections.append(
-            "Use every selected target exactly and consistently. These are constraints, not references."
-        )
+        sections += [
+            "# APPROVED TERMINOLOGY — MANDATORY CONSTRAINTS",
+            "Use these globally approved translations at their matched occurrences.",
+        ]
         for evidence in resolution.enforced:
             term = evidence.term
-            forms = " | ".join(source_forms(term))
-            line = f"- {forms} -> {term.target} [MANDATORY]"
-            if term.sense:
-                line += f"; sense: {term.sense}"
-            if evidence.context_hits:
-                line += f"; context matched: {', '.join(evidence.context_hits)}"
+            line = f"- {' | '.join(source_forms(term))} -> {term.target} [MANDATORY]"
             if term.rationale:
                 line += f"; rationale: {term.rationale}"
             if term.forbidden_targets:
                 line += f"; never use: {', '.join(term.forbidden_targets)}"
             sections.append(line)
     if resolution.ambiguous:
-        if sections:
-            sections.append("")
-        sections.append("# TERMINOLOGY REQUIRING CONTEXTUAL DISAMBIGUATION")
-        sections.append(
-            "Choose only the approved sense supported by this passage. Do not blend senses or guess silently."
-        )
+        sections += [
+            "# CONDITIONALLY APPROVED TERMINOLOGY — CHECK EACH OCCURRENCE",
+            (
+                "For each occurrence, determine whether the approved sense applies before using its "
+                "target. Other senses, grammar uses, compounds and retained citations may be NOT "
+                "APPLICABLE even when there is only one approved entry. Keywords are hints, not proof. "
+                "Do not insert a target elsewhere to satisfy a string check. Use the natural translation "
+                "when no approved sense applies. Ask for human judgment only if uncertainty remains."
+            ),
+        ]
         for ambiguity in resolution.ambiguous:
-            sections.append(f'- Ambiguous source form: "{ambiguity.source_form}"')
             for evidence in ambiguity.candidates:
                 term = evidence.term
-                label = term.sense or term.source
-                guidance = term.disambiguation or term.rationale or "human confirmation required"
-                keywords = ", ".join(term.context_keywords) or "none supplied"
                 sections.append(
-                    f"  - {label} -> {term.target}; context keywords: {keywords}; guidance: {guidance}"
+                    f"- {' | '.join(source_forms(term))} -> {term.target} [CONDITIONAL]; "
+                    f"sense: {term.sense or 'context-dependent'}; "
+                    f"guidance: {term.disambiguation or term.rationale or 'check local meaning'}; "
+                    f"keyword hints: {', '.join(term.context_keywords) or 'none'}; "
+                    f"forbidden in this sense: {', '.join(term.forbidden_targets) or 'none'}"
                 )
+                for occurrence in evidence.occurrences:
+                    sections.append(
+                        f"  - source[{occurrence.start}:{occurrence.end}]: "
+                        f"{occurrence.text}; sentence: {occurrence.sentence}"
+                    )
     return "\n".join(sections)

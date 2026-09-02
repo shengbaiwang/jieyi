@@ -7,7 +7,7 @@ from dataclasses import asdict
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from jieyi.domain.models import ModelSpec, utc_now
+from jieyi.domain.models import IssueSeverity, ModelSpec, utc_now
 from jieyi.quality import reindex_project_quality, run_deterministic_checks
 from jieyi.quality.service import visible_translation
 from jieyi.term_discovery import (
@@ -244,6 +244,7 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         affected = []
+        project_terms = store.list_terms(term.project_id)
         for document in store.list_documents(term.project_id):
             for segment in store.list_segments(document.id):
                 if not any(
@@ -254,7 +255,7 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
                 if not target:
                     continue
                 issues = run_deterministic_checks(
-                    segment.source_text, target, [term], segment_kind=segment.kind
+                    segment.source_text, target, project_terms, segment_kind=segment.kind
                 )
                 affected.append(
                     {
@@ -262,13 +263,16 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
                         "segment_id": segment.id,
                         "ordinal": segment.ordinal,
                         "issue_codes": [issue.code for issue in issues],
-                        "needs_revision": bool(issues),
+                        "needs_revision": any(issue.severity is IssueSeverity.ERROR for issue in issues),
+                        "pending_verification": any(issue.code == "terminology_pending"
+                                                    for issue in issues),
                     }
                 )
         reindex_project_quality(store, term.project_id)
         impact = {
             "translated_occurrences_checked": len(affected),
             "segments_needing_revision": sum(item["needs_revision"] for item in affected),
+            "segments_pending_verification": sum(item["pending_verification"] for item in affected),
             "segments": affected,
             "candidate_sense_id": sense_id,
             "run_id": candidate["run_id"],

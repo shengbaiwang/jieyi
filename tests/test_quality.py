@@ -76,7 +76,7 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(issue.details["matched_forms"], ["AI"])
         self.assertEqual(issue.severity, IssueSeverity.ERROR)
 
-    def test_context_keywords_select_one_sense_for_an_ambiguous_form(self):
+    def test_context_keywords_are_hints_not_proof_of_sense(self):
         terms = [
             TermEntry(
                 id="financial",
@@ -103,10 +103,9 @@ class QualityTests(unittest.TestCase):
             terms,
         )
         codes = {item.code for item in issues}
-        self.assertIn("approved_term_missing", codes)
-        self.assertNotIn("ambiguous_term_unresolved", codes)
-        issue = next(item for item in issues if item.code == "approved_term_missing")
-        self.assertEqual(issue.details["target"], "银行")
+        self.assertEqual(codes, {"terminology_pending"})
+        self.assertEqual(issues[0].severity, IssueSeverity.INFO)
+        self.assertFalse(issues[0].details["requires_human"])
 
     def test_unresolved_sense_is_warned_without_forcing_conflicting_targets(self):
         terms = [
@@ -131,7 +130,7 @@ class QualityTests(unittest.TestCase):
         ]
         issues = run_deterministic_checks("The bank was old.", "它很古老。", terms)
         codes = {item.code for item in issues}
-        self.assertIn("ambiguous_term_unresolved", codes)
+        self.assertIn("terminology_pending", codes)
         self.assertNotIn("approved_term_missing", codes)
 
 

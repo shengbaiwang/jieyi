@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass
+from html import escape
 
 _TOKEN = re.compile(r"\[\[JY_PH_(\d{4})\]\]")
 _PROTECTED = re.compile(
@@ -46,6 +48,67 @@ class ProtectedText:
     @property
     def tokens(self) -> tuple[str, ...]:
         return tuple(span.token for span in self.spans)
+
+    @property
+    def atom_boundaries(self) -> tuple[tuple[str, str], ...]:
+        """Expose typed EPUB boundaries without exposing source DOM addresses."""
+        pairs: list[tuple[str, str]] = []
+        opening: str | None = None
+        for span in self.spans:
+            if re.match(r"<jy-atom\s", span.text):
+                if opening is not None:
+                    raise PlaceholderIntegrityError("Nested SourceAtom boundaries in source")
+                opening = span.token
+            elif span.text == "</jy-atom>":
+                if opening is None:
+                    raise PlaceholderIntegrityError("Unmatched SourceAtom boundary in source")
+                pairs.append((opening, span.token))
+                opening = None
+        if opening is not None:
+            raise PlaceholderIntegrityError("Unclosed SourceAtom boundary in source")
+        return tuple(pairs)
+
+    def assemble_atom_repair(self, response: str) -> str:
+        """Rebuild wrappers locally from a complete, strictly keyed fragment response."""
+        pairs = self.atom_boundaries
+        if not pairs:
+            return response
+        cleaned = response.strip()
+        if cleaned.startswith("```json\n") and cleaned.endswith("```"):
+            cleaned = cleaned[8:-3].strip()
+        elif cleaned.startswith("```\n") and cleaned.endswith("```"):
+            cleaned = cleaned[4:-3].strip()
+
+        def unique_object(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError(f"Duplicate SourceAtom repair key: {key}")
+                result[key] = value
+            return result
+
+        try:
+            values = json.loads(cleaned, object_pairs_hook=unique_object)
+        except ValueError as exc:
+            raise PlaceholderIntegrityError(f"SourceAtom repair requires valid JSON: {exc}") from exc
+        expected = {opening for opening, _ in pairs}
+        if not isinstance(values, dict) or set(values) != expected:
+            raise PlaceholderIntegrityError("SourceAtom repair must contain exactly the requested keys")
+        pieces: list[str] = []
+        for opening, closing in pairs:
+            value = values[opening]
+            if not isinstance(value, str) or not value.strip():
+                raise PlaceholderIntegrityError(f"SourceAtom repair is empty: {opening}")
+            source_fragment = self.masked.split(opening, 1)[1].split(closing, 1)[0]
+            if extract_placeholder_tokens(value) != extract_placeholder_tokens(source_fragment):
+                raise PlaceholderIntegrityError(
+                    f"SourceAtom repair changed inline placeholders in {opening}"
+                )
+            # JSON values are text with protected inline tokens, never model-supplied XML.
+            pieces.append(opening + escape(value.strip(), quote=False) + closing)
+        assembled = "".join(pieces)
+        self.validate(assembled)
+        return assembled
 
     def mask_translation(self, translated_text: str) -> str:
         """Mask restored protected values before sending a draft to a reviewer."""

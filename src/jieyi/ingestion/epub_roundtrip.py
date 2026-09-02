@@ -465,7 +465,11 @@ def parse_structured_translation(
         raise ValueError(
             "Structured EPUB translation contains text outside SourceAtom boundaries"
         )
-    items = [item for item in root if _local_name(item.tag) == "jy-atom"]
+    if any(item.tag != "jy-atom" for item in root):
+        raise ValueError("Structured EPUB translation contains an unexpected outer element")
+    if any(child.tag == "jy-atom" for item in root for child in item.iter() if child is not item):
+        raise ValueError("Structured EPUB translation contains nested SourceAtom boundaries")
+    items = list(root)
     found = tuple(item.attrib.get("data-jy-id", "") for item in items)
     if found != expected_atom_ids:
         raise ValueError(

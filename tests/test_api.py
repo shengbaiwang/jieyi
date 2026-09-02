@@ -126,7 +126,7 @@ class ApiTests(unittest.TestCase):
         health = self.client.get("/health")
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["api_version"], 2)
-        self.assertEqual(health.json()["quality_detector_version"], "5")
+        self.assertEqual(health.json()["quality_detector_version"], "6")
         self.assertTrue(health.json()["db_path"].endswith("api.db"))
         self.assertIn("echo", health.json()["providers"])
 
@@ -220,7 +220,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(confirm.json()["status"], "human_confirmed")
         current_issues = self.client.get(f"/documents/{document['id']}/issues")
         self.assertEqual(current_issues.status_code, 200)
-        self.assertEqual(current_issues.json(), [])
+        self.assertEqual([item["code"] for item in current_issues.json()], ["terminology_pending"])
+        self.assertEqual(current_issues.json()[0]["severity"], "info")
 
         tm = self.client.get(f"/projects/{project['id']}/translation-memory")
         self.assertEqual(tm.status_code, 200)

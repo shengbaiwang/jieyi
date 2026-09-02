@@ -119,6 +119,7 @@ class TermEntry:
     context_keywords: tuple[str, ...] = ()
     sense: str = ""
     disambiguation: str = ""
+    enforcement: str = "auto"  # auto | global | contextual
     created_at: str = field(default_factory=utc_now)
 
 
@@ -221,6 +222,7 @@ class TranslationRequest:
     task: CandidateStage = CandidateStage.DRAFT
     existing_translation: str | None = None
     issue_summary: str = ""
+    atom_boundaries: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

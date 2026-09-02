@@ -274,6 +274,7 @@ async def _translate_group(
                 project=project,
                 document=document,
                 segment=replace(segment, source_text=protected.masked),
+                atom_boundaries=protected.atom_boundaries if structured_by_id[segment.id] else (),
                 context=project_context,
                 segment_context=_term_context(segment.source_text, relevant),
                 task=stage,
@@ -402,6 +403,7 @@ async def _translate_group(
                     project=project,
                     document=document,
                     segment=replace(segment, source_text=protected.masked),
+                    atom_boundaries=protected.atom_boundaries if structured_by_id[segment.id] else (),
                     context=project_context,
                     segment_context=_term_context(segment.source_text, terms_by_id[segment.id]),
                     task=CandidateStage.REPAIR,
@@ -434,7 +436,10 @@ async def _translate_group(
                         )
                     repaired = await limiter.complete(repair_operation)
                     usage_results.append(repaired)
-                    restored_value = protected.restore(repaired.text)
+                    restored_value = protected.restore(
+                        protected.assemble_atom_repair(repaired.text)
+                        if structured_by_id[segment.id] else repaired.text
+                    )
                     restored[segment.id] = (
                         engine.store.capture_epub_translation(segment.id, restored_value, "repair")
                         if structured_by_id[segment.id]
@@ -563,16 +568,23 @@ def _record_deferred_segment(
         if visible
         else []
     )
+    if isinstance(error, PlaceholderIntegrityError):
+        reason = "EPUB 文本片段对齐失败" if "SourceAtom" in str(error) else "译文格式标记校验失败"
+        failure_message = f"{reason}，自动修复 {_PLACEHOLDER_REPAIR_ATTEMPTS} 次仍未通过。本段尚未保存，可重试草译或更换模型。"
+    elif is_content_filtered_error(error):
+        failure_message = "模型拒绝生成本段译文。本段尚未保存，可更换模型或人工翻译。"
+    elif isinstance(error, EmptyProviderResponseError):
+        failure_message = "模型未返回可用译文。本段尚未保存，请检查输出额度或重试草译。"
+    else:
+        failure_message = "本段译文未通过验收，尚未保存。请重试草译或查看失败记录。"
     issues.append(
         QualityIssue(
             code="translation_deferred",
-            message=(
-                "该段未生成通过结构与内容验收的译文，已安全隔离；"
-                "原文及已有译文均未被无效结果覆盖。"
-            ),
+            message=failure_message,
             severity=IssueSeverity.ERROR,
             details={
                 "kind": payload.get("kind", "segment_validation_failure"),
+                "error": str(error)[:1_000],
                 "job_stage": stage.value,
                 "provider": model_spec.provider,
                 "model": model_spec.model,

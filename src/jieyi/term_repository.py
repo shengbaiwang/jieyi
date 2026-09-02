@@ -396,6 +396,7 @@ class TermRepository:
             target=target,
             status=TermStatus.APPROVED,
             scope="project",
+            enforcement="contextual",
             rationale=rationale.strip() or candidate["rationale"],
             aliases=aliases,
             context_keywords=context_keywords,
@@ -408,8 +409,8 @@ class TermRepository:
                 """INSERT INTO terms
                 (id, project_id, source, target, status, scope, domain, rationale,
                  forbidden_targets_json, aliases_json, context_keywords_json, sense,
-                 disambiguation, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 disambiguation, created_at, enforcement)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     term.id,
                     term.project_id,
@@ -425,6 +426,7 @@ class TermRepository:
                     term.sense,
                     term.disambiguation,
                     term.created_at,
+                    term.enforcement,
                 ),
             )
             connection.execute(

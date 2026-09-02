@@ -291,6 +291,7 @@ class TranslationEngine:
             project=project,
             document=document,
             segment=replace(segment, source_text=protected.masked),
+            atom_boundaries=protected.atom_boundaries if bool(structured_source) else (),
             context=context,
             task=CandidateStage.DRAFT,
         )
@@ -355,6 +356,7 @@ class TranslationEngine:
             project=project,
             document=document,
             segment=replace(segment, source_text=protected.masked),
+            atom_boundaries=protected.atom_boundaries if structured else (),
             context=context,
             task=stage,
             existing_translation=masked_existing,
@@ -440,6 +442,7 @@ class TranslationEngine:
                     project=project,
                     document=document,
                     segment=replace(segment, source_text=protected.masked),
+                    atom_boundaries=protected.atom_boundaries if structured else (),
                     context=context,
                     task=CandidateStage.REPAIR,
                     # Keep retry attempts independent. A rejected repair can contain fewer
@@ -465,7 +468,10 @@ class TranslationEngine:
                     )
                     continue
                 try:
-                    restored_value = protected.restore(repaired.text)
+                    restored_value = protected.restore(
+                        protected.assemble_atom_repair(repaired.text)
+                        if structured else repaired.text
+                    )
                     restored = replace(
                         repaired,
                         text=(

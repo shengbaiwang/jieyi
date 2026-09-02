@@ -297,7 +297,12 @@ nav { display: grid; gap: 3px; }
   letter-spacing: .015em;
 }
 .translation-pane textarea:focus-visible { outline: 0; }
-.editor-footer { display: flex; justify-content: space-between; align-items: center; padding-top: 20px; color: var(--muted); font-size: 9.5px; }
+.editor-footer { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; align-items: center; padding-top: 20px; color: var(--muted); font-size: 9.5px; }
+.editor-footer-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+.segment-draft-button { min-height: 27px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--blue-soft); color: var(--accent-text); font-size: 10.5px; font-weight: 620; white-space: nowrap; }
+.segment-draft-button:hover:not(:disabled) { border-color: var(--blue); }
+.segment-draft-button:disabled { opacity: .45; }
+.segment-draft-button[aria-busy="true"] { opacity: .8; }
 .confirm-button { min-height: 27px; display: flex; align-items: center; gap: 8px; border: 1px solid rgba(45,51,60,.16); border-radius: 7px; padding: 0 9px; background: var(--paper); box-shadow: 0 1px 2px rgba(0,0,0,.04); font-size: 10.5px; font-weight: 620; }
 .confirm-button:hover { border-color: rgba(10,118,246,.4); }
 .confirm-button kbd { color: var(--muted); font-size: 9px; }
@@ -743,3 +748,12 @@ nav { display: grid; gap: 3px; }
   .chapter-picker-dialog > footer { align-items: stretch; flex-direction: column; }
   .chapter-picker-dialog > footer > div { display: grid; grid-template-columns: 1fr 1.6fr; }
 }
+
+.terminology-review { margin: 18px 0; padding: 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.terminology-review-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.terminology-review-heading strong { font-size: 14px; }
+.terminology-review p { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 7px 0; }
+.terminology-review-counts { display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; margin: 14px 0; }
+.terminology-review button { flex-shrink: 0; }
+.term-create select { background: var(--paper); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+@media (max-width: 700px) { .terminology-review-heading { flex-direction: column; } }

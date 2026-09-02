@@ -281,6 +281,126 @@ class EpubRoundTripTests(unittest.TestCase):
         self.assertIn("〔尚未翻译〕", value)
 
 
+
+class SplitHeadingRepairTests(unittest.TestCase):
+    """Reproduce a real split title whose translated suffix falls outside both atoms."""
+
+    setUp = EpubRoundTripTests.setUp
+    tearDown = EpubRoundTripTests.tearDown
+
+    def split_book(self):
+        source = io.BytesIO(build_roundtrip_epub())
+        output = io.BytesIO()
+        with zipfile.ZipFile(source) as archive, zipfile.ZipFile(output, "w") as result:
+            for item in archive.infolist():
+                data = archive.read(item.filename)
+                if item.filename == "EPUB/Text/chapter.xhtml":
+                    data = data.replace(
+                        b"<h1>Round <em>Trip</em></h1>",
+                        b"<h1>The idea was later celebrated in Montesquieu's<br style='display:block'/>"
+                        b"<em>The Spirit of the Laws</em></h1>",
+                    )
+                result.writestr(item, data)
+        return create_epub_document(self.store, project_id=self.project.id, file_data=output.getvalue())
+
+    def test_split_heading_repair_works_in_both_runners_and_exports_all_text(self):
+        import json
+
+        from jieyi.domain.models import TranslationResult
+        from jieyi.ingestion.epub_reader import export_translated_epub
+        from jieyi.prompting import build_messages
+        from jieyi.protection import ProtectedTextCodec
+
+        for optimized in (False, True):
+            with self.subTest(optimized=optimized), tempfile.TemporaryDirectory() as directory:
+                original_store = self.store
+                self.store = SQLiteStore(Path(directory) / "case.db")
+                self.store.migrate()
+                self.store.create_project(self.project)
+                document = self.split_book()
+                segment = self.store.list_segments(document.id)[0]
+                protected = ProtectedTextCodec().encode(self.store.epub_translation_source(segment.id))
+                self.assertEqual(len(protected.atom_boundaries), 2)
+                pairs = protected.atom_boundaries
+
+                class Provider:
+                    repair_calls = 0
+
+                    async def translate(inner, request, model):
+                        return await inner.complete(build_messages(request))
+
+                    async def complete(inner, messages, model=None, *, pairs=pairs, **kwargs):
+                        if "SOURCE FRAGMENTS" in messages[1]["content"]:
+                            inner.repair_calls += 1
+                            text = json.dumps({
+                                pairs[0][0]: "这一观念后来备受颂扬，见孟德斯鸠的",
+                                pairs[1][0]: "《论法的精神》",
+                            }, ensure_ascii=False)
+                        else:
+                            text = (pairs[0][0] + "这一观念后来在孟德斯鸠的" + pairs[0][1]
+                                    + pairs[1][0] + "《论法的精神》" + pairs[1][1] + "中备受颂扬")
+                        return TranslationResult(text=text, prompt_tokens=20, completion_tokens=10)
+
+                provider = Provider()
+                registry = ProviderRegistry()
+                registry.register("split-repair", provider)
+                engine = TranslationEngine(self.store, registry)
+                job = create_job(self.store, document_id=document.id, draft_provider="split-repair",
+                                 draft_model="test", review_policy="never", segment_ranges=[(0, 0)])
+                run = engine.run_optimized if optimized else engine.run
+                asyncio.run(run(job.id))
+                saved = self.store.get_segment(segment.id)
+                self.assertEqual(provider.repair_calls, 1)
+                self.assertIn("备受颂扬", saved.machine_translation)
+                self.assertIn("《论法的精神》", saved.machine_translation)
+                self.assertFalse(any(s.machine_translation for s in self.store.list_segments(document.id)[1:]))
+                self.assertEqual(self.store.job_progress(job.id)["prompt_tokens"], 40)
+                self.assertEqual(self.store.job_progress(job.id)["completion_tokens"], 20)
+                self.assertFalse(self.store.list_issues(document.id))
+                with zipfile.ZipFile(io.BytesIO(export_translated_epub(self.store, document.id))) as archive:
+                    root = ET.fromstring(archive.read("EPUB/Text/chapter.xhtml"))
+                    heading = next(el for el in root.iter() if el.tag.endswith("}h1"))
+                    emphasis = next(el for el in heading.iter() if el.tag.endswith("}em"))
+                    self.assertEqual(emphasis.text, "《论法的精神》")
+                    self.assertIn("备受颂扬", "".join(heading.itertext()))
+                    self.assertEqual(archive.read("EPUB/Fonts/book.woff2"), b"fake-font-data")
+                self.store = original_store
+
+    def test_invalid_fragment_repairs_remain_isolated_without_partial_writes(self):
+        from jieyi.domain.models import TranslationResult
+        from jieyi.protection import ProtectedTextCodec
+
+        document = self.split_book()
+        segment = self.store.list_segments(document.id)[0]
+        protected = ProtectedTextCodec().encode(self.store.epub_translation_source(segment.id))
+
+        class InvalidProvider:
+            calls = 0
+
+            async def complete(inner, messages, model, **kwargs):
+                inner.calls += 1
+                text = protected.masked + "越界句尾" if inner.calls == 1 else '{"wrong": "缺少片段"}'
+                return TranslationResult(text=text, prompt_tokens=20, completion_tokens=10)
+
+        provider = InvalidProvider()
+        registry = ProviderRegistry()
+        registry.register("invalid-fragments", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(self.store, document_id=document.id, draft_provider="invalid-fragments",
+                         draft_model="test", review_policy="never", segment_ranges=[(0, 0)])
+        asyncio.run(engine.run_optimized(job.id))
+        self.assertEqual(provider.calls, 4)
+        self.assertIsNone(self.store.get_segment(segment.id).machine_translation)
+        self.assertIsNone(self.store.epub_structured_translation(segment.id))
+        progress = self.store.job_progress(job.id)
+        self.assertEqual(progress["deferred_segments"], 1)
+        self.assertEqual(progress["total_segments"], 1)
+        self.assertEqual(progress["prompt_tokens"], 80)
+        issue = self.store.list_issues(document.id)[0]
+        self.assertIn("EPUB 文本片段对齐失败", issue["message"])
+        self.assertIn("3 次", issue["message"])
+
+
 class EpubReaderApiTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()

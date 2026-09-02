@@ -33,7 +33,7 @@ type Run = {
 };
 export type ApprovedTerm = {
   id: string; source: string; target: string; status: string; scope: string; rationale: string;
-  aliases: string[]; context_keywords: string[]; sense: string; disambiguation: string;
+  aliases: string[]; context_keywords: string[]; sense: string; disambiguation: string; enforcement?: string;
 };
 type Props = {
   documentId: string;
@@ -178,7 +178,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
     if (!target) { notify("请先填写拟定译法，再批准这个义项。 "); return; }
     setBusySense(sense.id);
     try {
-      const payload = await request<{ term: ApprovedTerm; impact: { translated_occurrences_checked: number; segments_needing_revision: number } }>(
+      const payload = await request<{ term: ApprovedTerm; impact: { translated_occurrences_checked: number; segments_needing_revision: number; segments_pending_verification: number } }>(
         `/term-candidate-senses/${sense.id}/approve`,
         {
           method: "POST",
@@ -193,7 +193,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
       );
       onApproved(payload.term);
       await load();
-      notify(`术语已批准并检查 ${payload.impact.translated_occurrences_checked} 处既有译文；${payload.impact.segments_needing_revision} 处需复核。`);
+      notify(`术语已批准并检查 ${payload.impact.translated_occurrences_checked} 处既有译文；${payload.impact.segments_needing_revision} 段存在规则问题，${payload.impact.segments_pending_verification} 段待语境核验。`);
     } catch (error) {
       notify(error instanceof Error ? error.message : "批准失败");
     } finally {

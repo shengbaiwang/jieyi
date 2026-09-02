@@ -455,6 +455,15 @@ class SQLiteStore:
                 )
                 connection.execute("DROP TABLE terms_legacy")
                 connection.execute("CREATE INDEX idx_terms_project ON terms(project_id)")
+            if "enforcement" not in {
+                row["name"] for row in connection.execute("PRAGMA table_info(terms)")
+            }:
+                connection.execute(
+                    "ALTER TABLE terms ADD COLUMN enforcement TEXT NOT NULL DEFAULT 'auto'"
+                )
+            from jieyi.quality.terminology_review import _SCHEMA as review_schema
+
+            connection.executescript(review_schema)
             issue_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(issues)").fetchall()
             }
@@ -1136,8 +1145,8 @@ class SQLiteStore:
                 """INSERT INTO terms
                 (id, project_id, source, target, status, scope, domain, rationale,
                  forbidden_targets_json, aliases_json, context_keywords_json, sense,
-                 disambiguation, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 disambiguation, created_at, enforcement)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     term.id,
                     term.project_id,
@@ -1153,6 +1162,7 @@ class SQLiteStore:
                     term.sense,
                     term.disambiguation,
                     term.created_at,
+                    term.enforcement,
                 ),
             )
             self._audit(
@@ -1387,14 +1397,18 @@ class SQLiteStore:
         *,
         target_text: str = "",
         detector_version: str = "1",
+        replace_codes: set[str] | None = None,
     ) -> None:
         """Supersede prior findings and store the segment's current quality snapshot."""
         target_hash = hashlib.sha256(target_text.encode("utf-8")).hexdigest()
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE issues SET resolved = 1 WHERE segment_id = ? AND resolved = 0",
-                (segment_id,),
-            )
+            where = "segment_id = ? AND resolved = 0"
+            parameters: list = [segment_id]
+            if replace_codes is not None:
+                codes = sorted(replace_codes)
+                where += f" AND code IN ({','.join('?' for _ in codes)})"
+                parameters.extend(codes)
+            connection.execute(f"UPDATE issues SET resolved = 1 WHERE {where}", parameters)
             connection.executemany(
                 """INSERT INTO issues
                 (id, job_id, segment_id, code, message, severity, details_json,
