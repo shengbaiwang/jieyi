@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from jieyi.domain.models import TermEntry, TermStatus, new_id, utc_now
+from jieyi.domain.models import TermEnforcement, TermEntry, TermStatus, new_id, utc_now
 from jieyi.term_discovery import model_review_counts, needs_model_review
 
 
@@ -272,10 +272,11 @@ class TermRepository:
     @staticmethod
     def _read_senses(connection, candidate_id):
         rows = connection.execute(
-            """SELECT s.*, EXISTS (
+            """SELECT s.*, t.enforcement AS approved_enforcement, EXISTS (
                 SELECT 1 FROM audit_events a
                 WHERE a.entity_type = 'term_candidate_sense' AND a.entity_id = s.id
             ) AS human_reviewed FROM term_candidate_senses s
+            LEFT JOIN terms t ON t.id = s.approved_term_id
             WHERE s.lexeme_id = ? ORDER BY s.confidence DESC, s.updated_at""",
             (candidate_id,),
         ).fetchall()
@@ -448,11 +449,12 @@ class TermRepository:
         with self.store._connect() as connection:
             row = connection.execute(
                 """SELECT s.*, l.canonical_form, l.forms_json, l.run_id,
-                r.document_id, d.project_id
+                r.document_id, d.project_id, t.enforcement AS approved_enforcement
                 FROM term_candidate_senses s
                 JOIN term_lexeme_candidates l ON l.id = s.lexeme_id
                 JOIN term_discovery_runs r ON r.id = l.run_id
                 JOIN documents d ON d.id = r.document_id
+                LEFT JOIN terms t ON t.id = s.approved_term_id
                 WHERE s.id = ?""",
                 (sense_id,),
             ).fetchone()
@@ -476,6 +478,7 @@ class TermRepository:
         context_keywords: tuple[str, ...],
         disambiguation: str,
         actor: str,
+        enforcement: TermEnforcement = "contextual",
     ) -> tuple[TermEntry, dict[str, Any]]:
         candidate = self.get_sense(sense_id)
         if candidate["status"] == "approved":
@@ -496,7 +499,7 @@ class TermRepository:
             target=target,
             status=TermStatus.APPROVED,
             scope="project",
-            enforcement="contextual",
+            enforcement=enforcement,
             rationale=rationale.strip() or candidate["rationale"],
             aliases=aliases,
             context_keywords=context_keywords,
@@ -553,6 +556,7 @@ class TermRepository:
                 "source": term.source,
                 "context_keywords": list(term.context_keywords),
                 "target": term.target,
+                "enforcement": term.enforcement,
             }
             self.store._audit(connection, "term", term.id, "approved_from_candidate", provenance)
             self.store._audit(

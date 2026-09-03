@@ -55,7 +55,7 @@ def source_forms(term: TermEntry) -> tuple[str, ...]:
 
 def requires_context(term: TermEntry) -> bool:
     if term.enforcement != "auto":
-        return term.enforcement != "global"
+        return term.enforcement == "contextual"
     return bool(term.sense.strip() or term.disambiguation.strip() or term.context_keywords)
 
 
@@ -86,6 +86,7 @@ class TerminologyResolution:
     enforced: tuple[TermEvidence, ...] = ()
     ambiguous: tuple[AmbiguousTerm, ...] = ()
     candidates: tuple[TermEvidence, ...] = ()
+    references: tuple[TermEvidence, ...] = ()
 
     @property
     def matched_terms(self) -> tuple[TermEntry, ...]:
@@ -108,6 +109,7 @@ def resolve_terminology(
 
     Keywords remain hints for a semantic check. A longer approved phrase owns its
     span; independent short-word occurrences elsewhere in the paragraph remain.
+    Reference entries match independently and never displace binding constraints.
     """
     matches = [
         (term, form, start, end)
@@ -120,7 +122,8 @@ def resolve_terminology(
         match
         for match in matches
         if not any(
-            other[2] <= match[2]
+            (other[0].enforcement == "reference") == (match[0].enforcement == "reference")
+            and other[2] <= match[2]
             and other[3] >= match[3]
             and other[3] - other[2] > match[3] - match[2]
             for other in matches
@@ -144,10 +147,14 @@ def resolve_terminology(
                 ),
             )
         )
-    enforced, conditional = [], []
+    enforced, conditional, references = [], [], []
     for item in evidence:
+        if item.term.enforcement == "reference":
+            references.append(item)
+            continue
         competing = any(
             other.term.id != item.term.id
+            and other.term.enforcement != "reference"
             and any(
                 a.start == b.start and a.end == b.end
                 for a in item.occurrences
@@ -168,6 +175,7 @@ def resolve_terminology(
             AmbiguousTerm(items[0].term.source, tuple(items)) for items in by_form.values()
         ),
         candidates=tuple(evidence),
+        references=tuple(references),
     )
 
 
@@ -220,4 +228,27 @@ def render_terminology_constraints(
                         f"  - source[{occurrence.start}:{occurrence.end}]: "
                         f"{occurrence.text}; sentence: {occurrence.sentence}"
                     )
+    if resolution.references:
+        sections += [
+            "# REFERENCE TERMINOLOGY — OPTIONAL GUIDANCE",
+            (
+                "These translations are suggestions only. Consider their sense and local context; "
+                "adapt or use another natural translation whenever appropriate. Exact wording and "
+                "consistent use are not required, even when the described sense applies. "
+                "Reference entries never override mandatory or applicable conditional constraints. "
+                "Do not report terminology inconsistency solely for departing from a reference."
+            ),
+        ]
+        for evidence in resolution.references:
+            term = evidence.term
+            line = f"- {' | '.join(source_forms(term))} -> {term.target} [REFERENCE]"
+            for label, value in (
+                ("sense", term.sense),
+                ("guidance", term.disambiguation),
+                ("rationale", term.rationale),
+                ("keyword hints", ", ".join(term.context_keywords)),
+            ):
+                if value:
+                    line += f"; {label}: {value}"
+            sections.append(line)
     return "\n".join(sections)

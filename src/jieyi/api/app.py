@@ -6,7 +6,6 @@ import re
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
 from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -15,7 +14,14 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from jieyi.api.term_routes import install_term_routes
-from jieyi.domain.models import JobStatus, ModelSpec, TermEntry, TermStatus, new_id
+from jieyi.domain.models import (
+    JobStatus,
+    ModelSpec,
+    TermEnforcement,
+    TermEntry,
+    TermStatus,
+    new_id,
+)
 from jieyi.domain.reasoning import normalize_compute_mode
 from jieyi.ingestion import extract_epub, take_distributed_sample
 from jieyi.ingestion.epub_navigation import (
@@ -91,7 +97,11 @@ class TermCreate(BaseModel):
     context_keywords: list[str] = Field(default_factory=list)
     sense: str = ""
     disambiguation: str = ""
-    enforcement: Literal["auto", "global", "contextual"] = "auto"
+    enforcement: TermEnforcement = "auto"
+
+
+class TermEnforcementUpdate(BaseModel):
+    enforcement: TermEnforcement
 
 
 class TerminologyReviewCreate(BaseModel):
@@ -680,6 +690,15 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                     status_code=409, detail="Term sense already exists in this scope"
                 ) from exc
             raise
+
+    @app.patch("/projects/{project_id}/terms/{term_id}")
+    async def patch_term_enforcement(
+        project_id: str, term_id: str, body: TermEnforcementUpdate,
+    ):
+        store.get_project(project_id)
+        term = store.update_term_enforcement(project_id, term_id, body.enforcement)
+        reindex_project_quality(store, project_id)
+        return asdict(term)
 
     @app.get("/projects/{project_id}/terms")
     async def get_terms(project_id: str):

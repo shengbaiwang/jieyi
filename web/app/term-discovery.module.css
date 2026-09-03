@@ -41,8 +41,10 @@
 .sense blockquote { margin: 8px 0 0; border-left: 2px solid var(--line); padding: 7px 10px; color: var(--muted); background: color-mix(in srgb, var(--sidebar) 55%, transparent); }
 .sense blockquote small { font-size: 8px; }
 .sense blockquote p { margin: 4px 0 0; color: var(--text); font-family: ui-serif, Georgia, serif; font-size: 10px; line-height: 1.55; }
-.actions { display: flex; justify-content: flex-end; gap: 7px; }
-.actions button { font-size: 9px; }
+.actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+.actions button { min-width: 52px; font-size: 9px; }
+.reference { border: 1px solid var(--blue); border-radius: 7px; padding: 7px 11px; color: var(--accent-text); background: var(--blue-soft); }
+.actions button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .reject { border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; color: var(--muted); background: transparent; }
 .empty { border: 1px dashed var(--line); border-radius: 9px; padding: 18px; color: var(--muted); text-align: center; font-size: 10px; line-height: 1.55; }
 @media (max-width: 760px) { .heading { display: grid; } .heading button { justify-self: start; } .metrics { grid-template-columns: repeat(2, 1fr); } .metrics > div { border-bottom: 1px solid var(--line); } .editors { grid-template-columns: 1fr; } }

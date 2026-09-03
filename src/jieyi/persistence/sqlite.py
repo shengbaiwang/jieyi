@@ -20,6 +20,7 @@ from jieyi.domain.models import (
     Segment,
     SegmentKind,
     SegmentStatus,
+    TermEnforcement,
     TermEntry,
     TermStatus,
     TranslationMemoryMatch,
@@ -1186,6 +1187,29 @@ class SQLiteStore:
                 {"source": term.source, "target": term.target, "status": term.status.value},
             )
         return term
+
+    def update_term_enforcement(
+        self, project_id: str, term_id: str, enforcement: TermEnforcement,
+    ) -> TermEntry:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM terms WHERE id = ? AND project_id = ?",
+                (term_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Term not found: {term_id}")
+            term = self._term(row)
+            if term.enforcement == enforcement:
+                return term
+            connection.execute(
+                "UPDATE terms SET enforcement = ? WHERE id = ? AND project_id = ?",
+                (enforcement, term_id, project_id),
+            )
+            self._audit(
+                connection, "term", term_id, "enforcement_updated",
+                {"before": term.enforcement, "after": enforcement},
+            )
+        return replace(term, enforcement=enforcement)
 
     def list_terms(self, project_id: str) -> list[TermEntry]:
         with self._connect() as connection:

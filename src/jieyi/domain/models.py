@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from .reasoning import normalize_compute_mode
@@ -48,6 +48,9 @@ class TermStatus(StrEnum):
     APPROVED = "approved"
     DEPRECATED = "deprecated"
     FORBIDDEN = "forbidden"
+
+
+TermEnforcement = Literal["auto", "global", "contextual", "reference"]
 
 
 class CandidateStage(StrEnum):
@@ -118,7 +121,7 @@ class TermEntry:
     context_keywords: tuple[str, ...] = ()
     sense: str = ""
     disambiguation: str = ""
-    enforcement: str = "auto"  # auto | global | contextual
+    enforcement: TermEnforcement = "auto"
     created_at: str = field(default_factory=utc_now)
 
 

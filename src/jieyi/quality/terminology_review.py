@@ -69,7 +69,10 @@ def review_items(segment, terms, project) -> list[dict]:
     resolution = resolve_terminology(segment.source_text, terms)
     conditional_ids = {item.term.id for group in resolution.ambiguous for item in group.candidates}
     # Bind competing/longer rules too: adding a sense invalidates earlier judgments.
-    rules = [asdict(term) for term in sorted(terms, key=lambda term: term.id)]
+    rules = [
+        asdict(term) for term in sorted(terms, key=lambda term: term.id)
+        if term.enforcement != "reference"
+    ]
     items = []
     for evidence in resolution.candidates:
         if evidence.term.id not in conditional_ids:

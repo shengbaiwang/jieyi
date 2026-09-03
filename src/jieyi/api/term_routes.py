@@ -8,7 +8,7 @@ from dataclasses import asdict, replace
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from jieyi.domain.models import IssueSeverity, ModelSpec, utc_now
+from jieyi.domain.models import IssueSeverity, ModelSpec, TermEnforcement, utc_now
 from jieyi.quality import reindex_project_quality, run_deterministic_checks
 from jieyi.quality.service import visible_translation
 from jieyi.term_discovery import (
@@ -56,6 +56,7 @@ class TermCandidateRevocation(BaseModel):
 
 class TermCandidateApproval(BaseModel):
     target: str = Field(min_length=1)
+    enforcement: TermEnforcement = "contextual"
     sense: str = ""
     rationale: str = ""
     context_keywords: list[str] = Field(default_factory=list)
@@ -282,6 +283,7 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
             term, candidate = repository.approve_sense(
                 sense_id,
                 target=body.target,
+                enforcement=body.enforcement,
                 sense=body.sense,
                 rationale=body.rationale,
                 context_keywords=tuple(
@@ -303,30 +305,31 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         affected = []
-        project_terms = store.list_terms(term.project_id)
-        for document in store.list_documents(term.project_id):
-            for segment in store.list_segments(document.id):
-                if not any(
-                    term_appears(segment.source_text, form) for form in (term.source, *term.aliases)
-                ):
-                    continue
-                target = visible_translation(segment)
-                if not target:
-                    continue
-                issues = run_deterministic_checks(
-                    segment.source_text, target, project_terms, segment_kind=segment.kind
-                )
-                affected.append(
-                    {
-                        "document_id": document.id,
-                        "segment_id": segment.id,
-                        "ordinal": segment.ordinal,
-                        "issue_codes": [issue.code for issue in issues],
-                        "needs_revision": any(issue.severity is IssueSeverity.ERROR for issue in issues),
-                        "pending_verification": any(issue.code == "terminology_pending"
-                                                    for issue in issues),
-                    }
-                )
+        if term.enforcement != "reference":
+            project_terms = store.list_terms(term.project_id)
+            for document in store.list_documents(term.project_id):
+                for segment in store.list_segments(document.id):
+                    if not any(
+                        term_appears(segment.source_text, form) for form in (term.source, *term.aliases)
+                    ):
+                        continue
+                    target = visible_translation(segment)
+                    if not target:
+                        continue
+                    issues = run_deterministic_checks(
+                        segment.source_text, target, project_terms, segment_kind=segment.kind
+                    )
+                    affected.append(
+                        {
+                            "document_id": document.id,
+                            "segment_id": segment.id,
+                            "ordinal": segment.ordinal,
+                            "issue_codes": [issue.code for issue in issues],
+                            "needs_revision": any(issue.severity is IssueSeverity.ERROR for issue in issues),
+                            "pending_verification": any(issue.code == "terminology_pending"
+                                                        for issue in issues),
+                        }
+                    )
         reindex_project_quality(store, term.project_id)
         impact = {
             "translated_occurrences_checked": len(affected),

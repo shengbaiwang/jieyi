@@ -53,7 +53,9 @@ def build_system_prompt(request: TranslationRequest) -> str:
         instruction = (
             "Translate the source faithfully. Do not add commentary or omit content. Preserve "
             "meaning, modality, attribution and every mandatory terminology constraint. "
-            "Treat approved terminology as binding, not advisory. Return only the translation."
+            "Follow mandatory terminology and conditional terminology when its sense applies. "
+            "Reference terminology is optional guidance: adapt it to context without requiring "
+            "identical wording or consistency. Return only the translation."
         )
     structure_rule = (
         "Placeholder pairs may represent protected inline formatting, links, notes, line breaks, "

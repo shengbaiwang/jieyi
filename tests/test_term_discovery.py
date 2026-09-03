@@ -402,6 +402,69 @@ class TermDiscoveryApiTests(unittest.TestCase):
         self.assertEqual(self.client.post("/term-candidate-senses/missing/revoke", json={}).status_code,
                          404)
 
+    def test_candidate_reference_and_fixed_choices_persist_and_apply_distinct_rules(self):
+        project = self.client.post("/projects", json={
+            "name": "Candidate choices", "source_lang": "en", "target_lang": "zh-CN",
+        }).json()
+        document = self.client.post(f"/projects/{project['id']}/documents", json={
+            "title": "Agency", "source_format": "txt",
+            "text": "Agency is defined as the capacity to act. Agency matters.",
+        }).json()
+        job = self.client.post(f"/documents/{document['id']}/jobs", json={
+            "draft_provider": "echo", "draft_model": "draft",
+        }).json()
+        self.assertEqual(self.client.post(f"/jobs/{job['id']}/run").status_code, 200)
+        segments_url = f"/documents/{document['id']}/segments"
+        before = self.client.get(segments_url).json()
+        response = self.client.post(f"/documents/{document['id']}/term-discovery-runs", json={
+            "max_candidates": 100, "min_score": 0.1, "max_model_candidates": 0,
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        candidates_url = f"/documents/{document['id']}/term-candidates"
+        def candidate_sense():
+            candidates = self.client.get(candidates_url).json()
+            return next(item for item in candidates if item["lexeme_key"] == "agency")["senses"][0]
+
+        sense_id = candidate_sense()["id"]
+        approval_url = f"/term-candidate-senses/{sense_id}/approve"
+        invalid = self.client.post(approval_url, json={"target": "能动性", "enforcement": "invalid"})
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(candidate_sense()["status"], "pending")
+        store = SQLiteStore(self.database)
+        for mode, marker in (("reference", "[REFERENCE]"), ("global", "[MANDATORY]")):
+            with self.subTest(mode=mode):
+                response = self.client.post(approval_url, json={
+                    "target": "能动性", "enforcement": mode, "sense": "行动能力",
+                    "context_keywords": ["capacity"], "disambiguation": "由译者根据证据选择",
+                })
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                self.assertEqual(payload["term"]["enforcement"], mode)
+                self.assertEqual(candidate_sense()["approved_enforcement"], mode)
+                self.assertEqual(TermRepository(store).get_sense(sense_id)["approved_enforcement"], mode)
+                terms = self.client.get(f"/projects/{project['id']}/terms").json()
+                self.assertEqual(terms[0]["enforcement"], mode)
+                preview = self.client.get(
+                    f"/jobs/{job['id']}/segments/{before[0]['id']}/prompt-preview",
+                ).json()
+                self.assertIn(marker, preview["messages"][0]["content"])
+                issues = self.client.get(f"/documents/{document['id']}/issues").json()
+                if mode == "reference":
+                    self.assertEqual(issues, [])
+                    self.assertEqual(payload["impact"]["translated_occurrences_checked"], 0)
+                    self.assertEqual(payload["impact"]["segments"], [])
+                else:
+                    self.assertEqual({item["code"] for item in issues}, {"approved_term_missing"})
+                    self.assertGreater(payload["impact"]["segments_needing_revision"], 0)
+                audit = store.list_audit_events("term", payload["term"]["id"])
+                approved = next(item for item in audit if item["action"] == "approved_from_candidate")
+                self.assertEqual(approved["payload"]["enforcement"], mode)
+                self.assertEqual(self.client.get(segments_url).json(), before)
+                revoked = self.client.post(f"/term-candidate-senses/{sense_id}/revoke", json={})
+                self.assertEqual(revoked.status_code, 200)
+                self.assertEqual(candidate_sense()["status"], "pending")
+                self.assertIsNone(candidate_sense()["approved_enforcement"])
+
     def test_rejection_is_auditable_and_does_not_create_term(self):
         project = self.client.post(
             "/projects",

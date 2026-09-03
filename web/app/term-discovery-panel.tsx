@@ -11,7 +11,7 @@ type Evidence = {
 type Sense = {
   id: string; sense: string; concept_definition: string; proposed_target: string;
   rationale: string; disambiguation: string; confidence: number;
-  context_keywords: string[]; approved_term_id: string | null;
+  context_keywords: string[]; approved_term_id: string | null; approved_enforcement?: string | null;
   human_reviewed?: boolean; ai_recommended: boolean | null; proposer: string; status: "pending" | "approved" | "rejected";
 };
 type Candidate = {
@@ -218,7 +218,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
       setCandidates((items) => items.map((item) => ({
         ...item, senses: item.senses.map((entry) => entry.id === sense.id ? payload.candidate : entry),
       })));
-      notify("已撤回批准，候选恢复待审核；对应术语约束已移除，既有译文保持不变。");
+      notify("已撤回，候选恢复待审核；对应术语已移除，既有译文保持不变。");
     } catch (error) {
       notify(error instanceof Error ? error.message : "撤回失败");
     } finally {
@@ -226,9 +226,9 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
     }
   }
 
-  async function approve(sense: Sense) {
+  async function approve(sense: Sense, enforcement: "reference" | "global") {
     const target = (targets[sense.id] ?? sense.proposed_target).trim();
-    if (!target) { notify("请先填写拟定译法，再批准这个义项。 "); return; }
+    if (!target) { notify("请先填写拟定译法。"); return; }
     setBusySense(sense.id);
     try {
       const payload = await request<{ term: ApprovedTerm; impact: { translated_occurrences_checked: number; segments_needing_revision: number; segments_pending_verification: number } }>(
@@ -237,6 +237,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
           method: "POST",
           body: JSON.stringify({
             target,
+            enforcement,
             sense: senses[sense.id] ?? sense.sense,
             rationale: sense.rationale || "人工依据候选证据批准",
             context_keywords: (contexts[sense.id] ?? sense.context_keywords?.join("，") ?? "").split(/[,，;；]/).map((item) => item.trim()).filter(Boolean),
@@ -246,7 +247,9 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
       );
       onApproved(payload.term);
       await load();
-      notify(`术语已批准并检查 ${payload.impact.translated_occurrences_checked} 处既有译文；${payload.impact.segments_needing_revision} 段存在规则问题，${payload.impact.segments_pending_verification} 段待语境核验。`);
+      notify(enforcement === "reference"
+        ? "已加入参考译法，翻译时可灵活采用，不要求一致。"
+        : `已设为固定译法并检查 ${payload.impact.translated_occurrences_checked} 处既有译文；${payload.impact.segments_needing_revision} 段存在规则问题，${payload.impact.segments_pending_verification} 段待语境核验。`);
     } catch (error) {
       notify(error instanceof Error ? error.message : "批准失败");
     } finally {
@@ -256,7 +259,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
 
   return <section className={styles.panel} aria-label="候选术语发现与审核">
     <div className={styles.heading}>
-      <div><span>全书概念发现</span><h2>候选术语</h2><p>扫描覆盖全文；模型只依据原文证据提出候选和译法，人工批准前不会进入翻译约束。</p><p>{provider && model ? `术语发现模型：${model} · ${computeModeLabel[computeMode] || "均衡"}` : "未配置术语发现模型，本次仅做本地扫描。"} 可在“模型配置”中单独设置。</p></div>
+      <div><span>全书概念发现</span><h2>候选术语</h2><p>扫描覆盖全文；候选由人工选择驳回、参考或固定。参考译法可灵活采用，固定译法要求统一。</p><p>{provider && model ? `术语发现模型：${model} · ${computeModeLabel[computeMode] || "均衡"}` : "未配置术语发现模型，本次仅做本地扫描。"} 可在“模型配置”中单独设置。</p></div>
       <button type="button" onClick={() => void discover()} disabled={running || (scanSaved && (!unresolvedCount || !canReview))}>{running ? (scanSaved ? "模型复核中…" : "扫描中…") : scanSaved ? (unresolvedCount ? `继续复核 ${unresolvedCount} 项` : "复核已完成") : "扫描全书并生成候选"}</button>
     </div>
     {running && <div className={styles.running}>{scanSaved ? "正在复核未完成的候选；结果逐批保存，页面会自动更新。" : "正在扫描全文并保存候选；页面会自动更新。"}</div>}
@@ -277,13 +280,17 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
       {visibleCandidates.map((candidate) => <article className={styles.card} key={candidate.id}>
         <header><div><span>{candidateTypeLabel[candidate.candidate_type] || "未分类"} · 风险 {Math.round(candidate.risk_score * 100)} · 排名 {candidate.rank}</span><h3>{candidate.canonical_form}</h3>{candidate.forms.length > 1 && <small>原文词形：{candidate.forms.join(" · ")}</small>}</div><div className={styles.frequency}><strong>{candidate.frequency}</strong><span>次 / {candidate.segment_frequency} 段</span></div></header>
         {candidate.senses.map((sense) => <div className={styles.sense} key={sense.id}>
-          <div className={[styles.senseMeta].join(" ")}><span className={[styles.status, styles[sense.status]].join(" ")}>{sense.status === "pending" ? "待审核" : sense.status === "approved" ? "已批准" : "已驳回"}</span><small>{sense.ai_recommended === false ? "模型建议略过 · 置信度 " + Math.round(sense.confidence * 100) + "%" : sense.human_reviewed ? "人工已处理" : sense.proposer.startsWith("deterministic") ? "本地统计召回 · 尚未模型复核" : "模型建议保留 · 置信度 " + Math.round(sense.confidence * 100) + "%"}</small></div>
+          <div className={[styles.senseMeta].join(" ")}><span className={[styles.status, styles[sense.status]].join(" ")}>{sense.status === "pending" ? "待审核" : sense.status === "approved" ? (sense.approved_enforcement === "reference" ? "参考" : sense.approved_enforcement === "global" ? "固定" : "按义项采用") : "已驳回"}</span><small>{sense.ai_recommended === false ? "模型建议略过 · 置信度 " + Math.round(sense.confidence * 100) + "%" : sense.human_reviewed ? "人工已处理" : sense.proposer.startsWith("deterministic") ? "本地统计召回 · 尚未模型复核" : "模型建议保留 · 置信度 " + Math.round(sense.confidence * 100) + "%"}</small></div>
           {sense.concept_definition && <p>{sense.concept_definition}</p>}
           <div className={styles.editors}><label><span>拟定译法</span><input value={targets[sense.id] ?? sense.proposed_target} onChange={(event) => setTargets((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="人工确认或修改译法" /></label><label><span>义项</span><input value={senses[sense.id] ?? sense.sense} onChange={(event) => setSenses((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="说明该概念在本书中的义项" /></label><label><span>语境关键词</span><input value={contexts[sense.id] ?? sense.context_keywords?.join("，") ?? ""} onChange={(event) => setContexts((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="逗号分隔，用于同形词消歧" /></label></div>
           {sense.rationale && <p className={styles.rationale}>{sense.rationale}</p>}
           <details><summary>查看 {candidate.evidence.length} 条原文证据</summary>{candidate.evidence.map((evidence) => <blockquote key={evidence.id}><small>第 {evidence.ordinal + 1} 段{evidence.heading_path ? ` · ${evidence.heading_path}` : ""}</small><p>{evidence.quote}</p></blockquote>)}</details>
           {sense.status === "approved" && <div className={styles.actions}><button type="button" className={styles.reject} disabled={Boolean(busySense)} onClick={() => void revoke(sense)}>{busySense === sense.id ? "正在撤回…" : "撤回批准"}</button></div>}
-          {sense.status === "pending" && <div className={styles.actions}><button type="button" className={styles.reject} disabled={Boolean(busySense)} onClick={() => void reject(sense)}>驳回</button><button type="button" className={styles.approve} disabled={Boolean(busySense) || !(targets[sense.id] ?? sense.proposed_target).trim()} onClick={() => void approve(sense)}>人工批准并回查译文</button></div>}
+          {sense.status === "pending" && <div className={styles.actions}>
+            <button type="button" className={styles.reject} disabled={Boolean(busySense)} onClick={() => void reject(sense)}>驳回</button>
+            <button type="button" className={styles.reference} title="加入参考译法，允许按上下文调整" disabled={Boolean(busySense) || !(targets[sense.id] ?? sense.proposed_target).trim()} onClick={() => void approve(sense, "reference")}>参考</button>
+            <button type="button" className={styles.approve} title="固定译法，要求所有命中用法统一采用" disabled={Boolean(busySense) || !(targets[sense.id] ?? sense.proposed_target).trim()} onClick={() => void approve(sense, "global")}>固定</button>
+          </div>}
         </div>)}
       </article>)}
     </div>

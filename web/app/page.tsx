@@ -27,6 +27,11 @@ type Term = {
   id: string; source: string; target: string; status: string; scope: string; rationale: string;
   aliases: string[]; context_keywords: string[]; sense: string; disambiguation: string; enforcement?: string;
 };
+function termEnforcement(term: Term): string {
+  if (term.enforcement && term.enforcement !== "auto") return term.enforcement;
+  return term.sense || term.disambiguation || term.context_keywords?.length ? "contextual" : "global";
+}
+
 type Issue = { id: string; segment_id: string; ordinal: number; code: string; message: string; severity: string; resolved: number };
 type HumanReviewItem = { segment_id: string; ordinal: number; reason: "error" | "warning"; issue_count: number; source_text: string; translation: string };
 type Candidate = { id: string; job_id: string; stage: string; provider: string; model: string; prompt_tokens: number; completion_tokens: number; cost_usd: number; created_at: string };
@@ -210,7 +215,8 @@ export default function Home() {
   const [termTarget, setTermTarget] = useState("");
   const [termAliases, setTermAliases] = useState("");
   const [termContext, setTermContext] = useState("");
-  const [termEnforcement, setTermEnforcement] = useState("contextual");
+  const [termMode, setTermMode] = useState("contextual");
+  const [savingTermId, setSavingTermId] = useState<string | null>(null);
   const [termSense, setTermSense] = useState("");
   const [termDisambiguation, setTermDisambiguation] = useState("");
   const [libraryError, setLibraryError] = useState("");
@@ -596,12 +602,27 @@ export default function Home() {
       const term = await api<Term>(`/projects/${overview.project.id}/terms`, { method: "POST", body: JSON.stringify({
         source: termSource, target: termTarget, status: "approved",
         aliases: splitList(termAliases), context_keywords: splitList(termContext),
-        sense: termSense, disambiguation: termDisambiguation, enforcement: termEnforcement,
+        sense: termSense, disambiguation: termDisambiguation, enforcement: termMode,
       }) });
       setTerms((items) => [...items, term].sort((a, b) => a.source.localeCompare(b.source)));
       setTermSource(""); setTermTarget(""); setTermAliases(""); setTermContext(""); setTermSense(""); setTermDisambiguation("");
-      notify("术语约束已加入当前项目，并会在翻译与校对中自动检查。");
+      notify(term.enforcement === "reference" ? "参考译法已加入当前项目，翻译时可灵活采用，不要求一致。" : "术语已加入当前项目，并会在翻译与校对中按所选方式检查。");
+      await refreshQuality();
     } catch (error) { notify(error instanceof Error ? error.message : "添加术语失败"); }
+  }
+
+  async function updateTermEnforcement(term: Term, enforcement: string) {
+    if (!overview || savingTermId) return;
+    setSavingTermId(term.id);
+    try {
+      const saved = await api<Term>(`/projects/${overview.project.id}/terms/${term.id}`, {
+        method: "PATCH", body: JSON.stringify({ enforcement }),
+      });
+      setTerms((items) => items.map((item) => item.id === saved.id ? saved : item));
+      notify(enforcement === "reference" ? "已设为参考译法，不再要求译文一致。" : "术语采用方式已更新。");
+      await refreshQuality();
+    } catch (error) { notify(error instanceof Error ? error.message : "更新术语失败"); }
+    finally { setSavingTermId(null); }
   }
 
   async function handleImported(result: { projectId: string; documentId: string; title: string }) {
@@ -907,7 +928,36 @@ export default function Home() {
               id={"reader-segment-" + segment.ordinal} data-reader-ordinal={segment.ordinal} className={"reader-block reader-" + segment.kind} key={segment.id}>{readerMode !== "translated" && <div className="reader-source"><small>原文</small>{segment.kind === "heading" ? <h2>{segment.source_text}</h2> : <p>{segment.source_text}</p>}</div>}{readerMode !== "original" && <div className={"reader-target " + (!target ? "missing" : "")}><small>{segment.status === "human_confirmed" ? "译文 · 已确认" : "译文"}</small>{segment.kind === "heading" ? <h2>{target || "本节尚未草译"}</h2> : <p>{target || "本段尚未草译"}</p>}</div>}</section>; })}</article>}
         </section>}
 
-        {panel === "terms" && overview && <section className="library-view"><div className="library-header"><div><span className="page-kicker">翻译约束</span><h1>术语库</h1><p>当前项目共有 {terms.length} 条术语约束；固定译法按词组检查；语境译法先逐处判定义项，再检查译文。</p></div></div><TermDiscoveryPanel documentId={overview.document.id} provider={settings?.term_discovery_provider || ""} model={settings?.term_discovery_model || ""} computeMode={settings?.term_discovery_compute_mode || "balanced"} onApproved={(term) => { setTerms((items) => [...items.filter((item) => item.id !== term.id), term].sort((left, right) => left.source.localeCompare(right.source))); void refreshQuality(); }} onRevoked={(termId) => { setTerms((items) => items.filter((term) => term.id !== termId)); void refreshQuality(); }} notify={notify} /><form className="term-create" onSubmit={(event) => void addTerm(event)}><label><span>规范源词</span><input value={termSource} onChange={(event) => setTermSource(event.target.value)} placeholder="例如 bank" /></label><label><span>批准译法</span><input value={termTarget} onChange={(event) => setTermTarget(event.target.value)} placeholder="例如 银行" /></label><label><span>同义词 / 变体</span><input value={termAliases} onChange={(event) => setTermAliases(event.target.value)} placeholder="逗号分隔，例如 banking institution" /></label><label><span>适用范围</span><select value={termEnforcement} onChange={(event) => setTermEnforcement(event.target.value)}><option value="contextual">按语境采用此译法</option><option value="global">所有用法均采用此译法</option></select></label><label><span>语境关键词（仅作提示）</span><input value={termContext} onChange={(event) => setTermContext(event.target.value)} placeholder="用于消歧，例如 loan, credit" /></label><label><span>义项</span><input value={termSense} onChange={(event) => setTermSense(event.target.value)} placeholder="例如 金融机构" /></label><label><span>消歧说明</span><input value={termDisambiguation} onChange={(event) => setTermDisambiguation(event.target.value)} placeholder="说明何时采用此译法" /></label><button className="primary-button" disabled={!termSource.trim() || !termTarget.trim()}>添加术语约束</button></form><div className="term-table" role="table" aria-label="术语列表"><div className="term-table-head" role="row"><span>源词与同义词</span><span>批准译法 / 义项</span><span>语境触发</span><span>状态</span></div>{terms.map((term) => <div className="term-table-row" role="row" key={term.id}><div className="term-cell"><strong>{term.source}</strong>{term.aliases?.length > 0 && <small>{term.aliases.join(" · ")}</small>}</div><div className="term-cell"><span>{term.target}</span>{term.sense && <small>{term.sense}</small>}</div><small>{term.context_keywords?.length ? term.context_keywords.join(" · ") : term.sense || term.disambiguation || term.enforcement === "contextual" ? "逐处判断语境" : "固定译法"}</small><span className={`term-status ${term.status !== "approved" ? "pending" : ""}`}>{term.status === "approved" ? (term.enforcement === "global" || (term.enforcement !== "contextual" && !term.sense && !term.disambiguation && !term.context_keywords?.length) ? "固定译法" : "按义项采用") : term.status}</span></div>)}</div>{terms.length === 0 && <div className="empty-inline">还没有术语约束。添加后，命中的源词会直接参与译文生成和质量检查。</div>}</section>}
+        {panel === "terms" && overview && <section className="library-view">
+          <div className="library-header"><div><span className="page-kicker">翻译术语</span><h1>术语库</h1><p>当前项目共有 {terms.length} 条术语。固定译法要求统一；按义项采用会先判断语境；参考译法可灵活处理，不要求一致。</p></div></div>
+          <TermDiscoveryPanel documentId={overview.document.id} provider={settings?.term_discovery_provider || ""} model={settings?.term_discovery_model || ""} computeMode={settings?.term_discovery_compute_mode || "balanced"} onApproved={(term) => { setTerms((items) => [...items.filter((item) => item.id !== term.id), term].sort((left, right) => left.source.localeCompare(right.source))); void refreshQuality(); }} onRevoked={(termId) => { setTerms((items) => items.filter((term) => term.id !== termId)); void refreshQuality(); }} notify={notify} />
+          <form className="term-create" onSubmit={(event) => void addTerm(event)}>
+            <label><span>规范源词</span><input value={termSource} onChange={(event) => setTermSource(event.target.value)} placeholder="例如 bank" /></label>
+            <label><span>译法</span><input value={termTarget} onChange={(event) => setTermTarget(event.target.value)} placeholder="例如 银行" /></label>
+            <label><span>同义词 / 变体</span><input value={termAliases} onChange={(event) => setTermAliases(event.target.value)} placeholder="逗号分隔，例如 banking institution" /></label>
+            <label><span>采用方式</span><select value={termMode} onChange={(event) => setTermMode(event.target.value)}><option value="reference">参考译法（不要求一致）</option><option value="contextual">按义项采用此译法</option><option value="global">所有用法均采用此译法</option></select></label>
+            <label><span>语境关键词（仅作提示）</span><input value={termContext} onChange={(event) => setTermContext(event.target.value)} placeholder="用于消歧，例如 loan, credit" /></label>
+            <label><span>义项</span><input value={termSense} onChange={(event) => setTermSense(event.target.value)} placeholder="例如 金融机构" /></label>
+            <label><span>消歧说明</span><input value={termDisambiguation} onChange={(event) => setTermDisambiguation(event.target.value)} placeholder="说明何时采用此译法" /></label>
+            <button className="primary-button" disabled={!termSource.trim() || !termTarget.trim()}>添加术语</button>
+          </form>
+          <div className="term-table" role="table" aria-label="术语列表">
+            <div className="term-table-head" role="row"><span>源词与同义词</span><span>译法 / 义项</span><span>语境提示</span><span>采用方式</span></div>
+            {terms.map((term) => <div className="term-table-row" role="row" key={term.id}>
+              <div className="term-cell"><strong>{term.source}</strong>{term.aliases?.length > 0 && <small>{term.aliases.join(" · ")}</small>}</div>
+              <div className="term-cell"><span>{term.target}</span>{term.sense && <small>{term.sense}</small>}</div>
+              <small className="term-context">{term.context_keywords?.length ? term.context_keywords.join(" · ") : termEnforcement(term) === "reference" ? "可按上下文灵活处理" : termEnforcement(term) === "contextual" ? "逐处判断语境" : "固定译法"}</small>
+              <div className="term-policy">
+                <select className={termEnforcement(term) === "reference" ? "reference" : ""} aria-label={`${term.source}的采用方式`} value={termEnforcement(term)} disabled={savingTermId !== null} onChange={(event) => void updateTermEnforcement(term, event.target.value)}>
+                  <option value="reference">参考译法</option><option value="contextual">按义项采用</option><option value="global">固定译法</option>
+                </select>
+                {savingTermId === term.id && <span role="status">保存中…</span>}
+                {term.status !== "approved" && <span className="term-status pending">{term.status}</span>}
+              </div>
+            </div>)}
+          </div>
+          {terms.length === 0 && <div className="empty-inline">还没有术语。添加时可选择参考译法、按义项采用或固定译法。</div>}
+        </section>}
 
         {panel === "quality" && overview && <section className="library-view quality-view">
           <div className="library-header"><div><span className="page-kicker">人工把关</span><h1>审校</h1><p>{humanReviewQueue.length ? `${humanReviewQueue.length} 段带有未解决的检查问题，需要逐段人工确认。` : pendingTermSegments ? "尚有术语用法待机器核验；核验完成后如仍有问题会在此列出。" : "自动检查未发现遗留问题；可在下方核验术语语境，或从工作台逐段终审。"}</p></div><div className="large-score"><span>{humanReviewQueue.length}</span><small>问题必检</small></div></div>
@@ -920,7 +970,7 @@ export default function Home() {
         {panel === "import" && <ImportBookPanel onImported={(result) => void handleImported(result)} />}
         {panel === "settings" && <ProviderSettingsPanel onSaved={(value) => { setSettings(value); notify("模型配置已更新。"); }} />}
 
-        <aside className="inspector"><div className="inspector-heading"><strong>检查器</strong><button aria-label="关闭检查器" onClick={() => setInspectorOpen(false)}>×</button></div><div className="inspector-scroll"><div className="quality-card"><div className={`segment-state-mark ${currentStatus}`}><Mark>{currentStatus === "human_confirmed" ? "✓" : currentStatus === "machine_translated" ? "AI" : "—"}</Mark></div><div><strong>{statusLabel(currentSegment)}</strong><small>{currentErrorIssues.length ? `${currentErrorIssues.length} 项确定问题` : currentWarningIssues.length ? `${currentWarningIssues.length} 项建议复核` : currentIssues.some((item) => item.severity === "info") ? "本段术语待机器核验" : "本段没有已报告的问题"}</small></div></div>{currentIssues.length > 0 && <div className="inspector-section"><div className="eyebrow">问题</div>{currentIssues.map((issue) => <div className="issue-chip" key={issue.id}><i>{issue.severity === "error" ? "!" : issue.severity === "info" ? "待" : "?"}</i><span>{issue.message}</span></div>)}</div>}<div className="inspector-section"><div className="eyebrow">本段术语 <button onClick={() => setPanel("terms")}>查看全部</button></div>{relevantTerms.length ? relevantTerms.map((term) => <div className="term-row" key={term.id}><span>{term.source}</span><strong>{term.target}</strong></div>) : <p className="inspector-empty">未命中已批准术语</p>}</div><div className="inspector-section"><div className="eyebrow">生成信息</div>{candidates.length ? <dl><div><dt>模型</dt><dd>{candidates.at(-1)?.model}</dd></div><div><dt>{generationUsage?.task ? "本段任务输入 / 输出" : "输入 / 输出"}</dt><dd>{generationUsage ? `${generationUsage.prompt} / ${generationUsage.completion}` : "用量见任务记录"}</dd></div>{generationUsage && <div><dt>{generationUsage.task ? "本段任务费用" : "费用"}</dt><dd>${generationUsage.cost.toFixed(6)}</dd></div>}</dl> : <p className="inspector-empty">本段还没有模型候选</p>}</div></div></aside>
+        <aside className="inspector"><div className="inspector-heading"><strong>检查器</strong><button aria-label="关闭检查器" onClick={() => setInspectorOpen(false)}>×</button></div><div className="inspector-scroll"><div className="quality-card"><div className={`segment-state-mark ${currentStatus}`}><Mark>{currentStatus === "human_confirmed" ? "✓" : currentStatus === "machine_translated" ? "AI" : "—"}</Mark></div><div><strong>{statusLabel(currentSegment)}</strong><small>{currentErrorIssues.length ? `${currentErrorIssues.length} 项确定问题` : currentWarningIssues.length ? `${currentWarningIssues.length} 项建议复核` : currentIssues.some((item) => item.severity === "info") ? "本段术语待机器核验" : "本段没有已报告的问题"}</small></div></div>{currentIssues.length > 0 && <div className="inspector-section"><div className="eyebrow">问题</div>{currentIssues.map((issue) => <div className="issue-chip" key={issue.id}><i>{issue.severity === "error" ? "!" : issue.severity === "info" ? "待" : "?"}</i><span>{issue.message}</span></div>)}</div>}<div className="inspector-section"><div className="eyebrow">本段术语 <button onClick={() => setPanel("terms")}>查看全部</button></div>{relevantTerms.length ? relevantTerms.map((term) => <div className="term-row" key={term.id}><span>{term.source}{term.enforcement === "reference" && <small className="term-reference-label">参考</small>}</span><strong>{term.target}</strong></div>) : <p className="inspector-empty">未命中已批准术语</p>}</div><div className="inspector-section"><div className="eyebrow">生成信息</div>{candidates.length ? <dl><div><dt>模型</dt><dd>{candidates.at(-1)?.model}</dd></div><div><dt>{generationUsage?.task ? "本段任务输入 / 输出" : "输入 / 输出"}</dt><dd>{generationUsage ? `${generationUsage.prompt} / ${generationUsage.completion}` : "用量见任务记录"}</dd></div>{generationUsage && <div><dt>{generationUsage.task ? "本段任务费用" : "费用"}</dt><dd>${generationUsage.cost.toFixed(6)}</dd></div>}</dl> : <p className="inspector-empty">本段还没有模型候选</p>}</div></div></aside>
       </div>
     </section>
 

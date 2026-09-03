@@ -63,6 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     term.add_argument("--source", required=True)
     term.add_argument("--target", required=True)
     term.add_argument("--status", choices=[item.value for item in TermStatus], default="approved")
+    term.add_argument(
+        "--enforcement", choices=["auto", "global", "contextual", "reference"], default="auto",
+        help="reference provides optional translation guidance without consistency checks",
+    )
     term.add_argument("--rationale", default="")
     term.add_argument("--forbid", action="append", default=[])
     term.add_argument("--alias", action="append", default=[])
@@ -156,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
                 source=args.source,
                 target=args.target,
                 status=TermStatus(args.status),
+                enforcement=args.enforcement,
                 rationale=args.rationale,
                 forbidden_targets=tuple(args.forbid),
                 aliases=tuple(args.alias),
