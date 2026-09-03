@@ -190,16 +190,19 @@ class EmptyProviderResponseError(RuntimeError):
         last = self.attempts[-1]
         if self.kind == "content_filtered":
             detail = "上游模型拒绝或过滤了该内容"
+            guidance = "请更换模型或人工处理该段。"
         elif self.kind == "output_budget_exhausted":
             detail = "模型的推理/输出预算用尽，仍未产生可见译文"
+            guidance = "请增加输出额度、降低推理强度或重试该段。"
         else:
-            detail = "上游返回了零 token 空响应，可能是内容策略或服务异常"
+            detail = "上游返回了零 token 空响应，未提供明确原因"
+            guidance = "请稍后重试该段或检查模型服务。"
         finish = f"，finish_reason={last.finish_reason}" if last.finish_reason else ""
         return (
             f"{detail}：{location}；模型 {self.model}，"
             f"completion_tokens={last.completion_tokens}，"
             f"reasoning_tokens={last.reasoning_tokens}{finish}。"
-            "已保留诊断记录；请改用允许该类内容的模型，或人工处理该段。"
+            f"已保留诊断记录；{guidance}"
         )
 
     def usage_result(self) -> TranslationResult:

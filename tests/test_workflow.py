@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from test_epub import build_epub
 
@@ -282,6 +283,21 @@ class ZeroTokenEmptyProvider:
                 }
             ),
         )
+
+
+class SelectiveEmptyProvider(ZeroTokenEmptyProvider):
+    """Return empty results for one segment, while its siblings succeed."""
+
+    def __init__(self):
+        super().__init__()
+        self.sources: list[str] = []
+
+    async def complete(self, messages, model, **kwargs):
+        source = _sources_from_messages(messages)[0]
+        self.sources.append(source)
+        if "changed in 2020" in source:
+            return await super().complete(messages, model, **kwargs)
+        return TranslationResult(text=f"translated:{source}", prompt_tokens=10, completion_tokens=5)
 
 
 class SelectiveContentFilterProvider:
@@ -758,13 +774,16 @@ class WorkflowTests(unittest.TestCase):
             concurrency=1,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "零 token 空响应"):
-            asyncio.run(engine.run_optimized(job.id))
+        completed = asyncio.run(engine.run_optimized(job.id))
 
         self.assertEqual(provider.max_tokens, [512, 512])
-        failed = self.store.get_job(job.id)
-        self.assertEqual(failed.status, JobStatus.FAILED)
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        self.assertEqual(completed.next_ordinal, 1)
+        self.assertIsNone(completed.last_error)
         segment = self.store.list_segments(document.id)[0]
+        self.assertIsNone(segment.machine_translation)
+        self.assertEqual(self.store.list_candidates(segment.id), [])
+        self.assertEqual(self.store.job_progress(job.id)["deferred_segments"], 1)
         failures = [
             event
             for event in self.store.list_audit_events("segment", segment.id)
@@ -772,6 +791,88 @@ class WorkflowTests(unittest.TestCase):
         ]
         self.assertEqual(failures[-1]["payload"]["kind"], "upstream_empty_response")
         self.assertEqual(len(failures[-1]["payload"]["attempts"]), 2)
+        self.assertIs(failures[-1]["payload"]["deferred"], True)
+        self.assertNotIn("内容策略", failures[-1]["payload"]["message"])
+        issue = self.store.list_issues(document.id)[0]
+        self.assertEqual(issue["code"], "translation_deferred")
+        self.assertEqual(issue["severity"], "error")
+        self.assertIn("重试", issue["message"])
+
+    def test_empty_segment_preserves_siblings_and_resume_checkpoint(self):
+        provider = SelectiveEmptyProvider()
+        registry = ProviderRegistry()
+        registry.register("empty", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store, document_id=self.document.id,
+            draft_provider="empty", draft_model="test", batch_size=2, concurrency=3,
+        )
+
+        paused = asyncio.run(engine.run_optimized(job.id, max_batches=1))
+        self.assertEqual(paused.status, JobStatus.PAUSED)
+        self.assertEqual(paused.next_ordinal, 2)
+        segments = self.store.list_segments(self.document.id)
+        self.assertEqual(segments[0].machine_translation, "translated:Agency matters.")
+        self.assertIsNone(segments[1].machine_translation)
+        self.assertIsNone(segments[2].machine_translation)
+        self.assertEqual(len(provider.max_tokens), 2)
+
+        completed = asyncio.run(engine.run_optimized(job.id))
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        self.assertEqual(completed.next_ordinal, 3)
+        self.assertEqual(len(provider.max_tokens), 2)
+        self.assertEqual(provider.sources.count("Agency matters."), 1)
+        self.assertEqual(
+            self.store.get_segment(segments[2].id).machine_translation,
+            "translated:The conclusion follows.",
+        )
+        progress = self.store.job_progress(job.id)
+        self.assertEqual(progress["deferred_segments"], 1)
+        self.assertEqual(progress["total_tokens"], 30)
+        self.assertEqual(progress["processed_segments"], 3)
+
+    def test_transient_empty_response_succeeds_without_deferral(self):
+        provider = ZeroTokenEmptyProvider()
+        provider.complete = AsyncMock(side_effect=[
+            TranslationResult(text="", prompt_tokens=7),
+            TranslationResult(text="translated:Agency matters.", prompt_tokens=10, completion_tokens=5),
+        ])
+        registry = ProviderRegistry()
+        registry.register("empty", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store, document_id=self.document.id,
+            draft_provider="empty", draft_model="test", segment_ranges=[(0, 0)],
+        )
+        completed = asyncio.run(engine.run_optimized(job.id))
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        calls = provider.complete.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].kwargs["max_tokens"], calls[1].kwargs["max_tokens"])
+        progress = self.store.job_progress(job.id)
+        self.assertEqual(progress["deferred_segments"], 0)
+        self.assertEqual(progress["total_tokens"], 22)
+        self.assertEqual(
+            self.store.list_segments(self.document.id)[0].machine_translation,
+            "translated:Agency matters.",
+        )
+
+    def test_optimized_transport_failure_still_stops_for_retry(self):
+        provider = ZeroTokenEmptyProvider()
+        provider.complete = AsyncMock(side_effect=RuntimeError("HTTP 401: invalid API key"))
+        registry = ProviderRegistry()
+        registry.register("broken", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store, document_id=self.document.id,
+            draft_provider="broken", draft_model="test", concurrency=1, max_concurrency=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+            asyncio.run(engine.run_optimized(job.id))
+        failed = self.store.get_job(job.id)
+        self.assertEqual(failed.status, JobStatus.FAILED)
+        self.assertEqual(failed.next_ordinal, 0)
+        self.assertEqual(self.store.job_progress(job.id)["deferred_segments"], 0)
 
     def test_content_filter_is_deferred_without_discarding_batch_siblings(self):
         provider = SelectiveContentFilterProvider()

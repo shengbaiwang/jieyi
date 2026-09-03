@@ -440,15 +440,14 @@ async def _translate_group(
 
 
 def _can_defer_segment_failure(error: BaseException) -> bool:
-    """Only quarantine failures known to be local to one segment."""
+    """Quarantine exhausted segment responses; transport/configuration errors still stop."""
     if is_content_filtered_error(error):
         return True
     if isinstance(error, PlaceholderIntegrityError):
         return True
-    return (
-        isinstance(error, EmptyProviderResponseError)
-        and error.kind != "upstream_empty_response"
-    )
+    # Empty responses have already exhausted their bounded retries in _complete_one.
+    # Preserve their diagnostics and continue, just as for other unusable responses.
+    return isinstance(error, EmptyProviderResponseError)
 
 
 def _record_deferred_segment(
@@ -501,7 +500,10 @@ def _record_deferred_segment(
     elif is_content_filtered_error(error):
         failure_message = "模型拒绝生成本段译文。本段尚未保存，可更换模型或人工翻译。"
     elif isinstance(error, EmptyProviderResponseError):
-        failure_message = "模型未返回可用译文。本段尚未保存，请检查输出额度或重试草译。"
+        if error.kind == "upstream_empty_response":
+            failure_message = "上游返回空响应，重试后仍无译文。本段已隔离待复核，可稍后重试草译或检查模型服务。"
+        else:
+            failure_message = "模型未返回可用译文。本段尚未保存，请检查输出额度或重试草译。"
     else:
         failure_message = "本段译文未通过验收，尚未保存。请重试草译或查看失败记录。"
     issues.append(
