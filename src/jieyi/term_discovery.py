@@ -4,8 +4,8 @@ import json
 import math
 import re
 import unicodedata
-from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections import Counter, defaultdict, deque
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from typing import Any
@@ -164,7 +164,7 @@ class DiscoveryConfig:
     max_candidates: int = 40
     max_evidence_per_candidate: int = 6
     max_model_candidates: int = 40
-    model_batch_size: int = 8
+    model_batch_size: int = 4
     min_score: float = 0.34
 
 
@@ -524,6 +524,33 @@ def _analysis_messages(
     ]
 
 
+def needs_model_review(candidate: dict[str, Any]) -> bool:
+    """Human edits and any accepted model decision are final for automatic retries."""
+    senses = candidate["senses"]
+    return bool(senses) and all(
+        sense.get("ai_recommended") is None
+        and sense.get("status") == "pending"
+        and not sense.get("human_reviewed")
+        and str(sense.get("proposer", "")).startswith("deterministic")
+        for sense in senses
+    )
+
+
+def model_review_counts(candidates: list[dict[str, Any]], limit: int) -> dict[str, int]:
+    ranked = candidates[:limit]
+    kept = sum(any(s.get("ai_recommended") is True for s in c["senses"]) for c in ranked)
+    omitted = sum(
+        bool(c["senses"]) and all(s.get("ai_recommended") is False for s in c["senses"])
+        for c in ranked
+    )
+    return {
+        "model_decisions": kept + omitted,
+        "model_kept": kept,
+        "model_omitted": omitted,
+        "missing_decisions": sum(needs_model_review(c) for c in ranked),
+    }
+
+
 async def enrich_candidates(
     candidates: list[dict[str, Any]],
     *,
@@ -533,105 +560,130 @@ async def enrich_candidates(
     target_lang: str,
     config: DiscoveryConfig,
     compute_mode: str = "balanced",
-) -> tuple[list[dict[str, Any]], dict[str, float | int]]:
-    """Assess every bounded card, retry omissions once, and retain an auditable decision."""
+    checkpoint: Callable[[list[dict[str, Any]], dict[str, Any]], None] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Checkpoint each response; shrink incomplete batches with a bounded retry budget."""
     by_id = {candidate["id"]: candidate for candidate in candidates}
-    usage: dict[str, float | int] = {
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "reasoning_tokens": 0,
-        "cost_usd": 0.0,
-        "model_calls": 0,
-        "invalid_proposals": 0,
-        "model_decisions": 0,
-        "missing_decisions": 0,
-        "model_kept": 0,
-        "model_omitted": 0,
+    usage: dict[str, Any] = {
+        "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
+        "cost_usd": 0.0, "model_calls": 0, "invalid_proposals": 0,
+        "diagnostics": [], "model_error": "",
+        **model_review_counts(candidates, config.max_model_candidates),
     }
-    ranked = candidates[: config.max_model_candidates]
-    for start in range(0, len(ranked), config.model_batch_size):
-        batch = ranked[start : start + config.model_batch_size]
-        unresolved = list(batch)
-        decided_ids: set[str] = set()
-        for _attempt in range(2):
-            if not unresolved:
-                break
+    pending = [c for c in candidates[:config.max_model_candidates] if needs_model_review(c)]
+    batch_size = min(config.model_batch_size, 4)
+    queue = deque((pending[i:i + batch_size], 0) for i in range(0, len(pending), batch_size))
+
+    def save() -> None:
+        usage.update(model_review_counts(candidates, config.max_model_candidates))
+        if checkpoint:
+            checkpoint(candidates, usage)
+        usage.update(model_review_counts(candidates, config.max_model_candidates))
+
+    while queue:
+        queued, attempt = queue.popleft()
+        batch = [c for c in queued if needs_model_review(c)]
+        if not batch:
+            continue
+        max_tokens = 4_000 if attempt == 0 else 8_000
+        usage["model_calls"] += 1
+        try:
             result: TranslationResult = await provider.complete(
-                _analysis_messages(unresolved, source_lang, target_lang),
-                model,
-                compute_mode=compute_mode,
-                max_tokens=4_000,
+                _analysis_messages(batch, source_lang, target_lang), model,
+                compute_mode=compute_mode, max_tokens=max_tokens,
             )
-            usage["prompt_tokens"] += result.prompt_tokens
-            usage["completion_tokens"] += result.completion_tokens
-            usage["reasoning_tokens"] += result.reasoning_tokens
-            usage["cost_usd"] += result.cost_usd
-            usage["model_calls"] += 1
-            payload = _extract_json(result.text)
-            proposals = payload.get("proposals", [])
-            if not isinstance(proposals, list):
+        except Exception as exc:  # noqa: BLE001 — third-party adapter boundary
+            usage["model_error"] = str(exc)[:1_000]
+            usage["diagnostics"].append({
+                "kind": "provider_error", "candidate_ids": [c["id"] for c in batch],
+                "attempt": attempt + 1,
+            })
+            save()
+            break
+        for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cost_usd"):
+            usage[key] += getattr(result, key)
+        payload = _extract_json(result.text)
+        proposals = payload.get("proposals")
+        invalid_before = usage["invalid_proposals"]
+        if not isinstance(proposals, list):
+            usage["invalid_proposals"] += 1
+            proposals = []
+        unresolved_by_id = {candidate["id"]: candidate for candidate in batch}
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
                 usage["invalid_proposals"] += 1
                 continue
-            unresolved_by_id = {candidate["id"]: candidate for candidate in unresolved}
-            grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for proposal in proposals:
-                if not isinstance(proposal, dict):
-                    usage["invalid_proposals"] += 1
-                    continue
-                candidate = unresolved_by_id.get(str(proposal.get("candidate_id", "")))
-                if candidate is None:
-                    usage["invalid_proposals"] += 1
-                    continue
-                valid_evidence = {item["id"] for item in candidate["evidence"]}
-                proposed_evidence = proposal.get("evidence_ids", [])
-                if not isinstance(proposed_evidence, list):
-                    proposed_evidence = []
-                evidence_ids = [
-                    value
-                    for value in proposed_evidence
-                    if isinstance(value, str) and value in valid_evidence
-                ]
-                if not evidence_ids:
-                    usage["invalid_proposals"] += 1
-                    continue
-                keep = bool(proposal.get("keep", False))
-                try:
-                    confidence = float(proposal.get("confidence") or 0.0)
-                except (TypeError, ValueError):
-                    confidence = 0.0
-                grouped[candidate["id"]].append(
-                    {
-                        "id": new_id("sense"),
-                        "sense_key": str(proposal.get("sense_key") or "default").strip()[:120],
-                        "sense": str(proposal.get("sense", "")).strip()[:500],
-                        "concept_definition": str(proposal.get("concept_definition", "")).strip()[
-                            :1_000
-                        ],
-                        "proposed_target": (
-                            str(proposal.get("target", "")).strip()[:300] if keep else ""
-                        ),
-                        "rationale": str(proposal.get("rationale", "")).strip()[:1_000],
-                        "disambiguation": str(proposal.get("disambiguation", "")).strip()[:1_000],
-                        "confidence": max(0.0, min(1.0, confidence)),
-                        "ai_recommended": keep,
-                        "evidence_ids": evidence_ids,
-                        "proposer": f"{model.provider}:{model.model}",
-                        "status": "pending",
-                    }
-                )
-            for candidate_id, senses in grouped.items():
-                by_id[candidate_id]["senses"] = senses
-                decided_ids.add(candidate_id)
-            unresolved = [candidate for candidate in batch if candidate["id"] not in decided_ids]
-        usage["model_decisions"] += len(decided_ids)
-        usage["missing_decisions"] += len(unresolved)
+            candidate = unresolved_by_id.get(str(proposal.get("candidate_id", "")))
+            if candidate is None:
+                usage["invalid_proposals"] += 1
+                continue
+            valid_evidence = {item["id"] for item in candidate["evidence"]}
+            proposed_evidence = proposal.get("evidence_ids", [])
+            if not isinstance(proposed_evidence, list):
+                proposed_evidence = []
+            evidence_ids = [
+                value
+                for value in proposed_evidence
+                if isinstance(value, str) and value in valid_evidence
+            ]
+            if not evidence_ids:
+                usage["invalid_proposals"] += 1
+                continue
+            keep = proposal.get("keep")
+            if not isinstance(keep, bool) or (
+                keep and not str(proposal.get("target") or "").strip()
+            ):
+                usage["invalid_proposals"] += 1
+                continue
+            try:
+                confidence = float(proposal.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            grouped[candidate["id"]].append(
+                {
+                    "id": new_id("sense"),
+                    "sense_key": str(proposal.get("sense_key") or "default").strip()[:120],
+                    "sense": str(proposal.get("sense", "")).strip()[:500],
+                    "concept_definition": str(proposal.get("concept_definition", "")).strip()[
+                        :1_000
+                    ],
+                    "proposed_target": (
+                        str(proposal.get("target", "")).strip()[:300] if keep else ""
+                    ),
+                    "rationale": str(proposal.get("rationale", "")).strip()[:1_000],
+                    "disambiguation": str(proposal.get("disambiguation", "")).strip()[:1_000],
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "ai_recommended": keep,
+                    "evidence_ids": evidence_ids,
+                    "proposer": f"{model.provider}:{model.model}",
+                    "status": "pending",
+                }
+            )
+        for candidate_id, senses in grouped.items():
+            by_id[candidate_id]["senses"] = senses
 
-    for candidate in ranked:
-        recommendations = [sense.get("ai_recommended") for sense in candidate["senses"]]
-        if any(value is True for value in recommendations):
-            usage["model_kept"] += 1
-        elif recommendations and all(value is False for value in recommendations):
-            usage["model_omitted"] += 1
+        unresolved = [c for c in batch if needs_model_review(c)]
+        if unresolved:
+            # Store a small diagnostic envelope, never the book or full response.
+            from jieyi.workflow.provider_responses import inspect_empty_result
+
+            envelope = inspect_empty_result(result, attempt=attempt + 1, max_tokens=max_tokens)
+            usage["diagnostics"].append({
+                "kind": "invalid_json" if not payload else "missing_or_invalid_decisions",
+                "candidate_ids": [c["id"] for c in unresolved],
+                "attempt": attempt + 1, "max_tokens": max_tokens,
+                "finish_reason": envelope.finish_reason,
+                "invalid_proposals": usage["invalid_proposals"] - invalid_before,
+            })
+        save()
+        unresolved = [c for c in batch if needs_model_review(c)]
+        if unresolved and attempt < 3:
+            smaller = max(1, len(batch) // 2)
+            queue.extendleft(reversed([
+                (unresolved[i:i + smaller], attempt + 1)
+                for i in range(0, len(unresolved), smaller)
+            ]))
     return candidates, usage
 
 

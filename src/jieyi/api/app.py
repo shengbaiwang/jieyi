@@ -237,6 +237,10 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         yield
         await manager.shutdown()
         await terminology_manager.shutdown()
+        discovery_tasks = list(getattr(_app.state, "term_discovery_tasks", ()))
+        for task in discovery_tasks:
+            task.cancel()
+        await asyncio.gather(*discovery_tasks, return_exceptions=True)
 
     app = FastAPI(title="介译 API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
