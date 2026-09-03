@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from jieyi.api.app import create_app
 from jieyi.ingestion import extract_epub
-from jieyi.ingestion.epub_reader import render_spine
+from jieyi.ingestion.epub_reader import export_translated_epub, render_content_path, render_spine
 from jieyi.ingestion.epub_roundtrip import parse_epub_archive
 from jieyi.persistence import SQLiteStore
 from jieyi.providers import EchoProvider, ProviderRegistry
@@ -23,7 +23,9 @@ from jieyi.workflow import (
 )
 
 
-def build_roundtrip_epub(*, version: str = "3.0", fixed_layout: bool = True) -> bytes:
+def build_roundtrip_epub(
+    *, version: str = "3.0", fixed_layout: bool = True, doctype: bytes = b""
+) -> bytes:
     container = b"""<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
   <rootfiles><rootfile full-path="EPUB/package.opf"
@@ -53,7 +55,7 @@ def build_roundtrip_epub(*, version: str = "3.0", fixed_layout: bool = True) -> 
   </manifest>
   <spine><itemref idref="chapter"/></spine>
 </package>""".encode()
-    chapter = b"""<html xmlns="http://www.w3.org/1999/xhtml">
+    chapter = doctype + b"""<html xmlns="http://www.w3.org/1999/xhtml">
 <head>
   <base href="https://evil.example/"/>
   <link rel="stylesheet" href="../Styles/book.css"/>
@@ -76,7 +78,7 @@ h1{color:#735;} @import url('nested.css'); @import url('https://evil.example/imp
     svg = b"""<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160"
  onload="steal()"><script>alert(1)</script><rect width="120" height="160" fill="#735"/>
  <image href="https://evil.example/pixel.png"/></svg>"""
-    nav = b"""<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    nav = doctype + b"""<html xmlns="http://www.w3.org/1999/xhtml"><body>
 <nav id="toc"><ol><li><a href="Text/chapter.xhtml">Chapter</a></li></ol></nav>
 </body></html>"""
 
@@ -133,6 +135,30 @@ class EpubRoundTripTests(unittest.TestCase):
         self.assertTrue(
             all("::" in item["node_id"] for item in mappings["text_nodes"])
         )
+
+    def test_plain_doctype_survives_import_reading_and_export(self):
+        payload = build_roundtrip_epub(doctype=b"<!DOCTYPE html>", fixed_layout=False)
+        document = create_epub_document(
+            self.store, project_id=self.project.id, file_data=payload,
+        )
+        self.assertEqual(self.store.get_original_epub(document.id), payload)
+        for mode in ("original", "translated", "bilingual"):
+            with self.subTest(mode=mode):
+                rendered, _ = render_spine(
+                    self.store, document.id, 0, mode=mode, layout="comfort"
+                )
+                self.assertEqual(ET.fromstring(rendered).tag, "{http://www.w3.org/1999/xhtml}html")
+        nav, _ = render_content_path(self.store, document.id, "EPUB/nav.xhtml")
+        self.assertIn("Chapter", "".join(ET.fromstring(nav).itertext()))
+        for bilingual in (False, True):
+            with self.subTest(bilingual=bilingual):
+                exported = export_translated_epub(self.store, document.id, bilingual=bilingual)
+                book = extract_epub(exported)
+                self.assertEqual(book.title, "Round Trip Book")
+                self.assertEqual([item.label for item in book.navigation], ["Chapter"])
+                with zipfile.ZipFile(io.BytesIO(exported)) as archive:
+                    ET.fromstring(archive.read("EPUB/Text/chapter.xhtml"))
+                    self.assertEqual(archive.read("EPUB/Fonts/book.woff2"), b"fake-font-data")
 
     def test_reflowable_reader_exposes_segment_locations_to_parent(self):
         document = create_epub_document(

@@ -330,7 +330,7 @@ class ApiTests(unittest.TestCase):
         ).json()
         response = self.client.post(
             f"/projects/{project['id']}/documents/epub",
-            content=build_epub(),
+            content=build_epub(doctype=b"<!DOCTYPE html>"),
             headers={"Content-Type": "application/epub+zip"},
         )
         self.assertEqual(response.status_code, 201)
@@ -343,7 +343,7 @@ class ApiTests(unittest.TestCase):
     def test_epub_can_be_inspected_before_import(self):
         response = self.client.post(
             "/imports/epub/inspect",
-            content=build_epub(),
+            content=build_epub(doctype=b"<!DOCTYPE html>"),
             headers={"Content-Type": "application/epub+zip"},
         )
         self.assertEqual(response.status_code, 200)
@@ -352,6 +352,28 @@ class ApiTests(unittest.TestCase):
         self.assertGreater(inspection["block_count"], 0)
         self.assertGreater(inspection["chapter_count"], 0)
         self.assertEqual(inspection["preview"][0]["text"], "Second Chapter")
+
+    def test_epub_inspection_and_import_reject_external_entity_declarations(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "EPUB safety", "source_lang": "en", "target_lang": "zh-CN"},
+        ).json()
+        payload = build_epub(
+            doctype=b'<!DOCTYPE html [<!ENTITY xxe SYSTEM "file:///unused.txt">]>'
+        )
+        for endpoint in (
+            "/imports/epub/inspect", f"/projects/{project['id']}/documents/epub"
+        ):
+            with self.subTest(endpoint=endpoint):
+                response = self.client.post(
+                    endpoint, content=payload,
+                    headers={"Content-Type": "application/epub+zip"},
+                )
+                self.assertEqual(response.status_code, 422)
+                self.assertIn("DTD or entity", response.json()["detail"])
+        self.assertEqual(
+            self.client.get(f"/projects/{project['id']}/documents").json(), []
+        )
 
     def test_same_source_can_define_multiple_contextual_senses(self):
         project = self.client.post(

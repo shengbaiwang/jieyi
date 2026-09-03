@@ -14,7 +14,7 @@ from jieyi.persistence import SQLiteStore
 from jieyi.workflow import create_project
 
 
-def build_epub(*, malicious_member: bool = False, xhtml_doctype: bool = False) -> bytes:
+def build_epub(*, malicious_member: bool = False, doctype: bytes = b"") -> bytes:
     container = b"""<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
   <rootfiles><rootfile full-path="OPS/content.opf"
@@ -37,18 +37,17 @@ def build_epub(*, malicious_member: bool = False, xhtml_doctype: bool = False) -
     <itemref idref="chapter-one"/>
   </spine>
 </package>"""
-    prefix = b'<!DOCTYPE html [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>' if xhtml_doctype else b""
-    chapter_two = prefix + b"""<html xmlns="http://www.w3.org/1999/xhtml"
+    chapter_two = doctype + b"""<html xmlns="http://www.w3.org/1999/xhtml"
  xmlns:epub="http://www.idpf.org/2007/ops"><body>
   <h1><a id="second"/>Second Chapter</h1>
   <p>Agency <em>matters</em>.&nbsp;Still.</p>
   <blockquote><p>A cited passage.</p></blockquote>
   <aside epub:type="footnote"><p>Footnote text.</p></aside>
 </body></html>"""
-    chapter_one = b"""<html xmlns="http://www.w3.org/1999/xhtml"><body>
+    chapter_one = doctype + b"""<html xmlns="http://www.w3.org/1999/xhtml"><body>
   <h1><a id="first"/>First Chapter</h1><p>Structure follows.</p>
 </body></html>"""
-    nav = b"""<html xmlns="http://www.w3.org/1999/xhtml"
+    nav = doctype + b"""<html xmlns="http://www.w3.org/1999/xhtml"
  xmlns:epub="http://www.idpf.org/2007/ops"><body>
 <nav epub:type="toc"><ol>
 <li><a href="two.xhtml#second">Second from TOC</a></li>
@@ -109,7 +108,14 @@ class EpubTests(unittest.TestCase):
 
     def test_rejects_dtd_and_entity_declarations(self):
         with self.assertRaisesRegex(EpubIngestionError, "DTD or entity"):
-            extract_epub(build_epub(xhtml_doctype=True))
+            extract_epub(build_epub(
+                doctype=b'<!DOCTYPE html [<!ENTITY xxe SYSTEM "file:///unused.txt">]>'
+            ))
+
+    def test_plain_html_doctype_preserves_content_and_navigation(self):
+        expected = extract_epub(build_epub())
+        actual = extract_epub(build_epub(doctype=b"<!DOCTYPE html>"))
+        self.assertEqual(actual, expected)
 
     def test_cli_imports_epub_without_manual_format_flag(self):
         with tempfile.TemporaryDirectory() as directory:

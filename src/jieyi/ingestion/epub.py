@@ -5,7 +5,6 @@ import posixpath
 import re
 import zipfile
 from dataclasses import dataclass
-from html.entities import html5
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree as ET
@@ -23,6 +22,7 @@ from jieyi.ingestion.epub_structure import (
     extract_source_atoms,
     reflow_atoms,
 )
+from jieyi.ingestion.epub_xml import parse_xml_resource
 from jieyi.ingestion.plaintext import ParsedBlock
 
 _MAX_ENTRIES = 10_000
@@ -30,7 +30,6 @@ _MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024
 _MAX_SINGLE_ENTRY = 64 * 1024 * 1024
 _MAX_COMPRESSION_RATIO = 1_000
 _SPACE = re.compile(r"\s+")
-_NAMED_ENTITY = re.compile(rb"&([A-Za-z][A-Za-z0-9]+);")
 
 
 class EpubIngestionError(ValueError):
@@ -88,22 +87,10 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
 
 
 def _parse_xml(data: bytes, label: str) -> ET.Element:
-    upper = data.upper()
-    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
-        raise EpubIngestionError(f"DTD or entity declarations are not allowed in {label}")
-
-    def replace_html_entity(match: re.Match[bytes]) -> bytes:
-        name = match.group(1).decode("ascii")
-        if name in {"amp", "apos", "gt", "lt", "quot"}:
-            return match.group(0)
-        value = html5.get(f"{name};")
-        return value.encode("utf-8") if value is not None else match.group(0)
-
-    data = _NAMED_ENTITY.sub(replace_html_entity, data)
     try:
-        return ET.fromstring(data)
-    except ET.ParseError as exc:
-        raise EpubIngestionError(f"Invalid XML in {label}: {exc}") from exc
+        return parse_xml_resource(data, label)
+    except ValueError as exc:
+        raise EpubIngestionError(str(exc)) from exc
 
 
 def _resolve_member(base_dir: str, href: str) -> str:

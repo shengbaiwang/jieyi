@@ -4,15 +4,14 @@ import posixpath
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from html.entities import html5
 from typing import Any
 from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree as ET
 
+from jieyi.ingestion.epub_xml import parse_xml_resource
 from jieyi.ingestion.plaintext import ParsedBlock
 
 _SPACE = re.compile(r"\s+")
-_NAMED_ENTITY = re.compile(rb"&([A-Za-z][A-Za-z0-9]+);")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,50 +34,6 @@ def _local_name(value: str) -> str:
 
 def _normal(value: str) -> str:
     return _SPACE.sub(" ", value).strip()
-
-
-def _strip_doctype(data: bytes) -> bytes:
-    """Remove a declaration without ever evaluating its external or internal subset."""
-    upper = data.upper()
-    start = upper.find(b"<!DOCTYPE")
-    if start < 0:
-        return data
-    quote: int | None = None
-    subset_depth = 0
-    for index in range(start + len(b"<!DOCTYPE"), len(data)):
-        value = data[index]
-        if quote is not None:
-            if value == quote:
-                quote = None
-            continue
-        if value in (ord("'"), ord('"')):
-            quote = value
-        elif value == ord("["):
-            subset_depth += 1
-        elif value == ord("]") and subset_depth:
-            subset_depth -= 1
-        elif value == ord(">") and subset_depth == 0:
-            return data[:start] + data[index + 1 :]
-    raise ValueError("Unterminated XML doctype declaration")
-
-
-def parse_xml_resource(data: bytes, label: str) -> ET.Element:
-    """Parse saved EPUB XML while permitting, but never loading, a standard NCX DTD."""
-    if b"<!ENTITY" in data.upper():
-        raise ValueError(f"Entity declarations are not allowed in {label}")
-    data = _strip_doctype(data)
-
-    def replace_html_entity(match: re.Match[bytes]) -> bytes:
-        name = match.group(1).decode("ascii")
-        if name in {"amp", "apos", "gt", "lt", "quot"}:
-            return match.group(0)
-        value = html5.get(f"{name};")
-        return value.encode("utf-8") if value is not None else match.group(0)
-
-    try:
-        return ET.fromstring(_NAMED_ENTITY.sub(replace_html_entity, data))
-    except ET.ParseError as exc:
-        raise ValueError(f"Invalid XML in {label}: {exc}") from exc
 
 
 def _resolved_target(nav_path: str, href: str) -> tuple[str, str]:

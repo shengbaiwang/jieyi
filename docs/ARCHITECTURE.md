@@ -36,7 +36,7 @@ persistence / providers（实现领域端口）
 EPUB 适配器不把 ZIP 解压到磁盘，而是：
 
 1. 检查成员数量、单文件/总解压大小、压缩率、重复路径和路径穿越；
-2. 拒绝 XML DTD 与实体声明，并仅展开安全的内置 HTML 命名实体；
+2. 导入、目录、阅读与导出共用 `epub_xml.parse_xml_resource`：接受 `<!DOCTYPE html>` 等无子集声明及 EPUB 2 标准 NCX 标识符，始终不加载外部 DTD；按 XML 解析事件拒绝内部子集、实体声明及非标准外部 DTD，覆盖 UTF-8/UTF-16，仅展开内置 HTML 命名实体；
 3. 从 `META-INF/container.xml` 定位 OPF package，解析 manifest、完整 spine、EPUB 2 NCX / EPUB 3 nav、page progression 和 rendition metadata；
 4. 原始 EPUB 字节与每个成员（OPF、XHTML、CSS、封面、图片、SVG、字体等）一起写入 `epub_packages` / `epub_resources`；EPUB 3 `cover-image`、EPUB 2 `meta name=cover` 及 guide cover 都会解析；
 5. 可翻译文本仍经 `SourceAtom → ParsedBlock → Segment` 进入既有术语、QA、TM 和人工确认流程；
