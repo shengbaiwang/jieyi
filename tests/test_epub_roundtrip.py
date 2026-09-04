@@ -96,6 +96,72 @@ h1{color:#735;} @import url('nested.css'); @import url('https://evil.example/imp
     return output.getvalue()
 
 
+def build_roundtrip_epub_with_ncx() -> bytes:
+    """Build an EPUB 2 variant whose canonical navigation is an NCX file."""
+    source = io.BytesIO(build_roundtrip_epub(version="2.0"))
+    output = io.BytesIO()
+    ncx = b"""<?xml version="1.0"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/2005-1/">
+  <navMap><navPoint id="chapter">
+    <navLabel><text>Chapter</text></navLabel>
+    <content src="Text/landing.xhtml#chapter"/>
+  </navPoint></navMap>
+</ncx>"""
+    with zipfile.ZipFile(source) as archive, zipfile.ZipFile(output, "w") as result:
+        for info in archive.infolist():
+            data = archive.read(info)
+            if info.filename == "EPUB/package.opf":
+                data = data.replace(
+                    b'<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+                    b'<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>'
+                    b'<item id="landing" href="Text/landing.xhtml" media-type="application/xhtml+xml"/>',
+                ).replace(
+                    b"<spine>",
+                    b'<spine toc="ncx"><itemref idref="landing"/>',
+                )
+            result.writestr(info, data)
+        result.writestr("EPUB/toc.ncx", ncx)
+        result.writestr(
+            "EPUB/Text/landing.xhtml",
+            b'<html xmlns="http://www.w3.org/1999/xhtml"><body id="chapter"/></html>',
+        )
+    return output.getvalue()
+
+
+def build_roundtrip_epub_with_dual_navigation() -> bytes:
+    """Build an EPUB 3 book that declares both nav.xhtml and legacy NCX."""
+    source = io.BytesIO(build_roundtrip_epub())
+    output = io.BytesIO()
+    ncx = b"""<?xml version="1.0"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <navMap><navPoint id="chapter">
+    <navLabel><text>Chapter</text></navLabel>
+    <content src="Text/chapter.xhtml"/>
+  </navPoint></navMap>
+</ncx>"""
+    with zipfile.ZipFile(source) as archive, zipfile.ZipFile(output, "w") as result:
+        for info in archive.infolist():
+            data = archive.read(info)
+            if info.filename == "EPUB/package.opf":
+                data = data.replace(
+                    b'<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+                    b'<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>'
+                    b'<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+                ).replace(
+                    b"<spine>",
+                    b'<spine toc="ncx"><itemref idref="nav"/>',
+                )
+            elif info.filename == "EPUB/nav.xhtml":
+                data = data.replace(
+                    b'<html xmlns="http://www.w3.org/1999/xhtml">',
+                    b'<html xmlns="http://www.w3.org/1999/xhtml" '
+                    b'xmlns:epub="http://www.idpf.org/2007/ops">',
+                ).replace(b'<nav id="toc">', b'<nav epub:type="toc" id="toc">')
+            result.writestr(info, data)
+        result.writestr("EPUB/toc.ncx", ncx)
+    return output.getvalue()
+
+
 class EpubRoundTripTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -159,6 +225,81 @@ class EpubRoundTripTests(unittest.TestCase):
                 with zipfile.ZipFile(io.BytesIO(exported)) as archive:
                     ET.fromstring(archive.read("EPUB/Text/chapter.xhtml"))
                     self.assertEqual(archive.read("EPUB/Fonts/book.woff2"), b"fake-font-data")
+
+    def test_export_uses_translated_labels_in_epub3_navigation(self):
+        document = create_epub_document(
+            self.store,
+            project_id=self.project.id,
+            file_data=build_roundtrip_epub(),
+        )
+        heading = self.store.list_segments(document.id)[0]
+        self.store.confirm_segment(heading.id, "往返之书", rationale="translated title")
+
+        exported = export_translated_epub(self.store, document.id)
+
+        book = extract_epub(exported)
+        self.assertEqual([item.label for item in book.navigation], ["往返之书"])
+        with zipfile.ZipFile(io.BytesIO(exported)) as archive:
+            root = ET.fromstring(archive.read("EPUB/nav.xhtml"))
+            link = root.find(".//{http://www.w3.org/1999/xhtml}a")
+            self.assertEqual("".join(link.itertext()), "往返之书")
+            self.assertEqual(link.attrib["href"], "Text/chapter.xhtml")
+
+    def test_export_uses_translated_labels_in_epub2_ncx_navigation(self):
+        document = create_epub_document(
+            self.store,
+            project_id=self.project.id,
+            file_data=build_roundtrip_epub_with_ncx(),
+        )
+        heading = self.store.list_segments(document.id)[0]
+        self.store.confirm_segment(heading.id, "往返之书", rationale="translated title")
+
+        exported = export_translated_epub(self.store, document.id)
+
+        book = extract_epub(exported)
+        self.assertEqual([item.label for item in book.navigation], ["往返之书"])
+        with zipfile.ZipFile(io.BytesIO(exported)) as archive:
+            root = ET.fromstring(archive.read("EPUB/toc.ncx"))
+            namespace = "{http://www.daisy.org/z3986/2005/ncx/2005-1/}"
+            self.assertEqual(root.find(f".//{namespace}text").text, "往返之书")
+            self.assertEqual(
+                root.find(f".//{namespace}content").attrib["src"],
+                "Text/landing.xhtml#chapter",
+            )
+
+    def test_export_canonicalizes_and_syncs_dual_navigation_documents(self):
+        document = create_epub_document(
+            self.store,
+            project_id=self.project.id,
+            file_data=build_roundtrip_epub_with_dual_navigation(),
+        )
+        heading = self.store.list_segments(document.id)[0]
+        self.store.confirm_segment(heading.id, "往返之书", rationale="translated title")
+
+        exported = export_translated_epub(self.store, document.id)
+
+        self.assertEqual(
+            [item.label for item in extract_epub(exported).navigation],
+            ["往返之书"],
+        )
+        with zipfile.ZipFile(io.BytesIO(exported)) as archive:
+            nav = archive.read("EPUB/nav.xhtml").decode()
+            self.assertIn('<html xmlns="http://www.w3.org/1999/xhtml"', nav)
+            self.assertIn('xmlns:epub="http://www.idpf.org/2007/ops"', nav)
+            self.assertIn('epub:type="toc"', nav)
+            self.assertNotIn("<html:", nav)
+            self.assertNotIn("ns1:type", nav)
+
+            ncx = archive.read("EPUB/toc.ncx").decode()
+            self.assertIn('<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"', ncx)
+            self.assertNotIn("<ns0:", ncx)
+            ncx_root = ET.fromstring(ncx)
+            namespace = "{http://www.daisy.org/z3986/2005/ncx/}"
+            self.assertEqual(ncx_root.find(f".//{namespace}text").text, "往返之书")
+            self.assertEqual(
+                ncx_root.find(f".//{namespace}content").attrib["src"],
+                "Text/chapter.xhtml",
+            )
 
     def test_reflowable_reader_exposes_segment_locations_to_parent(self):
         document = create_epub_document(
@@ -506,8 +647,12 @@ class EpubReaderApiTests(unittest.TestCase):
                     self.assertIn("../nav.xhtml#toc", chapter)
                     self.assertEqual(archive.read("EPUB/Fonts/book.woff2"), b"fake-font-data")
                     with zipfile.ZipFile(io.BytesIO(build_roundtrip_epub())) as original_zip:
-                        for resource in ("EPUB/Images/cover.svg", "EPUB/Styles/book.css", "EPUB/nav.xhtml"):
+                        for resource in ("EPUB/Images/cover.svg", "EPUB/Styles/book.css"):
                             self.assertEqual(archive.read(resource), original_zip.read(resource))
+                    nav = ET.fromstring(archive.read("EPUB/nav.xhtml"))
+                    nav_link = nav.find(".//{http://www.w3.org/1999/xhtml}a")
+                    self.assertEqual("".join(nav_link.itertext()), "往返书籍")
+                    self.assertEqual(nav_link.attrib["href"], "Text/chapter.xhtml")
 
     def test_rendered_xhtml_and_resources_are_sanitized(self):
         rendered = self.client.get(

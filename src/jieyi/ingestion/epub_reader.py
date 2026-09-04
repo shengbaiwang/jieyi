@@ -11,6 +11,7 @@ from urllib.parse import quote, unquote, urlsplit
 from xml.etree import ElementTree as ET
 
 from jieyi.ingestion.epub import EpubIngestionError, _local_name, _parse_xml, _safe_member_name
+from jieyi.ingestion.epub_navigation import parse_epub_navigation, position_navigation
 
 _DANGEROUS_ELEMENTS = {
     "script",
@@ -41,6 +42,10 @@ _CSS_DANGER = re.compile(
     r"(?:expression\s*\(|javascript\s*:|vbscript\s*:|behavior\s*:|-moz-binding\s*:)",
     re.IGNORECASE,
 )
+_XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
+_EPUB_NAMESPACE = "http://www.idpf.org/2007/ops"
+_NCX_NAMESPACE = "http://www.daisy.org/z3986/2005/ncx/"
+
 _SAFE_RESOURCE_TYPES = {
     "text/css",
     "image/jpeg",
@@ -646,9 +651,269 @@ def _render_export_spine(
     )
 
 
+def _navigation_label_elements(root: ET.Element) -> list[ET.Element]:
+    """Return EPUB 3 or EPUB 2 TOC label nodes in navigation order."""
+    if _local_name(root.tag).casefold() == "ncx":
+        nav_map = next(
+            (item for item in root.iter() if _local_name(item.tag).casefold() == "navmap"),
+            None,
+        )
+        if nav_map is None:
+            return []
+        labels: list[ET.Element] = []
+
+        def walk_point(point: ET.Element) -> None:
+            nav_label = next(
+                (
+                    child
+                    for child in point
+                    if _local_name(child.tag).casefold() == "navlabel"
+                ),
+                None,
+            )
+            content = next(
+                (
+                    child
+                    for child in point
+                    if _local_name(child.tag).casefold() == "content"
+                ),
+                None,
+            )
+            if nav_label is not None and content is not None:
+                label = next(
+                    (
+                        child
+                        for child in nav_label.iter()
+                        if _local_name(child.tag).casefold() == "text"
+                    ),
+                    nav_label,
+                )
+                if "".join(nav_label.itertext()).strip() and content.attrib.get("src"):
+                    labels.append(label)
+            for child in point:
+                if _local_name(child.tag).casefold() == "navpoint":
+                    walk_point(child)
+
+        for point in nav_map:
+            if _local_name(point.tag).casefold() == "navpoint":
+                walk_point(point)
+        return labels
+
+    navs = [item for item in root.iter() if _local_name(item.tag).casefold() == "nav"]
+
+    def attribute_tokens(element: ET.Element, name: str) -> set[str]:
+        return {
+            token.casefold()
+            for key, value in element.attrib.items()
+            if _local_name(key).casefold() == name
+            for token in re.split(r"\s+", value.strip())
+            if token
+        }
+
+    toc = next(
+        (
+            item
+            for item in navs
+            if "toc" in attribute_tokens(item, "type")
+            or "doc-toc" in attribute_tokens(item, "role")
+        ),
+        navs[0] if navs else None,
+    )
+    if toc is None:
+        return []
+
+    def direct_children(element: ET.Element, tag: str) -> list[ET.Element]:
+        return [
+            child
+            for child in element
+            if _local_name(child.tag).casefold() == tag
+        ]
+
+    def item_link(item: ET.Element) -> ET.Element | None:
+        queue = list(item)
+        while queue:
+            child = queue.pop(0)
+            tag = _local_name(child.tag).casefold()
+            if tag in {"ol", "ul"}:
+                continue
+            if tag in {"a", "span"}:
+                return child
+            queue[0:0] = list(child)
+        return None
+
+    labels = []
+
+    def walk_list(list_element: ET.Element) -> None:
+        for item in direct_children(list_element, "li"):
+            link = item_link(item)
+            if (
+                link is not None
+                and link.attrib.get("href")
+                and "".join(link.itertext()).strip()
+            ):
+                labels.append(link)
+            for child_list in direct_children(item, "ol") + direct_children(item, "ul"):
+                walk_list(child_list)
+
+    for top_list in direct_children(toc, "ol") + direct_children(toc, "ul"):
+        walk_list(top_list)
+    return labels
+
+
+def _canonical_navigation_xml(root: ET.Element) -> bytes:
+    """Serialize navigation with prefixes recognized by strict EPUB readers."""
+    payload = ET.tostring(
+        root,
+        encoding="utf-8",
+        xml_declaration=True,
+        short_empty_elements=True,
+    )
+
+    def rename_namespace(namespace: str, target_prefix: bytes) -> None:
+        nonlocal payload
+        declaration = re.search(
+            rb'xmlns(?::([A-Za-z_][A-Za-z0-9_.-]*))?="'
+            + re.escape(namespace.encode("utf-8"))
+            + rb'"',
+            payload,
+        )
+        if declaration is None:
+            return
+        source_prefix = declaration.group(1) or b""
+        if source_prefix == target_prefix:
+            return
+        target_declaration = (
+            b'xmlns="' + namespace.encode("utf-8") + b'"'
+            if not target_prefix
+            else b'xmlns:' + target_prefix + b'="' + namespace.encode("utf-8") + b'"'
+        )
+        if source_prefix:
+            source = source_prefix + b":"
+            target = target_prefix + b":" if target_prefix else b""
+            payload = payload.replace(b"<" + source, b"<" + target)
+            payload = payload.replace(b"</" + source, b"</" + target)
+            payload = payload.replace(b" " + source, b" " + target)
+        payload = payload.replace(declaration.group(0), target_declaration, 1)
+
+    root_namespace = _element_namespace(root).strip("{}")
+    if root_namespace == _XHTML_NAMESPACE:
+        rename_namespace(_XHTML_NAMESPACE, b"")
+        rename_namespace(_EPUB_NAMESPACE, b"epub")
+    elif root_namespace == _NCX_NAMESPACE:
+        rename_namespace(_NCX_NAMESPACE, b"")
+    return payload
+
+
+def _render_export_navigation(
+    store,
+    document_id: str,
+    nav_path: str,
+    data: bytes,
+) -> bytes:
+    """Replace TOC labels with the translations of their target segments."""
+    entries = parse_epub_navigation(data, nav_path)
+    if not entries:
+        return data
+
+    roots: dict[str, ET.Element] = {}
+    for path in {entry.path for entry in entries}:
+        try:
+            resource = store.get_epub_resource(document_id, path)
+            roots[path] = _parse_xml(bytes(resource["data"]), path)
+        except (EpubIngestionError, LookupError):
+            continue
+
+    spine = store.list_epub_spine(document_id)
+    atoms = store.list_epub_mappings(document_id)["atoms"]
+    atoms_by_spine: dict[int, list[dict]] = {
+        int(item["spine_index"]): [] for item in spine
+    }
+    for atom in atoms:
+        atoms_by_spine.setdefault(int(atom["spine_index"]), []).append(atom)
+    positioned = position_navigation(entries, roots, atoms)
+    atoms_by_entry = {id(item.entry): item.atom for item in positioned}
+
+    # Some publishers point the TOC at an image-only split file immediately
+    # before the real chapter XHTML. Such a target has no translatable atoms,
+    # so use the first translated atom before the following TOC boundary.
+    spine_positions = {str(item["path"]): index for index, item in enumerate(spine)}
+    entry_positions = [spine_positions.get(entry.path) for entry in entries]
+    for order, entry in enumerate(entries):
+        if id(entry) in atoms_by_entry:
+            continue
+        start = entry_positions[order]
+        if start is None:
+            continue
+        stop = next(
+            (
+                position
+                for position in entry_positions[order + 1 :]
+                if position is not None and position > start
+            ),
+            len(spine),
+        )
+        for position in range(start, stop):
+            candidates = atoms_by_spine[int(spine[position]["spine_index"])]
+            if candidates:
+                atoms_by_entry[id(entry)] = candidates[0]
+                break
+
+    translated_segments = {
+        segment.id: (
+            segment.accepted_translation
+            or segment.reviewed_translation
+            or segment.edited_translation
+            or segment.machine_translation
+            or ""
+        ).strip()
+        for segment in store.list_segments(document_id)
+    }
+    translations = {
+        entry_id: translated_segments.get(str(atom["segment_id"]), "")
+        for entry_id, atom in atoms_by_entry.items()
+    }
+
+    root = _parse_xml(data, nav_path)
+    for entry, label in zip(entries, _navigation_label_elements(root)):
+        translation = translations.get(id(entry), "")
+        if not translation:
+            continue
+        for child in list(label):
+            label.remove(child)
+        label.text = translation
+
+    return _canonical_navigation_xml(root)
+
+
+def _export_navigation_paths(store, document_id: str) -> set[str]:
+    """Return every EPUB 2 and EPUB 3 navigation resource declared by the package."""
+    package = store.get_epub_package(document_id)
+    paths = {str(package["nav_path"])} if package.get("nav_path") else set()
+    package_path = str(package["package_path"])
+    try:
+        resource = store.get_epub_resource(document_id, package_path)
+        root = _parse_xml(bytes(resource["data"]), package_path)
+    except (EpubIngestionError, LookupError):
+        return paths
+
+    for item in root.iter():
+        if _local_name(item.tag).casefold() != "item":
+            continue
+        properties = item.attrib.get("properties", "").casefold().split()
+        media_type = item.attrib.get("media-type", "").casefold()
+        if "nav" not in properties and media_type != "application/x-dtbncx+xml":
+            continue
+        href = item.attrib.get("href", "")
+        resolved = _resource_path(package_path, href)
+        if resolved:
+            paths.add(resolved)
+    return paths
+
+
 def export_translated_epub(store, document_id: str, *, bilingual: bool = False) -> bytes:
     """Build a translated or bilingual EPUB, preserving original book assets."""
     original = store.get_original_epub(document_id)
+    navigation_paths = _export_navigation_paths(store, document_id)
     spine_by_path = {
         item["path"]: item["spine_index"]
         for item in store.list_epub_spine(document_id)
@@ -659,7 +924,15 @@ def export_translated_epub(store, document_id: str, *, bilingual: bool = False) 
         entries.sort(key=lambda item: item.filename != "mimetype")
         for info in entries:
             data = source.read(info)
-            if info.filename in spine_by_path:
+            if info.filename in navigation_paths:
+                try:
+                    data = _render_export_navigation(
+                        store, document_id, info.filename, data
+                    )
+                except (EpubIngestionError, LookupError, ValueError):
+                    # A malformed optional TOC must not prevent exporting readable content.
+                    pass
+            elif info.filename in spine_by_path:
                 data = _render_export_spine(
                     store, document_id, spine_by_path[info.filename], bilingual=bilingual
                 )
