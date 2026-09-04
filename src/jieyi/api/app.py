@@ -79,6 +79,11 @@ class ProjectStyleUpdate(BaseModel):
     style_guide: str = Field(default="", max_length=12_000)
 
 
+class ProjectLanguagesUpdate(BaseModel):
+    source_lang: str = Field(min_length=1, max_length=32)
+    target_lang: str = Field(min_length=1, max_length=32)
+
+
 class DocumentCreate(BaseModel):
     title: str = Field(min_length=1)
     text: str = Field(min_length=1)
@@ -134,6 +139,21 @@ class ConfirmSegment(BaseModel):
 
 class SaveSegmentDraft(BaseModel):
     translation: str = ""
+
+
+class SaveSegmentSource(BaseModel):
+    source_text: str = Field(min_length=1, max_length=500_000)
+    preserve_translation_for_review: bool = False
+
+class SplitSegmentSource(BaseModel):
+    source_text: str = Field(min_length=1, max_length=500_000)
+    selection_start: int = Field(ge=0)
+    selection_end: int = Field(ge=1)
+    reset_translation: bool = False
+
+
+class MergeSegmentSource(BaseModel):
+    direction: str = Field(pattern="^(previous|next)$")
 
 
 class ProviderProfileUpdate(BaseModel):
@@ -295,6 +315,12 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     @app.patch("/projects/{project_id}/style")
     async def patch_project_style(project_id: str, body: ProjectStyleUpdate):
         return asdict(store.update_project_style(project_id, body.style_guide.strip()))
+
+    @app.patch("/projects/{project_id}/languages")
+    async def patch_project_languages(project_id: str, body: ProjectLanguagesUpdate):
+        return asdict(store.update_project_languages(
+            project_id, body.source_lang.strip(), body.target_lang.strip()
+        ))
 
     @app.get("/projects/{project_id}/documents")
     async def get_project_documents(project_id: str):
@@ -755,6 +781,46 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
             return engine.preview(job_id, segment_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/segments/{segment_id}/source")
+    async def get_segment_source(segment_id: str):
+        segment = store.get_segment(segment_id)
+        return {
+            "source_text": segment.source_text,
+            "blocks": store.get_segment_source_blocks(segment_id),
+        }
+
+    @app.patch("/segments/{segment_id}/source")
+    async def save_segment_source(segment_id: str, body: SaveSegmentSource):
+        try:
+            segment = store.update_segment_source(
+                segment_id,
+                body.source_text,
+                preserve_translation_for_review=body.preserve_translation_for_review,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        refresh_segment_quality(store, segment_id)
+        return asdict(segment)
+
+    @app.post("/segments/{segment_id}/split")
+    async def split_segment(segment_id: str, body: SplitSegmentSource):
+        try:
+            result = store.split_segment(segment_id, **body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        result["segment"] = asdict(result["segment"])
+        return result
+
+    @app.post("/segments/{segment_id}/merge")
+    async def merge_segment(segment_id: str, body: MergeSegmentSource):
+        try:
+            result = store.merge_segment(segment_id, direction=body.direction)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        result["segment"] = asdict(result["segment"])
+        refresh_segment_quality(store, result["segment"]["id"])
+        return result
 
     @app.patch("/segments/{segment_id}/confirm")
     async def confirm_segment(segment_id: str, body: ConfirmSegment):

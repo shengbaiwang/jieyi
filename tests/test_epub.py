@@ -102,6 +102,13 @@ class EpubTests(unittest.TestCase):
         self.assertEqual([(item.label, item.level) for item in entries], [("Part", 0), ("1", 1)])
         self.assertEqual(entries[1].path, "OPS/chapter.xhtml")
 
+    def test_epub2_accepts_standard_xhtml_11_external_dtd(self):
+        doctype = b'''<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'''
+        expected = extract_epub(build_epub())
+        actual = extract_epub(build_epub(doctype=doctype))
+        self.assertEqual(actual, expected)
+
     def test_rejects_archive_path_traversal(self):
         with self.assertRaisesRegex(EpubIngestionError, "Unsafe EPUB member path"):
             extract_epub(build_epub(malicious_member=True))

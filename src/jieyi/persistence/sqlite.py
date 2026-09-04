@@ -585,6 +585,25 @@ class SQLiteStore:
             )
         return self.get_project(project_id)
 
+    def update_project_languages(
+        self, project_id: str, source_lang: str, target_lang: str
+    ) -> Project:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE projects SET source_lang = ?, target_lang = ? WHERE id = ?",
+                (source_lang, target_lang, project_id),
+            )
+            if cursor.rowcount == 0:
+                raise NotFoundError(f"Project not found: {project_id}")
+            self._audit(
+                connection,
+                "project",
+                project_id,
+                "languages_updated",
+                {"source_lang": source_lang, "target_lang": target_lang},
+            )
+        return self.get_project(project_id)
+
     def find_document_by_source_hash(self, project_id: str, source_hash: str) -> Document | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -1143,6 +1162,439 @@ class SQLiteStore:
         if row is None:
             raise NotFoundError(f"Segment not found: {segment_id}")
         return self._segment(row)
+
+    def get_segment_source_blocks(self, segment_id: str) -> list[str]:
+        segment = self.get_segment(segment_id)
+        saved_blocks = [item.strip() for item in re.split(r"\n\s*\n", segment.source_text)]
+        if len(saved_blocks) > 1:
+            return saved_blocks
+        if not segment.source_refs:
+            return [segment.source_text]
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT atom_id, source_text FROM epub_atoms
+                WHERE segment_id = ? ORDER BY ordinal""",
+                (segment_id,),
+            ).fetchall()
+        by_id = {str(row["atom_id"]): str(row["source_text"]) for row in rows}
+        blocks = [by_id[ref] for ref in segment.source_refs if ref in by_id]
+        if not blocks:
+            return [segment.source_text]
+        normalized_source = re.sub(r"\s+", " ", segment.source_text).strip()
+        normalized_blocks = re.sub(r"\s+", " ", " ".join(blocks)).strip()
+        return blocks if normalized_source == normalized_blocks else [segment.source_text]
+
+    def update_segment_source(
+        self,
+        segment_id: str,
+        source_text: str,
+        *,
+        preserve_translation_for_review: bool = False,
+    ) -> Segment:
+        value = source_text.strip()
+        if not value:
+            raise ValueError("原文不能为空")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM segments WHERE id = ?", (segment_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Segment not found: {segment_id}")
+            if value == str(row["source_text"]):
+                return self._segment(row)
+            translation = self._effective_translation(row)
+            if translation and not preserve_translation_for_review:
+                raise ValueError("本段已有译文；修改原文前必须确认将译文标记为待复核")
+            self._clear_segment_derivatives(connection, [segment_id])
+            connection.execute(
+                """UPDATE segments SET source_text = ?, machine_translation = NULL,
+                edited_translation = ?, reviewed_translation = NULL,
+                accepted_translation = NULL, status = ? WHERE id = ?""",
+                (
+                    value,
+                    translation or None,
+                    SegmentStatus.MACHINE_TRANSLATED.value
+                    if translation
+                    else SegmentStatus.SOURCE.value,
+                    segment_id,
+                ),
+            )
+            self._audit(
+                connection,
+                "segment",
+                segment_id,
+                "source_updated",
+                {
+                    "characters": len(value),
+                    "paragraphs": len(re.split(r"\n\s*\n", value)),
+                    "translation_preserved_for_review": bool(translation),
+                },
+            )
+        return self.get_segment(segment_id)
+
+    @staticmethod
+    def _effective_translation(row: sqlite3.Row) -> str:
+        return str(
+            row["accepted_translation"]
+            or row["reviewed_translation"]
+            or row["edited_translation"]
+            or row["machine_translation"]
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _source_blocks_for_row(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> list[str]:
+        saved_blocks = [
+            item.strip() for item in re.split(r"\n\s*\n", str(row["source_text"]))
+        ]
+        if len(saved_blocks) > 1:
+            return saved_blocks
+        refs = tuple(json.loads(row["source_refs_json"] or "[]"))
+        if not refs:
+            return [str(row["source_text"])]
+        atom_rows = connection.execute(
+            """SELECT atom_id, source_text FROM epub_atoms
+            WHERE segment_id = ? ORDER BY ordinal""",
+            (row["id"],),
+        ).fetchall()
+        by_id = {str(item["atom_id"]): str(item["source_text"]) for item in atom_rows}
+        blocks = [by_id[ref] for ref in refs if ref in by_id]
+        if not blocks:
+            return [str(row["source_text"])]
+        normalized_source = re.sub(r"\s+", " ", str(row["source_text"])).strip()
+        normalized_blocks = re.sub(r"\s+", " ", " ".join(blocks)).strip()
+        return blocks if normalized_source == normalized_blocks else [str(row["source_text"])]
+
+    @staticmethod
+    def _ensure_no_active_structure_job(
+        connection: sqlite3.Connection, document_id: str
+    ) -> None:
+        row = connection.execute(
+            """SELECT status FROM jobs WHERE document_id = ?
+            AND status IN ('pending', 'running', 'paused', 'failed')
+            ORDER BY created_at DESC LIMIT 1""",
+            (document_id,),
+        ).fetchone()
+        if row is not None:
+            raise ValueError("请先结束或取消未完成的翻译任务，再调整段落结构")
+
+    @staticmethod
+    def _clear_segment_derivatives(
+        connection: sqlite3.Connection, segment_ids: list[str]
+    ) -> None:
+        if not segment_ids:
+            return
+        placeholders = ",".join("?" for _ in segment_ids)
+        for table in (
+            "candidates",
+            "issues",
+            "decisions",
+            "term_candidate_evidence",
+            "epub_atom_translations",
+        ):
+            connection.execute(
+                f"DELETE FROM {table} WHERE segment_id IN ({placeholders})",
+                segment_ids,
+            )
+        connection.execute(
+            f"DELETE FROM tm_entries WHERE source_segment_id IN ({placeholders})",
+            segment_ids,
+        )
+
+    @staticmethod
+    def _renumber_segments(
+        connection: sqlite3.Connection, document_id: str, ordered_ids: list[str]
+    ) -> None:
+        for index, item_id in enumerate(ordered_ids):
+            connection.execute(
+                "UPDATE segments SET ordinal = ? WHERE id = ?",
+                (-(index + 1), item_id),
+            )
+        for index, item_id in enumerate(ordered_ids):
+            connection.execute(
+                "UPDATE segments SET ordinal = ? WHERE id = ? AND document_id = ?",
+                (index, item_id, document_id),
+            )
+
+    def split_segment(
+        self,
+        segment_id: str,
+        *,
+        source_text: str,
+        selection_start: int,
+        selection_end: int,
+        reset_translation: bool = False,
+    ) -> dict[str, Any]:
+        """Turn a selected source range into its own translation unit atomically."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT s.*, d.source_format FROM segments s
+                JOIN documents d ON d.id = s.document_id WHERE s.id = ?""",
+                (segment_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Segment not found: {segment_id}")
+            if row["kind"] == SegmentKind.HEADING.value:
+                raise ValueError("标题不能拆为正文段落")
+            self._ensure_no_active_structure_job(connection, str(row["document_id"]))
+
+            blocks = self._source_blocks_for_row(connection, row)
+            displayed = "\n\n".join(blocks)
+            if source_text != displayed:
+                raise ValueError("选中后原文发生了变化，请重新载入本段后再试")
+            if not (0 <= selection_start < selection_end <= len(displayed)):
+                raise ValueError("请先在原文中选中一段非空文字")
+
+            selected_raw = displayed[selection_start:selection_end]
+            selection_start += len(selected_raw) - len(selected_raw.lstrip())
+            selection_end -= len(selected_raw) - len(selected_raw.rstrip())
+            if selection_start >= selection_end:
+                raise ValueError("所选内容不能只有空白字符")
+
+            refs = tuple(json.loads(row["source_refs_json"] or "[]"))
+            part_refs: list[tuple[str, ...]]
+            if row["source_format"] == "epub":
+                if not refs or len(refs) != len(blocks):
+                    raise ValueError("该 EPUB 段落没有可安全拆分的原始结构边界")
+                starts: list[int] = []
+                ends: list[int] = []
+                cursor = 0
+                for block in blocks:
+                    starts.append(cursor)
+                    cursor += len(block)
+                    ends.append(cursor)
+                    cursor += 2
+                if selection_start not in starts or selection_end not in ends:
+                    raise ValueError("EPUB 只能选择一个或多个完整原始段落进行拆分")
+                first = starts.index(selection_start)
+                last = ends.index(selection_end) + 1
+                ref_groups = [refs[:first], refs[first:last], refs[last:]]
+                text_groups = [blocks[:first], blocks[first:last], blocks[last:]]
+                parts = ["\n\n".join(group) for group in text_groups if group]
+                part_refs = [tuple(group) for group in ref_groups if group]
+            else:
+                raw_parts = (
+                    displayed[:selection_start],
+                    displayed[selection_start:selection_end],
+                    displayed[selection_end:],
+                )
+                parts = [item.strip() for item in raw_parts if item.strip()]
+                part_refs = [() for _ in parts]
+            if len(parts) < 2:
+                raise ValueError("请选择本段中的一部分，而不是整段")
+
+            has_translation = bool(self._effective_translation(row))
+            if has_translation and not reset_translation:
+                raise ValueError("本段已有译文；拆分前必须明确确认清空本段译文")
+
+            document_id = str(row["document_id"])
+            existing_ids = [
+                str(item["id"])
+                for item in connection.execute(
+                    "SELECT id FROM segments WHERE document_id = ? ORDER BY ordinal",
+                    (document_id,),
+                ).fetchall()
+            ]
+            original_index = existing_ids.index(segment_id)
+            self._clear_segment_derivatives(connection, [segment_id])
+            connection.execute(
+                """UPDATE segments SET source_text = ?, machine_translation = NULL,
+                edited_translation = NULL, reviewed_translation = NULL,
+                accepted_translation = NULL, status = ?, source_refs_json = ?,
+                segmentation_confidence = 1.0, segmentation_reason = 'manual_split',
+                segmenter_version = 'manual-v1' WHERE id = ?""",
+                (
+                    parts[0],
+                    SegmentStatus.SOURCE.value,
+                    json.dumps(part_refs[0], ensure_ascii=False),
+                    segment_id,
+                ),
+            )
+            part_ids = [segment_id]
+            for index, (part, source_refs) in enumerate(
+                zip(parts[1:], part_refs[1:], strict=True), start=1
+            ):
+                new_segment_id = new_id("seg")
+                part_ids.append(new_segment_id)
+                connection.execute(
+                    """INSERT INTO segments
+                    (id, document_id, stable_key, ordinal, kind, source_text, heading_path,
+                     machine_translation, edited_translation, reviewed_translation,
+                     accepted_translation, status, source_refs_json, segmentation_confidence,
+                     segmentation_reason, segmenter_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1.0,
+                            'manual_split', 'manual-v1')""",
+                    (
+                        new_segment_id,
+                        document_id,
+                        f"{row['stable_key']}:split:{new_segment_id}",
+                        -(len(existing_ids) + index + 1),
+                        row["kind"],
+                        part,
+                        row["heading_path"],
+                        SegmentStatus.SOURCE.value,
+                        json.dumps(source_refs, ensure_ascii=False),
+                    ),
+                )
+            for part_id, source_refs in zip(part_ids, part_refs, strict=True):
+                if source_refs:
+                    placeholders = ",".join("?" for _ in source_refs)
+                    connection.execute(
+                        f"""UPDATE epub_atoms SET segment_id = ?
+                        WHERE document_id = ? AND atom_id IN ({placeholders})""",
+                        (part_id, document_id, *source_refs),
+                    )
+
+            ordered_ids = (
+                existing_ids[:original_index]
+                + part_ids
+                + existing_ids[original_index + 1 :]
+            )
+            self._renumber_segments(connection, document_id, ordered_ids)
+            selected_part_index = 0 if not displayed[:selection_start].strip() else 1
+            selected_id = part_ids[selected_part_index]
+            self._audit(
+                connection,
+                "segment",
+                segment_id,
+                "split",
+                {
+                    "parts": part_ids,
+                    "selected_segment_id": selected_id,
+                    "translation_reset": has_translation,
+                },
+            )
+        selected = self.get_segment(selected_id)
+        return {
+            "segment": selected,
+            "segment_count": len(ordered_ids),
+            "created_segment_ids": part_ids[1:],
+            "translation_reset": has_translation,
+        }
+
+    def merge_segment(self, segment_id: str, *, direction: str) -> dict[str, Any]:
+        """Merge an adjacent compatible translation unit, preserving target text for review."""
+        if direction not in {"previous", "next"}:
+            raise ValueError("合并方向必须是上一段或下一段")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """SELECT s.*, d.source_format FROM segments s
+                JOIN documents d ON d.id = s.document_id WHERE s.id = ?""",
+                (segment_id,),
+            ).fetchone()
+            if current is None:
+                raise NotFoundError(f"Segment not found: {segment_id}")
+            self._ensure_no_active_structure_job(connection, str(current["document_id"]))
+            neighbor_ordinal = int(current["ordinal"]) + (-1 if direction == "previous" else 1)
+            neighbor = connection.execute(
+                "SELECT * FROM segments WHERE document_id = ? AND ordinal = ?",
+                (current["document_id"], neighbor_ordinal),
+            ).fetchone()
+            if neighbor is None:
+                raise ValueError("该方向没有可合并的相邻段落")
+            left, right = (neighbor, current) if direction == "previous" else (current, neighbor)
+            if left["kind"] == SegmentKind.HEADING.value or right["kind"] == SegmentKind.HEADING.value:
+                raise ValueError("标题不能与正文段落合并")
+            if left["kind"] != right["kind"] or left["heading_path"] != right["heading_path"]:
+                raise ValueError("只能合并同一章节内类型相同的相邻段落")
+
+            left_blocks = self._source_blocks_for_row(connection, left)
+            right_blocks = self._source_blocks_for_row(connection, right)
+            left_refs = tuple(json.loads(left["source_refs_json"] or "[]"))
+            right_refs = tuple(json.loads(right["source_refs_json"] or "[]"))
+            combined_refs = left_refs + right_refs
+            if current["source_format"] == "epub":
+                if not left_refs or not right_refs:
+                    raise ValueError("这些 EPUB 段落没有可安全合并的结构边界")
+                atom_rows = connection.execute(
+                    """SELECT atom_id, spine_index, ordinal FROM epub_atoms
+                    WHERE document_id = ? AND atom_id IN ({}) ORDER BY ordinal""".format(
+                        ",".join("?" for _ in combined_refs)
+                    ),
+                    (current["document_id"], *combined_refs),
+                ).fetchall()
+                atom_ids = [str(item["atom_id"]) for item in atom_rows]
+                atom_ordinals = [int(item["ordinal"]) for item in atom_rows]
+                contiguous = not atom_ordinals or atom_ordinals == list(
+                    range(atom_ordinals[0], atom_ordinals[0] + len(atom_ordinals))
+                )
+                if (
+                    atom_ids != list(combined_refs)
+                    or len({item["spine_index"] for item in atom_rows}) != 1
+                    or not contiguous
+                ):
+                    raise ValueError("EPUB 只能合并同一页面内连续的原始段落")
+
+            merged_source = "\n\n".join(left_blocks + right_blocks)
+            translations = [
+                value
+                for value in (
+                    self._effective_translation(left),
+                    self._effective_translation(right),
+                )
+                if value
+            ]
+            merged_translation = "\n\n".join(translations) or None
+            document_id = str(current["document_id"])
+            existing_ids = [
+                str(item["id"])
+                for item in connection.execute(
+                    "SELECT id FROM segments WHERE document_id = ? ORDER BY ordinal",
+                    (document_id,),
+                ).fetchall()
+            ]
+            keeper_id, removed_id = str(left["id"]), str(right["id"])
+            self._clear_segment_derivatives(connection, [keeper_id, removed_id])
+            if combined_refs:
+                placeholders = ",".join("?" for _ in combined_refs)
+                connection.execute(
+                    f"""UPDATE epub_atoms SET segment_id = ?
+                    WHERE document_id = ? AND atom_id IN ({placeholders})""",
+                    (keeper_id, document_id, *combined_refs),
+                )
+            connection.execute("DELETE FROM segments WHERE id = ?", (removed_id,))
+            connection.execute(
+                """UPDATE segments SET source_text = ?, machine_translation = NULL,
+                edited_translation = ?, reviewed_translation = NULL,
+                accepted_translation = NULL, status = ?, source_refs_json = ?,
+                segmentation_confidence = 1.0, segmentation_reason = 'manual_merge',
+                segmenter_version = 'manual-v1' WHERE id = ?""",
+                (
+                    merged_source,
+                    merged_translation,
+                    SegmentStatus.MACHINE_TRANSLATED.value
+                    if merged_translation
+                    else SegmentStatus.SOURCE.value,
+                    json.dumps(combined_refs, ensure_ascii=False),
+                    keeper_id,
+                ),
+            )
+            ordered_ids = [item for item in existing_ids if item != removed_id]
+            self._renumber_segments(connection, document_id, ordered_ids)
+            self._audit(
+                connection,
+                "segment",
+                keeper_id,
+                "merged",
+                {
+                    "removed_segment_id": removed_id,
+                    "direction": direction,
+                    "translation_preserved_for_review": bool(merged_translation),
+                },
+            )
+        merged = self.get_segment(keeper_id)
+        return {
+            "segment": merged,
+            "segment_count": len(ordered_ids),
+            "removed_segment_id": removed_id,
+            "translation_needs_review": bool(merged_translation),
+        }
+
 
     def get_neighbors(self, document_id: str, ordinal: int, radius: int = 1) -> list[Segment]:
         with self._connect() as connection:

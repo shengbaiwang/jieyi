@@ -27,18 +27,18 @@ class TermDiscoveryCreate(BaseModel):
     provider: str = ""
     model: str = ""
     compute_mode: str = "balanced"
-    max_candidates: int = Field(default=40, ge=5, le=500)
+    max_candidates: int = Field(default=70, ge=5, le=500)
     max_evidence_per_candidate: int = Field(default=6, ge=1, le=20)
-    max_model_candidates: int = Field(default=40, ge=0, le=200)
+    max_model_candidates: int = Field(default=70, ge=0, le=500)
     model_batch_size: int = Field(default=4, ge=1, le=20)
-    min_score: float = Field(default=0.34, ge=0, le=1)
+    min_score: float = Field(default=0.12, ge=0, le=1)
 
 
 class TermDiscoveryRetry(BaseModel):
     provider: str = ""
     model: str = ""
     compute_mode: str | None = None
-    max_model_candidates: int | None = Field(default=None, ge=1, le=200)
+    max_model_candidates: int | None = Field(default=None, ge=1, le=500)
 
 
 class TermCandidateReview(BaseModel):
@@ -224,7 +224,7 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
             raise HTTPException(status_code=422, detail="请先配置术语发现模型。")
         mode = body.compute_mode or coverage.get("review_compute_mode") or "balanced"
         limit = body.max_model_candidates or coverage.get("review_limit") or (
-            run["config"].get("max_model_candidates") or 40
+            run["config"].get("max_model_candidates") or 70
         )
         if not repository.claim_review(run_id):
             return repository.get_run(run_id)

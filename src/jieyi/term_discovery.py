@@ -161,11 +161,12 @@ _CJK_STOP = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class DiscoveryConfig:
-    max_candidates: int = 40
+    algorithm_version: str = "v3.2"
+    max_candidates: int = 70
     max_evidence_per_candidate: int = 6
-    max_model_candidates: int = 40
+    max_model_candidates: int = 70
     model_batch_size: int = 4
-    min_score: float = 0.34
+    min_score: float = 0.12
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,9 +434,9 @@ def mine_term_candidates(
     source_lang: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Mine evidence-bound candidates with language-aware lexical boundaries."""
-    from jieyi.term_mining_v2 import mine_candidates_v2
+    from jieyi.term_mining_v2 import mine_candidates_v3
 
-    return mine_candidates_v2(segments, config or DiscoveryConfig(), source_lang=source_lang)
+    return mine_candidates_v3(segments, config or DiscoveryConfig(), source_lang=source_lang)
 
 
 def _extract_json(value: str) -> dict[str, Any]:
@@ -468,6 +469,7 @@ def _analysis_messages(
                 "canonical_form": candidate["canonical_form"],
                 "observed_forms": candidate["forms"],
                 "frequency": candidate["frequency"],
+                "segment_frequency": candidate["segment_frequency"],
                 "risk_score": candidate["risk_score"],
                 "candidate_type": candidate.get("candidate_type", "unclassified"),
                 "boundary_confidence": candidate.get("boundary_confidence", 0.0),
@@ -485,26 +487,37 @@ def _analysis_messages(
         "You are reviewing automatically mined terminology for a book translation. "
         "Use only the supplied verbatim evidence. Never introduce a source term, alias, "
         "definition, sense, or claim unsupported by that evidence. Distinguish lexical "
-        "forms from concepts and split genuinely different senses. Prefer concepts whose "
-        "mistranslation or inconsistent translation would materially affect the book. "
-        "Every supplied candidate ID must receive at least one keep or omit decision, even "
-        "when the answer is omit. A proposal is advisory and will require human approval. "
-        "Return strict JSON only."
+        "forms from concepts and split genuinely different senses. Optimize for precision: "
+        "when uncertain, omit. Keep only a stable concept or technical expression that is "
+        "material to the book's argument and genuinely needs a consistent target-language "
+        "rendering. Frequency, capitalization, a heading, or topical relevance alone never "
+        "justifies keeping an item. Every supplied candidate ID must receive at least one "
+        "keep or omit decision, even when the answer is omit. A proposal is advisory and "
+        "will require human approval. Return strict JSON only."
     )
     user = {
         "source_language": source_lang,
         "target_language": target_lang,
         "task": (
-            "Return a decision for every supplied candidate. Set keep=false for ordinary words, "
-            "sentence fragments, incidental names, metadata, or items that do not need a stable "
-            "book-wide translation. Suggest a target only for keep=true. Return multiple rows for "
-            "one candidate only when the evidence clearly supports distinct senses."
+            "Return a decision for every supplied candidate. Set keep=true only when all four "
+            "criteria are true: stable_concept, book_significant, consistency_needed, and "
+            "specialized_usage. Set keep=false for ordinary or broadly thematic words, grammatical "
+            "forms, descriptive phrases, incidental names, metadata, uncertain cases, and anything "
+            "that does not need a stable book-wide translation. Do not keep an item merely because "
+            "it is frequent or related to the subject. Suggest a target only for keep=true. Return "
+            "multiple rows for one candidate only when the evidence clearly supports distinct senses."
         ),
         "schema": {
             "proposals": [
                 {
                     "candidate_id": "exact supplied id",
                     "keep": True,
+                    "criteria": {
+                        "stable_concept": True,
+                        "book_significant": True,
+                        "consistency_needed": True,
+                        "specialized_usage": True,
+                    },
                     "sense_key": "short stable label",
                     "sense": "concise source-language sense distinction",
                     "concept_definition": "evidence-bound definition",
@@ -565,14 +578,20 @@ async def enrich_candidates(
     """Checkpoint each response; shrink incomplete batches with a bounded retry budget."""
     by_id = {candidate["id"]: candidate for candidate in candidates}
     usage: dict[str, Any] = {
-        "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
-        "cost_usd": 0.0, "model_calls": 0, "invalid_proposals": 0,
-        "diagnostics": [], "model_error": "",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.0,
+        "model_calls": 0,
+        "invalid_proposals": 0,
+        "strict_keep_demotions": 0,
+        "diagnostics": [],
+        "model_error": "",
         **model_review_counts(candidates, config.max_model_candidates),
     }
-    pending = [c for c in candidates[:config.max_model_candidates] if needs_model_review(c)]
+    pending = [c for c in candidates[: config.max_model_candidates] if needs_model_review(c)]
     batch_size = min(config.model_batch_size, 4)
-    queue = deque((pending[i:i + batch_size], 0) for i in range(0, len(pending), batch_size))
+    queue = deque((pending[i : i + batch_size], 0) for i in range(0, len(pending), batch_size))
 
     def save() -> None:
         usage.update(model_review_counts(candidates, config.max_model_candidates))
@@ -589,15 +608,20 @@ async def enrich_candidates(
         usage["model_calls"] += 1
         try:
             result: TranslationResult = await provider.complete(
-                _analysis_messages(batch, source_lang, target_lang), model,
-                compute_mode=compute_mode, max_tokens=max_tokens,
+                _analysis_messages(batch, source_lang, target_lang),
+                model,
+                compute_mode=compute_mode,
+                max_tokens=max_tokens,
             )
         except Exception as exc:  # noqa: BLE001 — third-party adapter boundary
             usage["model_error"] = str(exc)[:1_000]
-            usage["diagnostics"].append({
-                "kind": "provider_error", "candidate_ids": [c["id"] for c in batch],
-                "attempt": attempt + 1,
-            })
+            usage["diagnostics"].append(
+                {
+                    "kind": "provider_error",
+                    "candidate_ids": [c["id"] for c in batch],
+                    "attempt": attempt + 1,
+                }
+            )
             save()
             break
         for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cost_usd"):
@@ -640,6 +664,28 @@ async def enrich_candidates(
                 confidence = float(proposal.get("confidence") or 0.0)
             except (TypeError, ValueError):
                 confidence = 0.0
+            gate_failure = ""
+            if keep:
+                criteria = proposal.get("criteria")
+                required = {
+                    "stable_concept",
+                    "book_significant",
+                    "consistency_needed",
+                    "specialized_usage",
+                }
+                if not isinstance(criteria, dict) or not required.issubset(criteria):
+                    usage["invalid_proposals"] += 1
+                    continue
+                failures = [key for key in sorted(required) if criteria[key] is not True]
+                if confidence < 0.75:
+                    failures.append("confidence_below_0.75")
+                if failures:
+                    keep = False
+                    usage["strict_keep_demotions"] += 1
+                    gate_failure = "Strict keep gate failed: " + ", ".join(failures)
+            rationale = str(proposal.get("rationale", "")).strip()[:1_000]
+            if gate_failure:
+                rationale = f"{rationale} {gate_failure}".strip()[:1_000]
             grouped[candidate["id"]].append(
                 {
                     "id": new_id("sense"),
@@ -651,7 +697,7 @@ async def enrich_candidates(
                     "proposed_target": (
                         str(proposal.get("target", "")).strip()[:300] if keep else ""
                     ),
-                    "rationale": str(proposal.get("rationale", "")).strip()[:1_000],
+                    "rationale": rationale,
                     "disambiguation": str(proposal.get("disambiguation", "")).strip()[:1_000],
                     "confidence": max(0.0, min(1.0, confidence)),
                     "ai_recommended": keep,
@@ -669,21 +715,28 @@ async def enrich_candidates(
             from jieyi.workflow.provider_responses import inspect_empty_result
 
             envelope = inspect_empty_result(result, attempt=attempt + 1, max_tokens=max_tokens)
-            usage["diagnostics"].append({
-                "kind": "invalid_json" if not payload else "missing_or_invalid_decisions",
-                "candidate_ids": [c["id"] for c in unresolved],
-                "attempt": attempt + 1, "max_tokens": max_tokens,
-                "finish_reason": envelope.finish_reason,
-                "invalid_proposals": usage["invalid_proposals"] - invalid_before,
-            })
+            usage["diagnostics"].append(
+                {
+                    "kind": "invalid_json" if not payload else "missing_or_invalid_decisions",
+                    "candidate_ids": [c["id"] for c in unresolved],
+                    "attempt": attempt + 1,
+                    "max_tokens": max_tokens,
+                    "finish_reason": envelope.finish_reason,
+                    "invalid_proposals": usage["invalid_proposals"] - invalid_before,
+                }
+            )
         save()
         unresolved = [c for c in batch if needs_model_review(c)]
         if unresolved and attempt < 3:
             smaller = max(1, len(batch) // 2)
-            queue.extendleft(reversed([
-                (unresolved[i:i + smaller], attempt + 1)
-                for i in range(0, len(unresolved), smaller)
-            ]))
+            queue.extendleft(
+                reversed(
+                    [
+                        (unresolved[i : i + smaller], attempt + 1)
+                        for i in range(0, len(unresolved), smaller)
+                    ]
+                )
+            )
     return candidates, usage
 
 

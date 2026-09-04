@@ -19,6 +19,175 @@ class ApiTests(unittest.TestCase):
         self.client.close()
         self.tempdir.cleanup()
 
+    def test_source_copy_and_project_languages_can_be_edited(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "French", "source_lang": "en", "target_lang": "zh-CN"},
+        ).json()
+        changed_project = self.client.patch(
+            f"/projects/{project['id']}/languages",
+            json={"source_lang": "fr", "target_lang": "zh-CN"},
+        )
+        self.assertEqual(changed_project.status_code, 200)
+        self.assertEqual(changed_project.json()["source_lang"], "fr")
+
+        document = self.client.post(
+            f"/projects/{project['id']}/documents",
+            json={"title": "Original", "text": "Premier paragraphe.", "source_format": "txt"},
+        ).json()
+        segment = self.client.get(f"/documents/{document['id']}/segments").json()[0]
+        layout = self.client.get(f"/segments/{segment['id']}/source")
+        self.assertEqual(layout.status_code, 200)
+        self.assertEqual(layout.json()["blocks"], ["Premier paragraphe."])
+
+        changed_source = self.client.patch(
+            f"/segments/{segment['id']}/source",
+            json={"source_text": "Premier paragraphe.\n\nDeuxieme paragraphe."},
+        )
+        self.assertEqual(changed_source.status_code, 200)
+        self.assertEqual(
+            changed_source.json()["source_text"],
+            "Premier paragraphe.\n\nDeuxieme paragraphe.",
+        )
+        saved_layout = self.client.get(f"/segments/{segment['id']}/source").json()
+        self.assertEqual(
+            saved_layout["blocks"], ["Premier paragraphe.", "Deuxieme paragraphe."]
+        )
+
+    def test_edited_single_block_epub_source_remains_visible(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "EPUB source", "source_lang": "en", "target_lang": "zh-CN"},
+        ).json()
+        document = self.client.post(
+            f"/projects/{project['id']}/documents/epub",
+            content=build_epub(),
+            headers={"Content-Type": "application/epub+zip"},
+        ).json()
+        segment = next(
+            item
+            for item in self.client.get(f"/documents/{document['id']}/segments").json()
+            if item["source_text"] == "Agency matters. Still."
+        )
+        changed = self.client.patch(
+            f"/segments/{segment['id']}/source",
+            json={"source_text": "Agency matters. Still revised."},
+        )
+        self.assertEqual(changed.status_code, 200)
+        layout = self.client.get(f"/segments/{segment['id']}/source").json()
+        self.assertEqual(layout["blocks"], ["Agency matters. Still revised."])
+
+    def test_segments_can_be_split_and_merged_with_translation_guards(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "Structure", "source_lang": "en", "target_lang": "zh-CN"},
+        ).json()
+        document = self.client.post(
+            f"/projects/{project['id']}/documents",
+            json={
+                "title": "Split",
+                "text": "Alpha beta gamma",
+                "source_format": "txt",
+            },
+        ).json()
+        segment = self.client.get(f"/documents/{document['id']}/segments").json()[0]
+        self.client.patch(
+            f"/segments/{segment['id']}/confirm",
+            json={"translation": "整段译文"},
+        )
+
+        refused = self.client.post(
+            f"/segments/{segment['id']}/split",
+            json={
+                "source_text": "Alpha beta gamma",
+                "selection_start": 6,
+                "selection_end": 10,
+            },
+        )
+        self.assertEqual(refused.status_code, 422)
+        self.assertIn("确认清空", refused.json()["detail"])
+        self.assertEqual(
+            len(self.client.get(f"/documents/{document['id']}/segments").json()), 1
+        )
+
+        split = self.client.post(
+            f"/segments/{segment['id']}/split",
+            json={
+                "source_text": "Alpha beta gamma",
+                "selection_start": 6,
+                "selection_end": 10,
+                "reset_translation": True,
+            },
+        )
+        self.assertEqual(split.status_code, 200)
+        self.assertTrue(split.json()["translation_reset"])
+        self.assertEqual(split.json()["segment"]["source_text"], "beta")
+        items = self.client.get(f"/documents/{document['id']}/segments").json()
+        self.assertEqual([item["source_text"] for item in items], ["Alpha", "beta", "gamma"])
+        self.assertEqual([item["ordinal"] for item in items], [0, 1, 2])
+        self.assertTrue(all(not item["edited_translation"] for item in items))
+
+        merged_left = self.client.post(
+            f"/segments/{split.json()['segment']['id']}/merge",
+            json={"direction": "previous"},
+        )
+        self.assertEqual(merged_left.status_code, 200)
+        self.assertEqual(merged_left.json()["segment"]["source_text"], "Alpha\n\nbeta")
+        merged_all = self.client.post(
+            f"/segments/{merged_left.json()['segment']['id']}/merge",
+            json={"direction": "next"},
+        )
+        self.assertEqual(merged_all.status_code, 200)
+        self.assertEqual(merged_all.json()["segment_count"], 1)
+        self.assertEqual(
+            merged_all.json()["segment"]["source_text"], "Alpha\n\nbeta\n\ngamma"
+        )
+
+    def test_merge_preserves_adjacent_translations_but_requires_review(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "Merge", "source_lang": "en", "target_lang": "zh-CN"},
+        ).json()
+        document = self.client.post(
+            f"/projects/{project['id']}/documents",
+            json={"title": "Merge", "text": "One.\n\nTwo.", "source_format": "txt"},
+        ).json()
+        items = self.client.get(f"/documents/{document['id']}/segments").json()
+        for item, translation in zip(items, ("一。", "二。"), strict=True):
+            self.client.patch(
+                f"/segments/{item['id']}/confirm",
+                json={"translation": translation},
+            )
+
+        result = self.client.post(
+            f"/segments/{items[0]['id']}/merge",
+            json={"direction": "next"},
+        )
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(result.json()["translation_needs_review"])
+        merged = result.json()["segment"]
+        self.assertEqual(merged["edited_translation"], "一。\n\n二。")
+        self.assertEqual(merged["status"], "machine_translated")
+        self.assertIsNone(merged["accepted_translation"])
+
+        refused = self.client.patch(
+            f"/segments/{merged['id']}/source",
+            json={"source_text": "One revised.\n\nTwo."},
+        )
+        self.assertEqual(refused.status_code, 422)
+        self.assertIn("标记为待复核", refused.json()["detail"])
+        acknowledged = self.client.patch(
+            f"/segments/{merged['id']}/source",
+            json={
+                "source_text": "One revised.\n\nTwo.",
+                "preserve_translation_for_review": True,
+            },
+        )
+        self.assertEqual(acknowledged.status_code, 200)
+        self.assertEqual(acknowledged.json()["edited_translation"], "一。\n\n二。")
+        self.assertEqual(acknowledged.json()["status"], "machine_translated")
+
+
     def test_export_text_variants_and_unicode_filenames(self):
         project = self.client.post(
             "/projects", json={"name": "Export", "source_lang": "en", "target_lang": "zh-CN"}

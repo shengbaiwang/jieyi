@@ -23,6 +23,11 @@ type Segment = {
 type Chapter = { title: string; level: number; start_ordinal: number; end_ordinal: number; segment_count: number; translated_count: number; confirmed_count: number };
 type Overview = { document: Document; project: Project; segment_count: number; translated_count: number; confirmed_count: number; chapters: Chapter[] };
 type SegmentPage = { document: Document; project: Project; total: number; offset: number; limit: number; items: Segment[] };
+type SourceLayout = { source_text: string; blocks: string[] };
+type StructureResult = { segment: Segment; segment_count: number; translation_reset?: boolean; translation_needs_review?: boolean };
+type StructureAction =
+  | { kind: "split"; start: number; end: number; preview: string; resetsTranslation: boolean }
+  | { kind: "merge"; direction: "previous" | "next"; neighborOrdinal: number };
 type Term = {
   id: string; source: string; target: string; status: string; scope: string; rationale: string;
   aliases: string[]; context_keywords: string[]; sense: string; disambiguation: string; enforcement?: string;
@@ -186,6 +191,16 @@ export default function Home() {
   const [translation, setTranslation] = useState("");
   const [draftDirty, setDraftDirty] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [sourceDraft, setSourceDraft] = useState("");
+  const [sourceBaseline, setSourceBaseline] = useState("");
+  const [sourceDirty, setSourceDirty] = useState(false);
+  const [sourceSaveState, setSourceSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [sourceEditing, setSourceEditing] = useState(false);
+  const [sourceSaveWarning, setSourceSaveWarning] = useState(false);
+  const [sourceSelection, setSourceSelection] = useState({ start: 0, end: 0 });
+  const [structureAction, setStructureAction] = useState<StructureAction | null>(null);
+  const [structureBusy, setStructureBusy] = useState(false);
+  const sourceEditor = useRef<HTMLTextAreaElement | null>(null);
   const [loading, setLoading] = useState(true);
   const [startingTask, setStartingTask] = useState(false);
   const [draftPicker, setDraftPicker] = useState<{ document: Document; overview: Overview } | null>(null);
@@ -261,6 +276,7 @@ export default function Home() {
       : null;
   const currentDocumentBusy = jobsDocumentId === overview?.document.id && jobs.some((job) => job.status === "pending" || job.status === "running");
   const hasCurrentTranslation = Boolean(translation.trim() || segmentTranslation(currentSegment).trim());
+  const structureLocked = structureBusy || draftDirty || saveState === "saving" || sourceDirty || sourceSaveState === "saving" || Boolean(segmentDraft);
   const completion = overview?.segment_count ? Math.round((overview.confirmed_count / overview.segment_count) * 100) : 0;
   const translationProgress = overview?.segment_count ? Math.round((overview.translated_count / overview.segment_count) * 100) : 0;
   const selectedDraftChapters = draftPicker?.overview.chapters.filter((chapter) => selectedChapterStarts.includes(chapter.start_ordinal)) || [];
@@ -524,6 +540,32 @@ export default function Home() {
   }, [currentSegment?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    const segment = currentSegment;
+    let disposed = false;
+    const timer = window.setTimeout(() => {
+      const initial = segment?.source_text || "";
+      setSourceDraft(initial);
+      setSourceBaseline(initial);
+      setSourceDirty(false);
+      setSourceSaveState("idle");
+      setSourceEditing(false);
+      setSourceSaveWarning(false);
+      setSourceSelection({ start: 0, end: 0 });
+      if (!segment) return;
+      void api<SourceLayout>(`/segments/${segment.id}/source`)
+        .then((layout) => {
+          if (!disposed && layout.blocks.length > 1) {
+            const structured = layout.blocks.join("\n\n");
+            setSourceDraft(structured);
+            setSourceBaseline(structured);
+          }
+        })
+        .catch(() => { /* Older local APIs still show the editable aggregate source. */ });
+    }, 0);
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, [currentSegment?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
     if (panel !== "quality" && panel !== "translate") return;
     const timer = window.setTimeout(() => void refreshQuality(), 0);
     return () => window.clearTimeout(timer);
@@ -561,8 +603,180 @@ export default function Home() {
     }
   }
 
+  async function saveSourceImmediately(preserveTranslationForReview = false) {
+    if (!sourceDirty || !currentSegment) return;
+    const value = sourceDraft.trim();
+    if (!value) throw new Error("原文不能为空");
+    setSourceSaveState("saving");
+    try {
+      const saved = await api<Segment>("/segments/" + currentSegment.id + "/source", {
+        method: "PATCH",
+        body: JSON.stringify({
+          source_text: value,
+          preserve_translation_for_review: preserveTranslationForReview,
+        }),
+      });
+      legacySegments.current.delete(saved.document_id);
+      setPage((current) => current ? {
+        ...current,
+        items: current.items.map((item) => item.id === saved.id ? saved : item),
+      } : current);
+      setSourceDraft(saved.source_text);
+      setSourceBaseline(saved.source_text);
+      setSourceDirty(false);
+      setSourceSaveState("saved");
+      setSourceEditing(false);
+      await refreshQuality();
+    } catch (error) {
+      setSourceSaveState("error");
+      throw error;
+    }
+  }
+
+  async function saveSource(preserveTranslationForReview = false) {
+    if (
+      !preserveTranslationForReview
+      && currentSegment
+      && segmentTranslation(currentSegment)
+      && sourceDraft.trim() !== sourceBaseline.trim()
+    ) {
+      setSourceSaveWarning(true);
+      return;
+    }
+    try {
+      await saveSourceImmediately(preserveTranslationForReview);
+      setSourceSaveWarning(false);
+      notify(preserveTranslationForReview
+        ? "原文已保存；原译文已保留并标记为待复核。"
+        : "原文已保存；空行会保留为段落边界。");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "原文保存失败");
+    }
+  }
+
+  async function updateSourceLanguage(sourceLang: string) {
+    if (!overview) return;
+    try {
+      const saved = await api<Project>("/projects/" + overview.project.id + "/languages", {
+        method: "PATCH",
+        body: JSON.stringify({
+          source_lang: sourceLang,
+          target_lang: overview.project.target_lang,
+        }),
+      });
+      setProjects((items) => items.map((item) => item.id === saved.id ? saved : item));
+      setOverview((current) => current ? { ...current, project: saved } : current);
+      notify("原文语言已改为 " + sourceLang.toUpperCase());
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "原文语言更新失败");
+    }
+  }
+
+  function startSourceEditing() {
+    setSourceEditing(true);
+    setSourceSelection({ start: 0, end: 0 });
+    window.setTimeout(() => sourceEditor.current?.focus(), 0);
+  }
+
+  function cancelSourceEditing() {
+    if (sourceDirty && !window.confirm("放弃尚未保存的原文修改？")) return;
+    setSourceDraft(sourceBaseline);
+    setSourceDirty(false);
+    setSourceSaveState("idle");
+    setSourceSaveWarning(false);
+    setSourceEditing(false);
+  }
+
+  function requestSplit() {
+    if (!currentSegment || currentSegment.kind === "heading") return;
+    if (structureLocked) {
+      notify("请先保存或取消当前修改，并等待正在进行的操作结束。");
+      return;
+    }
+    const { start, end } = sourceSelection;
+    const preview = sourceDraft.slice(start, end).trim();
+    if (!preview || start === end) {
+      notify("请先在原文中选中要独立成段的文字。");
+      return;
+    }
+    if (preview === sourceDraft.trim()) {
+      notify("不能把整段拆成它自己；请选择其中一部分。");
+      return;
+    }
+    setStructureAction({
+      kind: "split",
+      start,
+      end,
+      preview,
+      resetsTranslation: Boolean(segmentTranslation(currentSegment)),
+    });
+  }
+
+  function requestMerge(direction: "previous" | "next") {
+    if (!currentSegment) return;
+    if (structureLocked) {
+      notify("请先保存或取消当前修改，并等待正在进行的操作结束。");
+      return;
+    }
+    setStructureAction({
+      kind: "merge",
+      direction,
+      neighborOrdinal: currentSegment.ordinal + (direction === "previous" ? -1 : 1),
+    });
+  }
+
+  async function performStructureAction() {
+    if (!structureAction || !currentSegment || !overview) return;
+    setStructureBusy(true);
+    try {
+      const result = structureAction.kind === "split"
+        ? await api<StructureResult>(`/segments/${currentSegment.id}/split`, {
+          method: "POST",
+          body: JSON.stringify({
+            source_text: sourceDraft,
+            selection_start: structureAction.start,
+            selection_end: structureAction.end,
+            reset_translation: structureAction.resetsTranslation,
+          }),
+        })
+        : await api<StructureResult>(`/segments/${currentSegment.id}/merge`, {
+          method: "POST",
+          body: JSON.stringify({ direction: structureAction.direction }),
+        });
+      const documentId = overview.document.id;
+      legacySegments.current.delete(documentId);
+      const refreshedOverview = await api<Overview>(`/documents/${documentId}/overview`);
+      setOverview(refreshedOverview);
+      await loadPageAt(documentId, result.segment.ordinal);
+      setSourceDraft(result.segment.source_text);
+      setSourceBaseline(result.segment.source_text);
+      setSourceDirty(false);
+      setSourceSaveState("idle");
+      setSourceSelection({ start: 0, end: 0 });
+      setTranslation(segmentTranslation(result.segment));
+      setDraftDirty(false);
+      setSaveState("idle");
+      setStructureAction(null);
+      setSourceEditing(false);
+      await refreshQuality();
+      notify(structureAction.kind === "split"
+        ? `已拆为独立段；全书现有 ${result.segment_count} 段。`
+        : result.translation_needs_review
+          ? `已合并段落；全书现有 ${result.segment_count} 段，合并译文已标记为待复核。`
+          : `已合并段落；全书现有 ${result.segment_count} 段。`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "段落结构修改失败");
+    } finally {
+      setStructureBusy(false);
+    }
+  }
+
   async function navigateTo(target: number) {
     if (!overview || target < 0 || target >= overview.segment_count) return;
+    if (sourceDirty) {
+      notify("原文有未保存修改，请先保存或取消编辑。");
+      return;
+    }
     try { await saveDraftImmediately(); }
     catch { notify("当前译文保存失败，已停留在本段。"); return; }
     if (!page || target < page.offset || target >= page.offset + page.items.length) await loadPageAt(overview.document.id, target);
@@ -903,7 +1117,34 @@ export default function Home() {
         </section>}
 
         {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
-          <div className={`editor-columns ${view === "target" ? "target-only" : ""}`}>{view === "split" && <article className={`source-pane content-${currentSegment.kind}`}><div className="column-label"><span>原文 · {overview?.project.source_lang.toUpperCase()}</span><button onClick={() => navigator.clipboard?.writeText(currentSegment.source_text).then(() => notify("原文已复制"))}>复制</button></div>{currentSegment.kind === "heading" ? <h2>{currentSegment.source_text}</h2> : <p>{currentSegment.source_text}</p>}<div className="context-note"><Mark>¶</Mark><div><strong>结构位置</strong><span>{currentSegment.heading_path || "正文"}</span></div></div></article>}<article className="translation-pane"><div className="column-label"><span>译文 · {overview?.project.target_lang}</span><div className={`draft-state ${currentStatus === "human_confirmed" ? "confirmed" : ""}`}><i />{statusLabel(currentSegment)}</div></div><textarea aria-label="译文编辑器" readOnly={draftingCurrentSegment} aria-busy={draftingCurrentSegment} value={translation} onChange={(event) => { setTranslation(event.target.value); setDraftDirty(true); setSaveState("idle"); }} placeholder={currentStatus === "source" ? "等待模型草译，或直接输入人工译文…" : "编辑译文…"} spellCheck={false} /><div className="editor-footer"><span>{translation.length} 字 · {draftingCurrentSegment ? "正在草译本段…" : saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : draftDirty ? "待保存" : "已保存"}</span><div className="editor-footer-actions"><button className="confirm-button" onClick={() => void confirmCurrent()} disabled={!translation.trim() || saveState === "saving"}>{currentStatus === "human_confirmed" ? "更新确认" : "确认译文"}<kbd>⌘↵</kbd></button></div></div></article></div></>}</section>}
+          <div className={`editor-columns ${view === "target" ? "target-only" : ""}`}>
+            {view === "split" && <article className={`source-pane content-${currentSegment.kind} ${sourceEditing ? "is-editing" : "is-readonly"}`}>
+              <div className="column-label"><label>原文 · <select aria-label="原文语言" value={overview?.project.source_lang || ""} onChange={(event) => void updateSourceLanguage(event.target.value)}><option value="en">EN</option><option value="fr">FR</option><option value="de">DE</option><option value="ja">JA</option><option value="zh-CN">ZH-CN</option></select></label><div className="source-label-actions">{sourceEditing ? <button onClick={cancelSourceEditing}>取消编辑</button> : <button className="source-edit-trigger" onClick={startSourceEditing}>编辑原文</button>}<button onClick={() => navigator.clipboard?.writeText(sourceDraft).then(() => notify("原文已复制"))}>复制</button></div></div>
+              {currentSegment.kind === "heading"
+                ? <input className="source-heading-editor" aria-label="原文标题" readOnly={!sourceEditing} value={sourceDraft} onChange={(event) => { setSourceDraft(event.target.value); setSourceDirty(true); setSourceSaveState("idle"); }} spellCheck={false} />
+                : <textarea ref={sourceEditor} className="source-editor" aria-label={sourceEditing ? "原文编辑器" : "原文，只读；可选中文字后拆分"} readOnly={!sourceEditing} value={sourceDraft} onSelect={(event) => setSourceSelection({ start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd })} onChange={(event) => { setSourceDraft(event.target.value); setSourceDirty(true); setSourceSaveState("idle"); }} placeholder="点击“编辑原文”后修改；空行表示段落边界…" spellCheck={false} />}
+              <div className="editor-footer source-footer">
+                <span>{sourceDraft.length} 字 · {sourceDraft.trim() ? sourceDraft.trim().split(/\n\s*\n/).length : 0} 块 · {sourceEditing ? sourceSaveState === "saving" ? "正在保存" : sourceSaveState === "error" ? "保存失败" : sourceDirty ? "待保存" : "编辑模式" : "只读保护"}</span>
+                <div className="editor-footer-actions">
+                  {sourceEditing
+                    ? <button className="confirm-button" onClick={() => void saveSource()} disabled={!sourceDirty || !sourceDraft.trim() || sourceSaveState === "saving"}>保存原文</button>
+                    : <>
+                      <button className="structure-button split" onClick={requestSplit} disabled={currentSegment.kind === "heading" || sourceSelection.start === sourceSelection.end || structureLocked}>拆为独立段</button>
+                      <button className="structure-button" onClick={() => requestMerge("previous")} disabled={ordinal === 0 || currentSegment.kind === "heading" || structureLocked}>与上一段合并</button>
+                      <button className="structure-button" onClick={() => requestMerge("next")} disabled={ordinal + 1 >= (overview?.segment_count || 0) || currentSegment.kind === "heading" || structureLocked}>与下一段合并</button>
+                    </>}
+                </div>
+              </div>
+              {!sourceEditing && currentSegment.kind !== "heading" && <div className="source-safety-hint">{sourceSelection.start !== sourceSelection.end ? `已选中 ${sourceDraft.slice(sourceSelection.start, sourceSelection.end).trim().length} 字，可拆为独立段。` : "原文默认锁定；选中文字可拆段，修改内容需先点击“编辑原文”。"}</div>}
+              <div className="context-note"><Mark>¶</Mark><div><strong>结构位置</strong><span>{currentSegment.heading_path || "正文"}</span></div></div>
+            </article>}
+            <article className="translation-pane">
+              <div className="column-label"><span>译文 · {overview?.project.target_lang}</span><div className={`draft-state ${currentStatus === "human_confirmed" ? "confirmed" : ""}`}><i />{statusLabel(currentSegment)}</div></div>
+              <textarea aria-label="译文编辑器" readOnly={draftingCurrentSegment} aria-busy={draftingCurrentSegment} value={translation} onChange={(event) => { setTranslation(event.target.value); setDraftDirty(true); setSaveState("idle"); }} placeholder={currentStatus === "source" ? "等待模型草译，或直接输入人工译文…" : "编辑译文…"} spellCheck={false} />
+              <div className="editor-footer"><span>{translation.length} 字 · {draftingCurrentSegment ? "正在草译本段…" : saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : draftDirty ? "待保存" : "已保存"}</span><div className="editor-footer-actions"><button className="confirm-button" onClick={() => void confirmCurrent()} disabled={!translation.trim() || saveState === "saving"}>{currentStatus === "human_confirmed" ? "更新确认" : "确认译文"}<kbd>⌘↵</kbd></button></div></div>
+            </article>
+          </div></>}
+        </section>}
 
         {panel === "reader" && <section ref={readerView} className="reader-view" aria-label="原书排版阅读模式" tabIndex={-1}>
           <div className="reader-toolbar"><div>
@@ -976,6 +1217,32 @@ export default function Home() {
 
     {searchOpen && <div className="command-overlay"><div className="command-palette search-palette"><form onSubmit={(event) => void performSearch(event)}><Mark>⌕</Mark><input ref={searchInput} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索当前书籍的原文或译文…" /><button type="submit" className="search-submit" disabled={!searchQuery.trim() || searching}>{searching ? "搜索中" : "搜索"}</button><button type="button" className="search-close" aria-label="关闭搜索" onClick={() => setSearchOpen(false)}>×</button></form><div className="command-results">{searching ? <div className="search-message">正在搜索…</div> : searchResults.length ? searchResults.map((item) => <button key={item.id} onClick={() => { setSearchOpen(false); setPanel("translate"); void navigateTo(item.ordinal); }}><span><strong>第 {item.ordinal + 1} 段</strong><small>{item.source_text.slice(0, 120)}</small></span><Mark>↵</Mark></button>) : <div className="search-message">输入关键词，搜索整本书的原文和译文。</div>}</div></div></div>}
     {draftPicker && <div className="command-overlay chapter-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !startingTask) setDraftPicker(null); }}><div className="chapter-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="chapter-picker-title"><header><div><span>草译范围</span><h2 id="chapter-picker-title">选择要翻译的篇章</h2><p>《{draftPicker.document.title}》· 可多选，任务只处理勾选范围。</p></div><button aria-label="关闭篇章选择" onClick={() => setDraftPicker(null)} disabled={startingTask}>×</button></header><div className="chapter-picker-tools"><strong>目录 · {draftPicker.overview.chapters.length} 节</strong><div><button onClick={() => setSelectedChapterStarts([...new Set(draftPicker.overview.chapters.map((chapter) => chapter.start_ordinal))])}>全选</button><button onClick={() => setSelectedChapterStarts([])}>清空</button></div></div><div className="chapter-picker-list" role="group" aria-label="选择草译篇章">{draftPicker.overview.chapters.map((chapter, index) => { const checked = selectedChapterStarts.includes(chapter.start_ordinal); return <label className={checked ? "selected" : ""} key={chapter.start_ordinal + "-" + chapter.title}><input type="checkbox" checked={checked} onChange={() => toggleDraftChapter(chapter.start_ordinal)} /><span className="chapter-check" aria-hidden="true">✓</span><span className="chapter-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{chapter.title}</strong><small>{chapter.segment_count} 段 · 已草译 {chapter.translated_count} · 已确认 {chapter.confirmed_count}</small></div></label>; })}</div><footer><span>已选 <strong>{selectedDraftChapters.length}</strong> 篇 · 去重后共 <strong>{selectedDraftSegmentCount}</strong> 段</span><div><button onClick={() => setDraftPicker(null)} disabled={startingTask}>取消</button><button className="accent" disabled={!selectedDraftRanges.length || startingTask} onClick={() => void runWholeBook(draftPicker.document, selectedDraftRanges)}>{startingTask ? "正在启动…" : "开始草译所选篇章"}</button></div></footer></div></div>}
+    {sourceSaveWarning && <div className="command-overlay delete-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && sourceSaveState !== "saving") setSourceSaveWarning(false); }}>
+      <div className="structure-dialog" role="dialog" aria-modal="true" aria-labelledby="source-save-title">
+        <div className="structure-mark danger">!</div>
+        <h2 id="source-save-title">修改原文后重新复核译文？</h2>
+        <p>本段已有译文。保存修改不会删除译文内容，但会撤销“人工已确认”状态、清除旧质量结果，并把译文标记为待复核。</p>
+        <div>
+          <button onClick={() => setSourceSaveWarning(false)} disabled={sourceSaveState === "saving"}>返回编辑</button>
+          <button className="danger" onClick={() => void saveSource(true)} disabled={sourceSaveState === "saving"}>{sourceSaveState === "saving" ? "正在保存…" : "保存并标记待复核"}</button>
+        </div>
+      </div>
+    </div>}
+    {structureAction && <div className="command-overlay delete-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !structureBusy) setStructureAction(null); }}>
+      <div className="structure-dialog" role="dialog" aria-modal="true" aria-labelledby="structure-title">
+        <div className={`structure-mark ${structureAction.kind === "split" && structureAction.resetsTranslation ? "danger" : ""}`}>{structureAction.kind === "split" ? "¶" : "⇆"}</div>
+        <h2 id="structure-title">{structureAction.kind === "split" ? "把所选文字拆为独立段？" : `与${structureAction.direction === "previous" ? "上一段" : "下一段"}合并？`}</h2>
+        {structureAction.kind === "split" ? <>
+          <p>{structureAction.resetsTranslation ? "本段已有译文，系统无法可靠地把整段译文分配给拆出的新段。确认后，本段现有译文及确认记录会被清空。" : "所选文字会成为可单独草译、编辑和确认的新段；前后的文字会保留为各自段落。"}</p>
+          <blockquote>{structureAction.preview.slice(0, 180)}{structureAction.preview.length > 180 ? "…" : ""}</blockquote>
+          {overview?.document.source_format === "epub" && <small>为保护 EPUB 回写结构，只能选择一个或多个完整的原始文本块。</small>}
+        </> : <p>第 {Math.min(currentSegment?.ordinal ?? 0, structureAction.neighborOrdinal) + 1} 段与第 {Math.max(currentSegment?.ordinal ?? 0, structureAction.neighborOrdinal) + 1} 段将合为一段。两段译文会按原顺序保留，但人工确认状态会撤销，需重新复核。</p>}
+        <div>
+          <button onClick={() => setStructureAction(null)} disabled={structureBusy}>取消</button>
+          <button className={structureAction.kind === "split" && structureAction.resetsTranslation ? "danger" : "accent"} onClick={() => void performStructureAction()} disabled={structureBusy}>{structureBusy ? "正在处理…" : structureAction.kind === "split" ? structureAction.resetsTranslation ? "清空译文并拆分" : "确认拆分" : "确认合并"}</button>
+        </div>
+      </div>
+    </div>}
     {pendingDelete && <div className="command-overlay delete-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !deleting) setPendingDelete(null); }}><div className="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title"><div className="delete-mark">!</div><h2 id="delete-title">从书库删除《{pendingDelete.title}》？</h2><p>这会同时删除该书的原文、译文、任务记录与质量检查结果。此操作无法撤销。</p><div><button onClick={() => setPendingDelete(null)} disabled={deleting}>取消</button><button className="danger" onClick={() => void deleteSelectedDocument()} disabled={deleting}>{deleting ? "正在删除…" : "确认删除"}</button></div></div></div>}
     {bookSettingsEditor && settings && <div className="command-overlay book-settings-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !savingBookSettings) setBookSettingsEditor(null); }}>
       <div className="book-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="book-settings-title">

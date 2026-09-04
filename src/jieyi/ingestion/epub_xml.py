@@ -6,16 +6,50 @@ from xml.etree import ElementTree as ET
 from xml.parsers import expat
 
 _NAMED_ENTITY = re.compile(rb"&([A-Za-z][A-Za-z0-9]+);")
-# EPUB 2 NCX files commonly include this identifier. It is recognized, never fetched.
-_NCX_DOCTYPE = (
-    "ncx",
-    "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd",
-    "-//NISO//DTD ncx 2005-1//EN",
-)
+# Legacy EPUB 2 documents commonly declare one of these standard external
+# doctypes. The identifiers are allowlisted exactly; the referenced resources
+# are never fetched or parsed.
+_STANDARD_EXTERNAL_DOCTYPES = {
+    (
+        "ncx",
+        "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd",
+        "-//NISO//DTD ncx 2005-1//EN",
+    ),
+    (
+        "html",
+        "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd",
+        "-//W3C//DTD XHTML 1.1//EN",
+    ),
+    (
+        "html",
+        "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd",
+        "-//W3C//DTD XHTML 1.0 Strict//EN",
+    ),
+    (
+        "html",
+        "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd",
+        "-//W3C//DTD XHTML 1.0 Transitional//EN",
+    ),
+    (
+        "html",
+        "http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd",
+        "-//W3C//DTD XHTML 1.0 Frameset//EN",
+    ),
+    (
+        "html",
+        "http://www.w3.org/TR/xhtml-basic/xhtml-basic10.dtd",
+        "-//W3C//DTD XHTML Basic 1.0//EN",
+    ),
+    (
+        "html",
+        "http://www.w3.org/TR/xhtml-basic/xhtml-basic11.dtd",
+        "-//W3C//DTD XHTML Basic 1.1//EN",
+    ),
+}
 
 
 def parse_xml_resource(data: bytes, label: str) -> ET.Element:
-    """Accept plain doctypes and the standard NCX identifier without evaluating DTDs."""
+    """Accept standard EPUB doctypes without fetching or evaluating their DTDs."""
     def replace_html_entity(match: re.Match[bytes]) -> bytes:
         name = match.group(1).decode("ascii")
         if name in {"amp", "apos", "gt", "lt", "quot"}:
@@ -38,8 +72,10 @@ def parse_xml_resource(data: bytes, label: str) -> ET.Element:
         if has_internal_subset:
             reject_declaration()
         if (system_id is not None or public_id is not None) and (
-            name, system_id, public_id
-        ) != _NCX_DOCTYPE:
+            name,
+            system_id,
+            public_id,
+        ) not in _STANDARD_EXTERNAL_DOCTYPES:
             reject_declaration()
 
     # Use XML events rather than a byte search: UTF-16 must not bypass this check,

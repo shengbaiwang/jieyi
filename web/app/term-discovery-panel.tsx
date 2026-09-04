@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import styles from "./term-discovery.module.css";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
+const CURRENT_DISCOVERY_ALGORITHM = "multilingual-family+c-value+strict-local-review-v3.2";
 
 type Evidence = {
   id: string; ordinal: number; source_form: string; quote: string; heading_path: string;
@@ -24,7 +25,7 @@ type Candidate = {
 type Run = {
   id: string; status: string; provider: string; model: string; error: string;
   prompt_tokens: number; completion_tokens: number; cost_usd: number;
-  config: { max_model_candidates: number };
+  config: { max_candidates?: number; max_model_candidates: number; algorithm_version?: string };
   coverage: {
     segments_total?: number; segments_scanned?: number; characters_scanned?: number;
     retained_candidates?: number; model_calls?: number; invalid_model_proposals?: number;
@@ -122,11 +123,16 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
     return () => window.clearInterval(timer);
   }, [running, load]);
 
-  const scanSaved = Boolean(displayRun && (displayRun.coverage.scan_completed || (
-    (displayRun.coverage.segments_scanned || 0) > 0
-    && displayRun.coverage.segments_scanned === displayRun.coverage.segments_total
-  )));
-  const reviewLimit = displayRun?.coverage.review_limit || displayRun?.config?.max_model_candidates || 40;
+  const scanSaved = Boolean(
+    displayRun
+    && displayRun.coverage.algorithm === CURRENT_DISCOVERY_ALGORITHM
+    && (displayRun.config?.max_candidates || 0) >= 70
+    && (displayRun.coverage.scan_completed || (
+      (displayRun.coverage.segments_scanned || 0) > 0
+      && displayRun.coverage.segments_scanned === displayRun.coverage.segments_total
+    )),
+  );
+  const reviewLimit = displayRun?.coverage.review_limit || displayRun?.config?.max_model_candidates || 70;
   const unresolvedCount = candidates.slice(0, reviewLimit).filter((candidate) =>
     candidate.senses.length > 0 && candidate.senses.every((sense) =>
       sense.ai_recommended == null && sense.status === "pending" && !sense.human_reviewed
@@ -151,6 +157,14 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
     ),
     [candidates],
   );
+  const approved = useMemo(
+    () => candidates.reduce(
+      (total, item) => total + item.senses.filter(
+        (sense) => sense.status === "approved").length,
+      0,
+    ),
+    [candidates],
+  );
 
   async function discover() {
     setDiscovering(true);
@@ -168,8 +182,8 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
           method: "POST",
           body: JSON.stringify({
             provider: useModel ? provider : "", model: useModel ? model : "",
-            compute_mode: computeMode || "balanced", max_candidates: 40,
-            max_model_candidates: useModel ? 40 : 0,
+            compute_mode: computeMode || "balanced", max_candidates: 70,
+            max_model_candidates: useModel ? 70 : 0,
           }),
         });
       await load();
@@ -259,7 +273,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
 
   return <section className={styles.panel} aria-label="候选术语发现与审核">
     <div className={styles.heading}>
-      <div><span>全书概念发现</span><h2>候选术语</h2><p>扫描覆盖全文；候选由人工选择驳回、参考或固定。参考译法可灵活采用，固定译法要求统一。</p><p>{provider && model ? `术语发现模型：${model} · ${computeModeLabel[computeMode] || "均衡"}` : "未配置术语发现模型，本次仅做本地扫描。"} 可在“模型配置”中单独设置。</p></div>
+      <div><span>全书概念发现</span><h2>术语候选</h2><p>候选不等于术语：系统先做精筛，模型建议仍须人工批准。参考译法可灵活采用，固定译法要求统一。</p><p>{provider && model ? `术语发现模型：${model} · ${computeModeLabel[computeMode] || "均衡"}` : "未配置术语发现模型，本次仅做本地扫描。"} 可在“模型配置”中单独设置。</p></div>
       <button type="button" onClick={() => void discover()} disabled={running || (scanSaved && (!unresolvedCount || !canReview))}>{running ? (scanSaved ? "模型复核中…" : "扫描中…") : scanSaved ? (unresolvedCount ? `继续复核 ${unresolvedCount} 项` : "复核已完成") : "扫描全书并生成候选"}</button>
     </div>
     {running && <div className={styles.running}>{scanSaved ? "正在复核未完成的候选；结果逐批保存，页面会自动更新。" : "正在扫描全文并保存候选；页面会自动更新。"}</div>}
@@ -267,9 +281,9 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
     {displayRun && <div className={styles.metrics}>
       <div><strong>{displayRun.coverage.segments_scanned || 0}/{displayRun.coverage.segments_total || 0}</strong><span>段落已扫描</span></div>
       <div><strong>{formatCount(displayRun.coverage.characters_scanned)}</strong><span>原文字符</span></div>
-      <div><strong>{displayRun.coverage.model_calls ? displayRun.coverage.model_kept || 0 : displayRun.coverage.retained_candidates || 0}</strong><span>{displayRun.coverage.model_calls ? "模型建议候选" : "本地复核池"}</span></div>
+      <div><strong>{displayRun.coverage.model_calls ? displayRun.coverage.model_kept || 0 : displayRun.coverage.retained_candidates || 0}</strong><span>{displayRun.coverage.model_calls ? "模型建议保留" : "待甄别候选（尚非术语）"}</span></div>
       <div><strong>{pending}</strong><span>待人工审核</span></div>
-      <div><strong>{formatCount(displayRun.prompt_tokens + displayRun.completion_tokens)}</strong><span>模型 token</span></div>
+      <div><strong>{approved}</strong><span>已批准术语</span></div>
     </div>}
     {displayRun?.error && <div className={styles.modelError}>{scanSaved ? "全文候选与已完成的判断均已保存。" : "扫描未完成："}{displayRun.error.startsWith("Model review incomplete after retry:") ? `还有 ${unresolvedCount} 项未取得有效模型判断，可继续复核。` : displayRun.error}</div>}
     {omittedCandidates.length > 0 && <div className={styles.omittedBar}>
@@ -278,9 +292,9 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
     </div>}
     <div className={styles.list}>
       {visibleCandidates.map((candidate) => <article className={styles.card} key={candidate.id}>
-        <header><div><span>{candidateTypeLabel[candidate.candidate_type] || "未分类"} · 风险 {Math.round(candidate.risk_score * 100)} · 排名 {candidate.rank}</span><h3>{candidate.canonical_form}</h3>{candidate.forms.length > 1 && <small>原文词形：{candidate.forms.join(" · ")}</small>}</div><div className={styles.frequency}><strong>{candidate.frequency}</strong><span>次 / {candidate.segment_frequency} 段</span></div></header>
+        <header><div><span>{candidateTypeLabel[candidate.candidate_type] || "未分类"} · 候选优先度 {Math.round(candidate.risk_score * 100)} · 序位 {candidate.rank}</span><h3>{candidate.canonical_form}</h3>{candidate.forms.length > 1 && <small>原文词形：{candidate.forms.join(" · ")}</small>}</div><div className={styles.frequency}><strong>{candidate.frequency}</strong><span>次 / {candidate.segment_frequency} 段</span></div></header>
         {candidate.senses.map((sense) => <div className={styles.sense} key={sense.id}>
-          <div className={[styles.senseMeta].join(" ")}><span className={[styles.status, styles[sense.status]].join(" ")}>{sense.status === "pending" ? "待审核" : sense.status === "approved" ? (sense.approved_enforcement === "reference" ? "参考" : sense.approved_enforcement === "global" ? "固定" : "按义项采用") : "已驳回"}</span><small>{sense.ai_recommended === false ? "模型建议略过 · 置信度 " + Math.round(sense.confidence * 100) + "%" : sense.human_reviewed ? "人工已处理" : sense.proposer.startsWith("deterministic") ? "本地统计召回 · 尚未模型复核" : "模型建议保留 · 置信度 " + Math.round(sense.confidence * 100) + "%"}</small></div>
+          <div className={[styles.senseMeta].join(" ")}><span className={[styles.status, styles[sense.status]].join(" ")}>{sense.status === "pending" ? "尚非术语 · 待审核" : sense.status === "approved" ? (sense.approved_enforcement === "reference" ? "参考" : sense.approved_enforcement === "global" ? "固定" : "按义项采用") : "已驳回"}</span><small>{sense.ai_recommended === false ? "模型建议略过 · 置信度 " + Math.round(sense.confidence * 100) + "%" : sense.human_reviewed ? "人工已处理" : sense.proposer.startsWith("deterministic") ? "本地统计召回 · 尚未模型复核" : "模型建议保留 · 置信度 " + Math.round(sense.confidence * 100) + "%"}</small></div>
           {sense.concept_definition && <p>{sense.concept_definition}</p>}
           <div className={styles.editors}><label><span>拟定译法</span><input value={targets[sense.id] ?? sense.proposed_target} onChange={(event) => setTargets((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="人工确认或修改译法" /></label><label><span>义项</span><input value={senses[sense.id] ?? sense.sense} onChange={(event) => setSenses((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="说明该概念在本书中的义项" /></label><label><span>语境关键词</span><input value={contexts[sense.id] ?? sense.context_keywords?.join("，") ?? ""} onChange={(event) => setContexts((items) => ({ ...items, [sense.id]: event.target.value }))} disabled={sense.status !== "pending"} placeholder="逗号分隔，用于同形词消歧" /></label></div>
           {sense.rationale && <p className={styles.rationale}>{sense.rationale}</p>}
@@ -294,7 +308,7 @@ export function TermDiscoveryPanel({ documentId, provider, model, computeMode, o
         </div>)}
       </article>)}
     </div>
-    {!displayRun && !activeRun && <div className={styles.empty}>尚未扫描。系统会读取每一个原文段落，先在本地进行高召回筛选，再把少量高风险候选交给模型复核。</div>}
+    {!displayRun && !activeRun && <div className={styles.empty}>尚未扫描。系统会覆盖全文，但只把通过多重语言与统计信号的精简候选交给模型复核；候选经人工批准后才成为术语。</div>}
     {displayRun?.status === "completed" && candidates.length === 0 && <div className={styles.empty}>本次扫描没有发现需要进入人工审核的关键术语候选。</div>}
     {displayRun?.status === "completed" && candidates.length > 0 && visibleCandidates.length === 0 && !showOmitted && <div className={styles.empty}>模型已逐项复核本地召回项，本次没有建议进入人工审核的术语；略过记录仍可展开检查。</div>}
   </section>;

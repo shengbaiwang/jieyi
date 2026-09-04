@@ -35,14 +35,33 @@ class TermRepository:
                     same_source = coverage.get("source_hash", run["coverage"]["source_hash"]) == (
                         run["coverage"]["source_hash"]
                     )
-                    same_scan = all(existing["config"].get(key) == run["config"].get(key) for key in (
-                        "max_candidates", "max_evidence_per_candidate", "min_score",
-                    ))
+                    same_scan = all(
+                        existing["config"].get(key) == run["config"].get(key)
+                        for key in (
+                            "algorithm_version",
+                            "max_candidates",
+                            "max_evidence_per_candidate",
+                            "min_score",
+                        )
+                    )
+                    existing_review_enabled = bool(
+                        existing["provider"]
+                        and existing["config"].get("max_model_candidates")
+                    )
+                    requested_review_enabled = bool(
+                        run["provider"] and run["config"].get("max_model_candidates")
+                    )
+                    same_review_mode = existing_review_enabled == requested_review_enabled
                     saved_scan = coverage.get("scan_completed") or (
                         coverage.get("segments_scanned", 0) > 0
                         and coverage.get("segments_scanned") == coverage.get("segments_total")
                     )
-                    if same_source and same_scan and (saved_scan or existing["status"] == "running"):
+                    if (
+                        same_source
+                        and same_scan
+                        and same_review_mode
+                        and (saved_scan or existing["status"] == "running")
+                    ):
                         return existing
             connection.execute(
                 """INSERT INTO term_discovery_runs

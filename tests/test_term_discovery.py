@@ -33,6 +33,12 @@ class GroundedProvider:
                         {
                             "candidate_id": card["candidate_id"],
                             "keep": True,
+                            "criteria": {
+                                "stable_concept": True,
+                                "book_significant": True,
+                                "consistency_needed": True,
+                                "specialized_usage": True,
+                            },
                             "sense_key": "capacity",
                             "sense": "capacity to act",
                             "concept_definition": "A capacity described in the evidence.",
@@ -54,6 +60,35 @@ class GroundedProvider:
             ),
             prompt_tokens=100,
             completion_tokens=40,
+        )
+
+
+class WeakKeepProvider:
+    async def complete(self, messages, model, **_kwargs):
+        del model
+        card = json.loads(messages[-1]["content"])["candidates"][0]
+        return TranslationResult(
+            text=json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "candidate_id": card["candidate_id"],
+                            "keep": True,
+                            "criteria": {
+                                "stable_concept": True,
+                                "book_significant": True,
+                                "consistency_needed": False,
+                                "specialized_usage": True,
+                            },
+                            "target": "弱建议",
+                            "rationale": "Topical, but no stable rendering is required.",
+                            "confidence": 0.95,
+                            "evidence_ids": [card["evidence"][0]["evidence_id"]],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
         )
 
 
@@ -167,9 +202,187 @@ class TermDiscoveryAlgorithmTests(unittest.IsolatedAsyncioTestCase):
         keys = {candidate["lexeme_key"] for candidate in candidates}
         self.assertEqual(coverage["language_profile"], "fr")
         self.assertLessEqual(len(candidates), coverage["review_queue_ceiling"])
-        self.assertTrue({"saint-sulpice", "terre-plein"} & keys)
+        self.assertFalse({"saint-sulpice", "terre-plein"} & keys)
+        self.assertGreater(coverage["local_precision_rejections"], 0)
         self.assertTrue({"de", "des", "le", "un"}.isdisjoint(keys))
         self.assertFalse(any("," in candidate["canonical_form"] for candidate in candidates))
+
+    def test_german_compounds_concept_pairs_and_inflections_survive(self):
+        paragraphs = [
+            ("Die Aura bezeichnet eine besondere Nähe. Die technische "
+            "Reproduzierbarkeit verändert das Kunstwerk. Kultwert und "
+            "Ausstellungswert bilden einen Gegensatz."),
+            ("Die Ästhetisierung der Politik steht der Politisierung der Kunst "
+            "gegenüber. Das Hier und Jetzt bestimmt die Echtheit des Werkes."),
+            ("Das Werk bezeichnet hier das einzelne Objekt. Die Werke bleiben sichtbar. "
+            "Die Masse bezeichnet hier das Kollektiv, die Massen betrachten die Werke. "
+            "Das Maß bestimmt die Breite. Eine Seite bezeichnet hier eine paginierte "
+            "Fläche; alle Seiten tragen eine Nummer. Seit heute gilt das."),
+        ]
+        candidates, coverage = mine_term_candidates(
+            segments_from_text("doc_de", "\n\n".join(paragraphs * 5), "txt"),
+            DiscoveryConfig(max_candidates=160, min_score=0.1),
+            source_lang="de",
+        )
+        keys = {candidate["lexeme_key"] for candidate in candidates}
+        self.assertEqual(
+            coverage["algorithm"],
+            "multilingual-family+c-value+strict-local-review-v3.2",
+        )
+        self.assertTrue(
+            {
+                "aura",
+                "technische reproduzierbarkeit",
+                "ästhetisierung der politik",
+                "politisierung der kunst",
+                "hier und jetzt",
+                "kultwert und ausstellungswert",
+            }.issubset(keys)
+        )
+        work = next(
+            candidate for candidate in candidates if candidate["canonical_form"] == "Werk"
+        )
+        self.assertEqual(set(work["forms"]), {"Werk", "Werkes", "Werke"})
+        observed_forms = {
+            form.lower()
+            for candidate in candidates
+            for form in candidate["forms"]
+        }
+        self.assertNotIn("seit", observed_forms)
+
+    def test_french_inflection_families_do_not_merge_different_lexemes(self):
+        paragraphs = [
+            ("Le lieu est défini comme un espace vécu. Les lieux gardent une "
+            "présence réelle."),
+            ("Une lieue désigne une ancienne distance. Plusieurs lieues séparent "
+            "les villes."),
+            ("La réalité signifie ici une expérience du monde. La beauté demeure "
+            "dans la peinture."),
+        ]
+        candidates, coverage = mine_term_candidates(
+            segments_from_text("doc_fr_inflections", "\n\n".join(paragraphs * 5), "txt"),
+            DiscoveryConfig(max_candidates=160, min_score=0.1),
+            source_lang="fr",
+        )
+        by_canonical = {
+            candidate["canonical_form"].lower(): candidate for candidate in candidates
+        }
+        self.assertEqual(coverage["language_profile"], "fr")
+        self.assertEqual(set(by_canonical["lieu"]["forms"]), {"lieu", "lieux"})
+        self.assertEqual(set(by_canonical["lieue"]["forms"]), {"lieue", "lieues"})
+        self.assertIn("réalité", by_canonical)
+        self.assertNotIn("beauté", by_canonical)
+        self.assertTrue({"avait", "avais", "bien"}.isdisjoint(by_canonical))
+
+    def test_english_abstract_nouns_and_multiword_concepts_share_the_review_pool(self):
+        paragraphs = [
+            ("Civilization and inequality shape the state. Social science studies "
+            "agriculture, hierarchy, freedom, democracy, and slavery."),
+            ("The indigenous critique is defined as a conceptual challenge. "
+            "Private property differs from shared property."),
+            "Hunter-gatherers discuss egalitarianism and hunter-gatherer freedom.",
+        ]
+        candidates, coverage = mine_term_candidates(
+            segments_from_text("doc_en_concepts", "\n\n".join(paragraphs * 5), "txt"),
+            DiscoveryConfig(max_candidates=160, min_score=0.1),
+            source_lang="en",
+        )
+        surfaces = {
+            form.lower()
+            for candidate in candidates
+            for form in candidate["forms"]
+        }
+        self.assertTrue(
+            {
+                "indigenous critique",
+                "egalitarianism and hunter-gatherer",
+                "civilization and inequality",
+            }.issubset(surfaces)
+        )
+        self.assertNotIn("state", surfaces)
+        self.assertGreater(coverage["local_precision_rejections"], 0)
+        self.assertLess(coverage["retained_candidates"], coverage["ranked_candidates"])
+
+    def test_romance_language_definition_cues_are_language_aware(self):
+        examples = {
+            "es": "Autonomía significa capacidad política.",
+            "it": "Autonomia significa capacità politica.",
+            "pt": "Autonomia significa capacidade política.",
+        }
+        for language, sentence in examples.items():
+            with self.subTest(language=language):
+                candidates, coverage = mine_term_candidates(
+                    segments_from_text(
+                        f"doc_{language}",
+                        "\n\n".join([sentence] * 4),
+                        "txt",
+                    ),
+                    DiscoveryConfig(max_candidates=100, min_score=0.1),
+                    source_lang=language,
+                )
+                autonomy = next(
+                    candidate
+                    for candidate in candidates
+                    if candidate["canonical_form"].lower()
+                    in {"autonomía", "autonomia"}
+                )
+                self.assertEqual(coverage["language_profile"], language)
+                self.assertIn("definition_cue", autonomy["extraction_methods"])
+
+    def test_adaptive_budget_depends_on_corpus_size_not_paragraph_count(self):
+        sentence = "Ontology transforms classification."
+        one_paragraph = segments_from_text(
+            "doc_one_paragraph",
+            " ".join([sentence] * 80),
+            "txt",
+        )
+        many_paragraphs = segments_from_text(
+            "doc_many_paragraphs",
+            "\n\n".join([sentence] * 80),
+            "txt",
+        )
+        _, one_coverage = mine_term_candidates(
+            one_paragraph,
+            DiscoveryConfig(max_candidates=500, min_score=0.1),
+            source_lang="en",
+        )
+        _, many_coverage = mine_term_candidates(
+            many_paragraphs,
+            DiscoveryConfig(max_candidates=500, min_score=0.1),
+            source_lang="en",
+        )
+        self.assertEqual(one_coverage["corpus_units"], many_coverage["corpus_units"])
+        self.assertEqual(
+            one_coverage["review_queue_ceiling"],
+            many_coverage["review_queue_ceiling"],
+        )
+
+    async def test_model_keep_requires_all_precision_criteria(self):
+        candidates, _ = mine_term_candidates(
+            self.segments,
+            DiscoveryConfig(max_candidates=100, min_score=0.1),
+        )
+        enriched, usage = await enrich_candidates(
+            candidates,
+            provider=WeakKeepProvider(),
+            model=ModelSpec(provider="fake", model="weak"),
+            source_lang="en",
+            target_lang="zh-CN",
+            config=DiscoveryConfig(
+                max_candidates=100,
+                max_model_candidates=1,
+                model_batch_size=1,
+                min_score=0.1,
+            ),
+        )
+        sense = enriched[0]["senses"][0]
+        self.assertEqual(usage["model_decisions"], 1)
+        self.assertEqual(usage["model_kept"], 0)
+        self.assertEqual(usage["model_omitted"], 1)
+        self.assertEqual(usage["strict_keep_demotions"], 1)
+        self.assertIn("consistency_needed", sense["rationale"])
+        self.assertIs(sense["ai_recommended"], False)
+        self.assertEqual(sense["proposed_target"], "")
 
     async def test_model_retries_only_missing_candidate_decisions(self):
         retry_segments = segments_from_text(
@@ -281,6 +494,51 @@ class TermDiscoveryApiTests(unittest.TestCase):
         self.assertEqual(interrupted["status"], "failed")
         self.assertIn("restart", interrupted["error"])
         self.assertTrue(interrupted["completed_at"])
+
+    def test_saved_scan_from_old_algorithm_is_not_reused(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "Versions", "source_lang": "en", "target_lang": "zh-CN"},
+        ).json()
+        document = self.client.post(
+            f"/projects/{project['id']}/documents",
+            json={
+                "title": "Versioned scan",
+                "text": "Ontology is defined as a conceptual system.",
+                "source_format": "txt",
+            },
+        ).json()
+        store = SQLiteStore(self.database)
+        repository = TermRepository(store)
+        stored_document = store.get_document(document["id"])
+        old_config = DiscoveryConfig(
+            algorithm_version="v2.0",
+            max_model_candidates=0,
+        )
+        old_run = new_discovery_run(
+            document_id=document["id"],
+            fingerprint=discovery_fingerprint(stored_document.source_hash, old_config),
+            config=old_config,
+        )
+        old_run["status"] = "completed"
+        old_run["coverage"] = {
+            "source_hash": stored_document.source_hash,
+            "scan_completed": True,
+            "segments_total": 1,
+            "segments_scanned": 1,
+        }
+        repository.create_run(old_run)
+
+        response = self.client.post(
+            f"/documents/{document['id']}/term-discovery-runs",
+            json={"max_model_candidates": 0},
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertNotEqual(response.json()["id"], old_run["id"])
+        self.assertEqual(
+            response.json()["coverage"]["algorithm"],
+            "multilingual-family+c-value+strict-local-review-v3.2",
+        )
 
     def test_candidate_requires_human_approval_then_checks_existing_translation(self):
         project = self.client.post(

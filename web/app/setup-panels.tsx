@@ -843,6 +843,10 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
           method: "PATCH",
           body: JSON.stringify({ style_guide: styleGuide }),
         });
+        await api<Project>(`/projects/${selectedProjectId}/languages`, {
+          method: "PATCH",
+          body: JSON.stringify({ source_lang: sourceLang, target_lang: targetLang }),
+        });
       }
       const document = file.format === "epub" && file.bytes
         ? await epubApi<{ id: string }>(`/projects/${selectedProjectId}/documents/epub?title=${encodeURIComponent(title)}`, file.bytes)

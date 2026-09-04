@@ -28,6 +28,13 @@ def reply(cards, **overrides):
     return TranslationResult(
         text=json.dumps({'proposals': [
             {'candidate_id': c['candidate_id'], 'keep': True, 'target': '术语译法',
+             'criteria': {
+                 'stable_concept': True,
+                 'book_significant': True,
+                 'consistency_needed': True,
+                 'specialized_usage': True,
+             },
+             'confidence': 0.9,
              'evidence_ids': [c['evidence'][0]['evidence_id']], **overrides}
             for c in cards
         ]}),
@@ -81,7 +88,12 @@ class RecoveryAlgorithmTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(d['finish_reason'] == 'length' for d in usage['diagnostics']))
 
     async def test_invalid_decisions_remain_pending_with_bounded_retries(self):
-        for bad_fields in ({'keep': 'false'}, {'target': ''}, {'evidence_ids': ['invented']}):
+        for bad_fields in (
+            {'keep': 'false'},
+            {'target': ''},
+            {'evidence_ids': ['invented']},
+            {'criteria': {}},
+        ):
             with self.subTest(fields=bad_fields):
                 candidates, _ = mine_term_candidates(segments_from_text('doc', SOURCE, 'txt'))
                 provider = RecordingProvider(lambda cards, fields=bad_fields: reply(cards, **fields))
@@ -143,7 +155,7 @@ class RecoveryApiTests(unittest.TestCase):
         partial = self.start()
         self.assertEqual(partial['status'], 'partial')
         self.assertEqual(partial['coverage']['model_decisions'], 2)
-        self.assertEqual(partial['coverage']['missing_model_decisions'], 6)
+        self.assertEqual(partial['coverage']['missing_model_decisions'], 4)
         self.assertEqual(partial['prompt_tokens'], 100)
         before = self.candidates()
         completed_ids = {c['id'] for c in before if c['senses'][0]['ai_recommended'] is not None}
@@ -153,12 +165,12 @@ class RecoveryApiTests(unittest.TestCase):
             finished = self.retry(partial, model='model-b', provider='recovery')
             self.assertEqual(finished['status'], 'completed')
             self.assertEqual(finished['coverage']['missing_model_decisions'], 0)
-            self.assertEqual(finished['prompt_tokens'], 400)
-            self.assertEqual(finished['completion_tokens'], 160)
-            self.assertEqual(finished['reasoning_tokens'], 40)
-            self.assertAlmostEqual(finished['cost_usd'], 0.04)
-            self.assertEqual(finished['coverage']['model_calls'], 5)
-            self.assertEqual(len(self.provider.calls), 3)
+            self.assertEqual(finished['prompt_tokens'], 300)
+            self.assertEqual(finished['completion_tokens'], 120)
+            self.assertEqual(finished['reasoning_tokens'], 30)
+            self.assertAlmostEqual(finished['cost_usd'], 0.03)
+            self.assertEqual(finished['coverage']['model_calls'], 4)
+            self.assertEqual(len(self.provider.calls), 2)
             self.assertTrue(completed_ids.isdisjoint(i for c in self.provider.calls for i in c['ids']))
             self.assertTrue(all(c['model'] == 'model-b' for c in self.provider.calls))
             after = self.candidates()
@@ -168,7 +180,7 @@ class RecoveryApiTests(unittest.TestCase):
                              [c['senses'] for c in after if c['id'] in completed_ids])
             again = self.retry(finished)
             self.assertEqual(again['prompt_tokens'], finished['prompt_tokens'])
-            self.assertEqual(len(self.provider.calls), 3)
+            self.assertEqual(len(self.provider.calls), 2)
             # Translation/model changes must not trigger a new full scan.
             segment = self.client.get(self.base + '/segments').json()[0]
             self.client.patch(f"/segments/{segment['id']}/confirm", json={'translation': '已确认译文'})
@@ -179,7 +191,7 @@ class RecoveryApiTests(unittest.TestCase):
     def test_human_edits_approvals_and_rejections_survive_resume(self):
         local = self.start(provider='', model='')
         candidates = self.candidates()
-        self.assertGreaterEqual(len(candidates), 8)
+        self.assertGreaterEqual(len(candidates), 6)
         protected_ids = {c['id'] for c in candidates[:3]}
         for index, c in enumerate(candidates[:3]):
             sense_id = c['senses'][0]['id']
@@ -259,7 +271,7 @@ class RecoveryApiTests(unittest.TestCase):
             finished = self.retry(partial)
         self.assertEqual(finished['status'], 'completed')
         self.assertEqual(finished['error'], '')
-        self.assertEqual(len(self.provider.calls), 3)
+        self.assertEqual(len(self.provider.calls), 2)
         self.assertEqual([c['id'] for c in self.candidates()], [c['id'] for c in before])
         self.assertEqual([c['senses'] for c in self.candidates()[:2]], [c['senses'] for c in before[:2]])
 

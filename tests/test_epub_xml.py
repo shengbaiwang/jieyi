@@ -22,11 +22,43 @@ class EpubXmlTests(unittest.TestCase):
         root = parse_xml_resource(data, "chapter.xhtml")
         self.assertEqual(root.find("body").text, '<!ENTITY example "text">')
 
+    def test_accepts_standard_legacy_epub_xhtml_doctypes_without_loading_them(self):
+        doctypes = (
+            (
+                '-//W3C//DTD XHTML 1.1//EN',
+                'http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd',
+            ),
+            (
+                '-//W3C//DTD XHTML 1.0 Strict//EN',
+                'http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd',
+            ),
+            (
+                '-//W3C//DTD XHTML 1.0 Transitional//EN',
+                'http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd',
+            ),
+            (
+                '-//W3C//DTD XHTML Basic 1.1//EN',
+                'http://www.w3.org/TR/xhtml-basic/xhtml-basic11.dtd',
+            ),
+        )
+        for public_id, system_id in doctypes:
+            with self.subTest(public_id=public_id):
+                data = (
+                    f'<!DOCTYPE html PUBLIC "{public_id}" "{system_id}">'
+                    '<html><body>Legacy EPUB</body></html>'
+                ).encode()
+                root = parse_xml_resource(data, "chapter.xhtml")
+                self.assertEqual(root.find("body").text, "Legacy EPUB")
+
     def test_rejects_subsets_entities_and_untrusted_external_identifiers(self):
         declarations = (
             '<!DOCTYPE html SYSTEM "file:///unused.dtd">',
             '<!DOCTYPE html SYSTEM "https://example.invalid/external.dtd">',
             '<!DOCTYPE html PUBLIC "untrusted" "https://example.invalid/external.dtd">',
+            (
+                '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+                '"http://www.w3.org/TR/xhtml11/DTD/not-xhtml11.dtd">'
+            ),
             '<!DOCTYPE html []>',
             '<!DOCTYPE html [<!ENTITY local "expanded">]>',
             '<!DOCTYPE html [<!ENTITY xxe SYSTEM "file:///unused.txt">]>',
