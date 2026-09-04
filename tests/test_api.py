@@ -1,5 +1,7 @@
+import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -142,6 +144,87 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(
             merged_all.json()["segment"]["source_text"], "Alpha\n\nbeta\n\ngamma"
         )
+
+    def test_epub_atom_can_be_split_and_translation_can_be_preserved(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "EPUB split", "source_lang": "en", "target_lang": "zh-CN"},
+        ).json()
+        document = self.client.post(
+            f"/projects/{project['id']}/documents/epub",
+            content=build_epub(),
+            headers={"Content-Type": "application/epub+zip"},
+        ).json()
+        segment = next(
+            item
+            for item in self.client.get(f"/documents/{document['id']}/segments").json()
+            if item["source_text"] == "A cited passage."
+        )
+        self.client.patch(
+            f"/segments/{segment['id']}/confirm",
+            json={"translation": "原有整段译文"},
+        )
+
+        result = self.client.post(
+            f"/segments/{segment['id']}/split",
+            json={
+                "source_text": "A cited passage.",
+                "selection_start": 2,
+                "selection_end": 7,
+                "preserve_translation": True,
+                "selected_as_heading": True,
+            },
+        )
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertTrue(result.json()["translation_preserved"])
+        self.assertTrue(result.json()["translation_needs_review"])
+        self.assertEqual(result.json()["segment"]["source_text"], "cited")
+        self.assertEqual(result.json()["segment"]["kind"], "heading")
+
+        items = self.client.get(f"/documents/{document['id']}/segments").json()
+        parts = [
+            item for item in items
+            if item["source_text"] in {"A", "cited", "passage."}
+        ]
+        self.assertEqual([item["source_text"] for item in parts], ["A", "cited", "passage."])
+        self.assertTrue(all(len(item["source_refs"]) == 1 for item in parts))
+        for item in parts:
+            layout = self.client.get(f"/segments/{item['id']}/source")
+            self.assertEqual(layout.status_code, 200)
+            self.assertEqual(layout.json()["blocks"], [item["source_text"]])
+        heading = result.json()["segment"]
+        renamed = self.client.patch(
+            f"/segments/{heading['id']}/source",
+            json={"source_text": "Cited title"},
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        self.assertEqual(renamed.json()["kind"], "heading")
+        overview = self.client.get(f"/documents/{document['id']}/overview")
+        self.assertEqual(overview.status_code, 200)
+        self.assertIn(
+            "Cited title",
+            [chapter["title"] for chapter in overview.json()["chapters"]],
+        )
+
+
+        preserved = next(item for item in parts if item["source_text"] == "passage.")
+        self.assertEqual(preserved["edited_translation"], "原有整段译文")
+        self.assertEqual(preserved["status"], "machine_translated")
+        self.assertIsNone(preserved["accepted_translation"])
+
+        for item, translation in zip(parts, ("甲", "乙", "丙"), strict=True):
+            saved = self.client.patch(
+                f"/segments/{item['id']}/confirm",
+                json={"translation": translation},
+            )
+            self.assertEqual(saved.status_code, 200, saved.text)
+        exported = self.client.get(
+            f"/documents/{document['id']}/export?format=book"
+        )
+        self.assertEqual(exported.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+            chapter = archive.read("OPS/two.xhtml").decode()
+        self.assertIn("甲 乙 丙", chapter)
 
     def test_merge_preserves_adjacent_translations_but_requires_review(self):
         project = self.client.post(
@@ -295,6 +378,45 @@ class ApiTests(unittest.TestCase):
         csp = rendered.headers["content-security-policy"]
         self.assertIn("script-src 'sha256-", csp)
         self.assertIn("sandbox allow-scripts", csp)
+
+    def test_existing_segment_can_be_toggled_as_toc_heading_without_losing_translation(self):
+        project = self.client.post(
+            "/projects",
+            json={"name": "Manual TOC", "source_lang": "fr", "target_lang": "zh-CN"},
+        ).json()
+        document = self.client.post(
+            f"/projects/{project['id']}/documents",
+            json={
+                "title": "Manual heading",
+                "text": "L'Arrière-pays",
+                "source_format": "txt",
+            },
+        ).json()
+        segment = self.client.get(f"/documents/{document['id']}/segments").json()[0]
+        self.assertEqual(segment["kind"], "paragraph")
+        self.assertEqual(
+            self.client.patch(
+                f"/segments/{segment['id']}/draft",
+                json={"translation": "腹地"},
+            ).status_code,
+            200,
+        )
+
+        promoted = self.client.patch(
+            f"/segments/{segment['id']}/heading", json={"heading": True}
+        )
+        self.assertEqual(promoted.status_code, 200)
+        self.assertEqual(promoted.json()["kind"], "heading")
+        self.assertEqual(promoted.json()["edited_translation"], "腹地")
+        chapters = self.client.get(f"/documents/{document['id']}/overview").json()["chapters"]
+        self.assertEqual([item["title"] for item in chapters], ["L'Arrière-pays"])
+
+        restored = self.client.patch(
+            f"/segments/{segment['id']}/heading", json={"heading": False}
+        )
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(restored.json()["kind"], "paragraph")
+        self.assertEqual(restored.json()["edited_translation"], "腹地")
 
     def test_dry_run_translation_and_human_confirmation(self):
         health = self.client.get("/health")

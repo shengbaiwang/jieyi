@@ -24,9 +24,9 @@ type Chapter = { title: string; level: number; start_ordinal: number; end_ordina
 type Overview = { document: Document; project: Project; segment_count: number; translated_count: number; confirmed_count: number; chapters: Chapter[] };
 type SegmentPage = { document: Document; project: Project; total: number; offset: number; limit: number; items: Segment[] };
 type SourceLayout = { source_text: string; blocks: string[] };
-type StructureResult = { segment: Segment; segment_count: number; translation_reset?: boolean; translation_needs_review?: boolean };
+type StructureResult = { segment: Segment; segment_count: number; translation_reset?: boolean; translation_preserved?: boolean; translation_needs_review?: boolean };
 type StructureAction =
-  | { kind: "split"; start: number; end: number; preview: string; resetsTranslation: boolean }
+  | { kind: "split"; start: number; end: number; preview: string; resetsTranslation: boolean; asHeading: boolean }
   | { kind: "merge"; direction: "previous" | "next"; neighborOrdinal: number };
 type Term = {
   id: string; source: string; target: string; status: string; scope: string; rationale: string;
@@ -709,6 +709,7 @@ export default function Home() {
       end,
       preview,
       resetsTranslation: Boolean(segmentTranslation(currentSegment)),
+      asHeading: false,
     });
   }
 
@@ -725,7 +726,7 @@ export default function Home() {
     });
   }
 
-  async function performStructureAction() {
+  async function performStructureAction(preserveTranslation = false) {
     if (!structureAction || !currentSegment || !overview) return;
     setStructureBusy(true);
     try {
@@ -736,7 +737,9 @@ export default function Home() {
             source_text: sourceDraft,
             selection_start: structureAction.start,
             selection_end: structureAction.end,
-            reset_translation: structureAction.resetsTranslation,
+            reset_translation: structureAction.resetsTranslation && !preserveTranslation,
+            preserve_translation: structureAction.resetsTranslation && preserveTranslation,
+            selected_as_heading: structureAction.asHeading,
           }),
         })
         : await api<StructureResult>(`/segments/${currentSegment.id}/merge`, {
@@ -759,13 +762,51 @@ export default function Home() {
       setStructureAction(null);
       setSourceEditing(false);
       await refreshQuality();
+      const splitOutcome = result.segment.kind === "heading" ? "已拆为目录标题" : "已拆为独立段";
       notify(structureAction.kind === "split"
-        ? `已拆为独立段；全书现有 ${result.segment_count} 段。`
+        ? result.translation_preserved
+          ? `${splitOutcome}；原译文保留在文字最多的拆分段，并已标记为待复核。全书现有 ${result.segment_count} 段。`
+          : `${splitOutcome}；全书现有 ${result.segment_count} 段。`
         : result.translation_needs_review
           ? `已合并段落；全书现有 ${result.segment_count} 段，合并译文已标记为待复核。`
           : `已合并段落；全书现有 ${result.segment_count} 段。`);
     } catch (error) {
       notify(error instanceof Error ? error.message : "段落结构修改失败");
+    } finally {
+      setStructureBusy(false);
+    }
+  }
+
+  async function toggleCurrentHeading() {
+    if (!currentSegment || !overview) return;
+    if (structureLocked) {
+      notify("请先保存或取消当前修改，并等待正在进行的操作结束。");
+      return;
+    }
+    const makeHeading = currentSegment.kind !== "heading";
+    setStructureBusy(true);
+    try {
+      const saved = await api<Segment>(`/segments/${currentSegment.id}/heading`, {
+        method: "PATCH",
+        body: JSON.stringify({ heading: makeHeading }),
+      });
+      const documentId = overview.document.id;
+      legacySegments.current.delete(documentId);
+      const refreshedOverview = await api<Overview>(`/documents/${documentId}/overview`);
+      setOverview(refreshedOverview);
+      await loadPageAt(documentId, saved.ordinal);
+      setSourceDraft(saved.source_text);
+      setSourceBaseline(saved.source_text);
+      setSourceDirty(false);
+      setSourceSaveState("idle");
+      setSourceSelection({ start: 0, end: 0 });
+      setTranslation(segmentTranslation(saved));
+      setDraftDirty(false);
+      setSaveState("idle");
+      setSourceEditing(false);
+      notify(makeHeading ? "已设为目录标题，并加入左侧目录。" : "已改回正文，并从目录中移除。");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "目录标题更新失败");
     } finally {
       setStructureBusy(false);
     }
@@ -1129,6 +1170,7 @@ export default function Home() {
                   {sourceEditing
                     ? <button className="confirm-button" onClick={() => void saveSource()} disabled={!sourceDirty || !sourceDraft.trim() || sourceSaveState === "saving"}>保存原文</button>
                     : <>
+                      <button className="structure-button heading" onClick={() => void toggleCurrentHeading()} disabled={structureLocked}>{currentSegment.kind === "heading" ? "改回正文" : "设为目录标题"}</button>
                       <button className="structure-button split" onClick={requestSplit} disabled={currentSegment.kind === "heading" || sourceSelection.start === sourceSelection.end || structureLocked}>拆为独立段</button>
                       <button className="structure-button" onClick={() => requestMerge("previous")} disabled={ordinal === 0 || currentSegment.kind === "heading" || structureLocked}>与上一段合并</button>
                       <button className="structure-button" onClick={() => requestMerge("next")} disabled={ordinal + 1 >= (overview?.segment_count || 0) || currentSegment.kind === "heading" || structureLocked}>与下一段合并</button>
@@ -1231,15 +1273,21 @@ export default function Home() {
     {structureAction && <div className="command-overlay delete-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !structureBusy) setStructureAction(null); }}>
       <div className="structure-dialog" role="dialog" aria-modal="true" aria-labelledby="structure-title">
         <div className={`structure-mark ${structureAction.kind === "split" && structureAction.resetsTranslation ? "danger" : ""}`}>{structureAction.kind === "split" ? "¶" : "⇆"}</div>
-        <h2 id="structure-title">{structureAction.kind === "split" ? "把所选文字拆为独立段？" : `与${structureAction.direction === "previous" ? "上一段" : "下一段"}合并？`}</h2>
+        <h2 id="structure-title">{structureAction.kind === "split" ? structureAction.asHeading ? "把所选文字拆为目录标题？" : "把所选文字拆为独立段？" : `与${structureAction.direction === "previous" ? "上一段" : "下一段"}合并？`}</h2>
         {structureAction.kind === "split" ? <>
-          <p>{structureAction.resetsTranslation ? "本段已有译文，系统无法可靠地把整段译文分配给拆出的新段。确认后，本段现有译文及确认记录会被清空。" : "所选文字会成为可单独草译、编辑和确认的新段；前后的文字会保留为各自段落。"}</p>
+          <p>{structureAction.resetsTranslation ? "本段已有译文。你可以清空译文后拆分，也可以把原译文保留在文字最多的拆分段；保留的译文会撤销确认并标记为待复核。" : "所选文字会成为可单独草译、编辑和确认的新段；前后的文字会保留为各自段落。"}</p>
           <blockquote>{structureAction.preview.slice(0, 180)}{structureAction.preview.length > 180 ? "…" : ""}</blockquote>
-          {overview?.document.source_format === "epub" && <small>为保护 EPUB 回写结构，只能选择一个或多个完整的原始文本块。</small>}
+          {overview?.document.source_format === "epub" && <small>支持在 EPUB 原始文本块内部拆分；有原书位置的内容仍会按原顺序回写。</small>}
+          <div className={`structure-heading-option ${structureAction.asHeading ? "selected" : ""}`}>
+            <input id="split-as-heading" type="checkbox" checked={structureAction.asHeading} disabled={structureBusy} onChange={(event) => setStructureAction((current) => current?.kind === "split" ? { ...current, asHeading: event.target.checked } : current)} />
+            <label htmlFor="split-as-heading"><strong>设为目录标题</strong><small>拆分后可单独编辑，并作为新章节显示在目录中。</small></label>
+          </div>
+
         </> : <p>第 {Math.min(currentSegment?.ordinal ?? 0, structureAction.neighborOrdinal) + 1} 段与第 {Math.max(currentSegment?.ordinal ?? 0, structureAction.neighborOrdinal) + 1} 段将合为一段。两段译文会按原顺序保留，但人工确认状态会撤销，需重新复核。</p>}
         <div>
           <button onClick={() => setStructureAction(null)} disabled={structureBusy}>取消</button>
-          <button className={structureAction.kind === "split" && structureAction.resetsTranslation ? "danger" : "accent"} onClick={() => void performStructureAction()} disabled={structureBusy}>{structureBusy ? "正在处理…" : structureAction.kind === "split" ? structureAction.resetsTranslation ? "清空译文并拆分" : "确认拆分" : "确认合并"}</button>
+          {structureAction.kind === "split" && structureAction.resetsTranslation && <button className="danger" onClick={() => void performStructureAction(false)} disabled={structureBusy}>{structureBusy ? "正在处理…" : "清空译文并拆分"}</button>}
+          <button className="accent" onClick={() => void performStructureAction(structureAction.kind === "split" && structureAction.resetsTranslation)} disabled={structureBusy}>{structureBusy ? "正在处理…" : structureAction.kind === "split" ? structureAction.resetsTranslation ? "保留译文" : structureAction.asHeading ? "拆为标题" : "确认拆分" : "确认合并"}</button>
         </div>
       </div>
     </div>}

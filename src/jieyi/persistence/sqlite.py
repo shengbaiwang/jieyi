@@ -1233,6 +1233,44 @@ class SQLiteStore:
             )
         return self.get_segment(segment_id)
 
+    def set_segment_heading(self, segment_id: str, *, heading: bool) -> Segment:
+        """Promote an existing segment to a manual TOC heading, or restore it to body text."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM segments WHERE id = ?", (segment_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Segment not found: {segment_id}")
+            self._ensure_no_active_structure_job(connection, str(row["document_id"]))
+
+            old_kind = str(row["kind"])
+            new_kind = (
+                SegmentKind.HEADING.value if heading else SegmentKind.PARAGRAPH.value
+            )
+            if old_kind == new_kind:
+                return self._segment(row)
+
+            reason = (
+                "manual_heading"
+                if heading
+                else "manual_heading_reverted"
+            )
+            connection.execute(
+                """UPDATE segments SET kind = ?, segmentation_confidence = 1.0,
+                segmentation_reason = ?, segmenter_version = 'manual-v2'
+                WHERE id = ?""",
+                (new_kind, reason, segment_id),
+            )
+            self._audit(
+                connection,
+                "segment",
+                segment_id,
+                "kind_updated",
+                {"from": old_kind, "to": new_kind},
+            )
+        return self.get_segment(segment_id)
+
     @staticmethod
     def _effective_translation(row: sqlite3.Row) -> str:
         return str(
@@ -1327,8 +1365,12 @@ class SQLiteStore:
         selection_start: int,
         selection_end: int,
         reset_translation: bool = False,
+        preserve_translation: bool = False,
+        selected_as_heading: bool = False,
     ) -> dict[str, Any]:
         """Turn a selected source range into its own translation unit atomically."""
+        if reset_translation and preserve_translation:
+            raise ValueError("拆分时不能同时选择清空译文和保留译文")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1340,7 +1382,8 @@ class SQLiteStore:
                 raise NotFoundError(f"Segment not found: {segment_id}")
             if row["kind"] == SegmentKind.HEADING.value:
                 raise ValueError("标题不能拆为正文段落")
-            self._ensure_no_active_structure_job(connection, str(row["document_id"]))
+            document_id = str(row["document_id"])
+            self._ensure_no_active_structure_job(connection, document_id)
 
             blocks = self._source_blocks_for_row(connection, row)
             displayed = "\n\n".join(blocks)
@@ -1355,43 +1398,154 @@ class SQLiteStore:
             if selection_start >= selection_end:
                 raise ValueError("所选内容不能只有空白字符")
 
+            raw_ranges = (
+                (0, selection_start),
+                (selection_start, selection_end),
+                (selection_end, len(displayed)),
+            )
+            parts: list[str] = []
+            part_ranges: list[tuple[int, int]] = []
+            selected_part_index = -1
+            for raw_index, (start, end) in enumerate(raw_ranges):
+                raw = displayed[start:end]
+                trimmed_start = start + len(raw) - len(raw.lstrip())
+                trimmed_end = end - (len(raw) - len(raw.rstrip()))
+                if trimmed_start >= trimmed_end:
+                    continue
+                if raw_index == 1:
+                    selected_part_index = len(parts)
+                parts.append(displayed[trimmed_start:trimmed_end])
+                part_ranges.append((trimmed_start, trimmed_end))
+            if len(parts) < 2 or selected_part_index < 0:
+                raise ValueError("请选择本段中的一部分，而不是整段")
+
             refs = tuple(json.loads(row["source_refs_json"] or "[]"))
             part_refs: list[tuple[str, ...]]
             if row["source_format"] == "epub":
-                if not refs or len(refs) != len(blocks):
-                    raise ValueError("该 EPUB 段落没有可安全拆分的原始结构边界")
-                starts: list[int] = []
-                ends: list[int] = []
+                if not refs:
+                    raise ValueError("该 EPUB 段落没有可安全回写的原始文本位置")
+                atom_rows = connection.execute(
+                    """SELECT * FROM epub_atoms WHERE document_id = ?
+                    AND segment_id = ? ORDER BY ordinal""",
+                    (document_id, segment_id),
+                ).fetchall()
+                atoms_by_id = {str(atom["atom_id"]): atom for atom in atom_rows}
+                if any(ref not in atoms_by_id for ref in refs):
+                    raise ValueError("该 EPUB 段落的原始文本映射不完整，请重新导入后再试")
+                ordered_atoms = [atoms_by_id[ref] for ref in refs]
+
+                atom_positions: list[tuple[sqlite3.Row, int, int]] = []
                 cursor = 0
-                for block in blocks:
-                    starts.append(cursor)
-                    cursor += len(block)
-                    ends.append(cursor)
-                    cursor += 2
-                if selection_start not in starts or selection_end not in ends:
-                    raise ValueError("EPUB 只能选择一个或多个完整原始段落进行拆分")
-                first = starts.index(selection_start)
-                last = ends.index(selection_end) + 1
-                ref_groups = [refs[:first], refs[first:last], refs[last:]]
-                text_groups = [blocks[:first], blocks[first:last], blocks[last:]]
-                parts = ["\n\n".join(group) for group in text_groups if group]
-                part_refs = [tuple(group) for group in ref_groups if group]
+                for atom in ordered_atoms:
+                    atom_text = str(atom["source_text"])
+                    start = displayed.find(atom_text, cursor)
+                    if start < 0:
+                        raise ValueError("该 EPUB 段落的显示文本与原书位置不一致，无法安全拆分")
+                    end = start + len(atom_text)
+                    atom_positions.append((atom, start, end))
+                    cursor = end
+
+                from html import escape
+
+                all_atom_ids = [
+                    str(item["atom_id"])
+                    for item in connection.execute(
+                        "SELECT atom_id FROM epub_atoms WHERE document_id = ? ORDER BY ordinal",
+                        (document_id,),
+                    ).fetchall()
+                ]
+                replacements: dict[str, list[str]] = {}
+                refs_by_part: list[list[str]] = [[] for _ in parts]
+                for atom, atom_start, atom_end in atom_positions:
+                    atom_id = str(atom["atom_id"])
+                    atom_text = str(atom["source_text"])
+                    cuts = {0, len(atom_text)}
+                    for boundary in (selection_start, selection_end):
+                        if atom_start < boundary < atom_end:
+                            cuts.add(boundary - atom_start)
+                    ordered_cuts = sorted(cuts)
+                    chunks = [
+                        (ordered_cuts[index], ordered_cuts[index + 1])
+                        for index in range(len(ordered_cuts) - 1)
+                        if ordered_cuts[index] < ordered_cuts[index + 1]
+                    ]
+                    chunk_ids = [atom_id] + [
+                        new_id("atom") for _ in range(max(0, len(chunks) - 1))
+                    ]
+                    replacements[atom_id] = chunk_ids
+                    if len(chunks) > 1:
+                        first_start, first_end = chunks[0]
+                        first_text = atom_text[first_start:first_end].strip()
+                        connection.execute(
+                            """UPDATE epub_atoms SET source_text = ?, source_markup = ?
+                            WHERE document_id = ? AND atom_id = ?""",
+                            (first_text, escape(first_text), document_id, atom_id),
+                        )
+                        for child_id, (chunk_start, chunk_end) in zip(
+                            chunk_ids[1:], chunks[1:], strict=True
+                        ):
+                            chunk_text = atom_text[chunk_start:chunk_end].strip()
+                            connection.execute(
+                                """INSERT INTO epub_atoms
+                                (document_id, atom_id, segment_id, spine_index, spine_path,
+                                 dom_path, semantic_path, ordinal, source_text, source_markup,
+                                 node_refs_json)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    document_id,
+                                    child_id,
+                                    segment_id,
+                                    atom["spine_index"],
+                                    atom["spine_path"],
+                                    atom["dom_path"],
+                                    atom["semantic_path"],
+                                    -(len(all_atom_ids) + len(chunk_ids)),
+                                    chunk_text,
+                                    escape(chunk_text),
+                                    atom["node_refs_json"],
+                                ),
+                            )
+                    for child_id, (chunk_start, chunk_end) in zip(
+                        chunk_ids, chunks, strict=True
+                    ):
+                        global_start = atom_start + chunk_start
+                        global_end = atom_start + chunk_end
+                        overlaps = [
+                            max(0, min(global_end, part_end) - max(global_start, part_start))
+                            for part_start, part_end in part_ranges
+                        ]
+                        best_part = max(range(len(parts)), key=overlaps.__getitem__)
+                        if overlaps[best_part] <= 0:
+                            raise ValueError("EPUB 文本边界包含无法归属的内容，拆分已取消")
+                        refs_by_part[best_part].append(child_id)
+
+                ordered_atom_ids: list[str] = []
+                for atom_id in all_atom_ids:
+                    ordered_atom_ids.extend(replacements.get(atom_id, [atom_id]))
+                for index, atom_id in enumerate(ordered_atom_ids):
+                    connection.execute(
+                        "UPDATE epub_atoms SET ordinal = ? WHERE document_id = ? AND atom_id = ?",
+                        (-(index + 1), document_id, atom_id),
+                    )
+                for index, atom_id in enumerate(ordered_atom_ids):
+                    connection.execute(
+                        "UPDATE epub_atoms SET ordinal = ? WHERE document_id = ? AND atom_id = ?",
+                        (index, document_id, atom_id),
+                    )
+                part_refs = [tuple(items) for items in refs_by_part]
             else:
-                raw_parts = (
-                    displayed[:selection_start],
-                    displayed[selection_start:selection_end],
-                    displayed[selection_end:],
-                )
-                parts = [item.strip() for item in raw_parts if item.strip()]
                 part_refs = [() for _ in parts]
-            if len(parts) < 2:
-                raise ValueError("请选择本段中的一部分，而不是整段")
 
-            has_translation = bool(self._effective_translation(row))
-            if has_translation and not reset_translation:
-                raise ValueError("本段已有译文；拆分前必须明确确认清空本段译文")
+            translation = self._effective_translation(row)
+            has_translation = bool(translation)
+            if has_translation and not (reset_translation or preserve_translation):
+                raise ValueError("本段已有译文；拆分前请确认清空译文，或选择保留译文")
+            preserved_part_index = (
+                max(range(len(parts)), key=lambda index: len(parts[index]))
+                if has_translation and preserve_translation
+                else -1
+            )
 
-            document_id = str(row["document_id"])
             existing_ids = [
                 str(item["id"])
                 for item in connection.execute(
@@ -1401,15 +1555,23 @@ class SQLiteStore:
             ]
             original_index = existing_ids.index(segment_id)
             self._clear_segment_derivatives(connection, [segment_id])
+
+            first_translation = translation if preserved_part_index == 0 else None
             connection.execute(
-                """UPDATE segments SET source_text = ?, machine_translation = NULL,
-                edited_translation = NULL, reviewed_translation = NULL,
+                """UPDATE segments SET source_text = ?, kind = ?, machine_translation = NULL,
+                edited_translation = ?, reviewed_translation = NULL,
                 accepted_translation = NULL, status = ?, source_refs_json = ?,
                 segmentation_confidence = 1.0, segmentation_reason = 'manual_split',
-                segmenter_version = 'manual-v1' WHERE id = ?""",
+                segmenter_version = 'manual-v2' WHERE id = ?""",
                 (
                     parts[0],
-                    SegmentStatus.SOURCE.value,
+                    SegmentKind.HEADING.value
+                    if selected_as_heading and selected_part_index == 0
+                    else row["kind"],
+                    first_translation,
+                    SegmentStatus.MACHINE_TRANSLATED.value
+                    if first_translation
+                    else SegmentStatus.SOURCE.value,
                     json.dumps(part_refs[0], ensure_ascii=False),
                     segment_id,
                 ),
@@ -1420,23 +1582,29 @@ class SQLiteStore:
             ):
                 new_segment_id = new_id("seg")
                 part_ids.append(new_segment_id)
+                part_translation = translation if preserved_part_index == index else None
                 connection.execute(
                     """INSERT INTO segments
                     (id, document_id, stable_key, ordinal, kind, source_text, heading_path,
                      machine_translation, edited_translation, reviewed_translation,
                      accepted_translation, status, source_refs_json, segmentation_confidence,
                      segmentation_reason, segmenter_version)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1.0,
-                            'manual_split', 'manual-v1')""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?, 1.0,
+                            'manual_split', 'manual-v2')""",
                     (
                         new_segment_id,
                         document_id,
                         f"{row['stable_key']}:split:{new_segment_id}",
                         -(len(existing_ids) + index + 1),
-                        row["kind"],
+                        SegmentKind.HEADING.value
+                        if selected_as_heading and selected_part_index == index
+                        else row["kind"],
                         part,
                         row["heading_path"],
-                        SegmentStatus.SOURCE.value,
+                        part_translation,
+                        SegmentStatus.MACHINE_TRANSLATED.value
+                        if part_translation
+                        else SegmentStatus.SOURCE.value,
                         json.dumps(source_refs, ensure_ascii=False),
                     ),
                 )
@@ -1455,8 +1623,9 @@ class SQLiteStore:
                 + existing_ids[original_index + 1 :]
             )
             self._renumber_segments(connection, document_id, ordered_ids)
-            selected_part_index = 0 if not displayed[:selection_start].strip() else 1
             selected_id = part_ids[selected_part_index]
+            translation_was_reset = has_translation and reset_translation
+            translation_was_preserved = has_translation and preserve_translation
             self._audit(
                 connection,
                 "segment",
@@ -1465,7 +1634,14 @@ class SQLiteStore:
                 {
                     "parts": part_ids,
                     "selected_segment_id": selected_id,
-                    "translation_reset": has_translation,
+                    "translation_reset": translation_was_reset,
+                    "translation_preserved": translation_was_preserved,
+                    "translation_preserved_segment_id": (
+                        part_ids[preserved_part_index]
+                        if translation_was_preserved
+                        else None
+                    ),
+                    "selected_as_heading": selected_as_heading,
                 },
             )
         selected = self.get_segment(selected_id)
@@ -1473,7 +1649,9 @@ class SQLiteStore:
             "segment": selected,
             "segment_count": len(ordered_ids),
             "created_segment_ids": part_ids[1:],
-            "translation_reset": has_translation,
+            "translation_reset": translation_was_reset,
+            "translation_preserved": translation_was_preserved,
+            "translation_needs_review": translation_was_preserved,
         }
 
     def merge_segment(self, segment_id: str, *, direction: str) -> dict[str, Any]:

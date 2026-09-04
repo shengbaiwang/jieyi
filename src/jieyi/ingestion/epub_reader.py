@@ -366,19 +366,28 @@ def _replace_text_nodes(
     group: list[dict],
     node_rows: dict[str, dict],
 ) -> None:
+    values_by_node: dict[str, list[str]] = {}
+    ordered_nodes: list[dict] = []
     for atom in group:
         refs = [node_rows[ref] for ref in atom["node_refs"] if ref in node_rows]
         if not refs:
             continue
         for index, node in enumerate(refs):
-            element = paths.get(node["dom_path"])
-            if element is None:
-                continue
-            value = atom["translation_text"] if index == 0 else ""
-            if node["slot"] == "tail":
-                element.tail = value
-            elif node["slot"] == "text" or index == 0:
-                element.text = value
+            node_id = str(node["node_id"])
+            if node_id not in values_by_node:
+                values_by_node[node_id] = []
+                ordered_nodes.append(node)
+            if index == 0 and atom.get("translation_text"):
+                values_by_node[node_id].append(str(atom["translation_text"]))
+    for node in ordered_nodes:
+        element = paths.get(node["dom_path"])
+        if element is None:
+            continue
+        value = " ".join(values_by_node[str(node["node_id"])])
+        if node["slot"] == "tail":
+            element.tail = value
+        elif node["slot"] == "text" or value:
+            element.text = value
 
 
 def _pair_translation(

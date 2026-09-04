@@ -145,11 +145,18 @@ class SaveSegmentSource(BaseModel):
     source_text: str = Field(min_length=1, max_length=500_000)
     preserve_translation_for_review: bool = False
 
+
+class SetSegmentHeading(BaseModel):
+    heading: bool
+
+
 class SplitSegmentSource(BaseModel):
     source_text: str = Field(min_length=1, max_length=500_000)
     selection_start: int = Field(ge=0)
     selection_end: int = Field(ge=1)
     reset_translation: bool = False
+    preserve_translation: bool = False
+    selected_as_heading: bool = False
 
 
 class MergeSegmentSource(BaseModel):
@@ -615,6 +622,40 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                             chapters.append(chapter_row(entry.label, start, later - 1, entry.level))
             except (NotFoundError, ValueError):
                 chapters = []
+        manual_headings = [
+            item
+            for item in segments
+            if item.kind.value == "heading"
+            and item.segmentation_reason in {"manual_split", "manual_heading"}
+        ]
+        if chapters and manual_headings:
+            boundaries = {
+                int(chapter["start_ordinal"]): (
+                    str(chapter["title"]),
+                    int(chapter["level"]),
+                )
+                for chapter in chapters
+            }
+            for heading in manual_headings:
+                boundaries[heading.ordinal] = (
+                    heading.source_text,
+                    max(0, heading.heading_path.count(" / ")),
+                )
+            ordered_boundaries = sorted(boundaries.items())
+            chapters = [
+                chapter_row(
+                    title,
+                    start,
+                    (
+                        ordered_boundaries[index + 1][0] - 1
+                        if index + 1 < len(ordered_boundaries)
+                        else len(segments) - 1
+                    ),
+                    level,
+                )
+                for index, (start, (title, level)) in enumerate(ordered_boundaries)
+            ]
+
 
         if not chapters:
             for segment in segments:
@@ -801,6 +842,14 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         refresh_segment_quality(store, segment_id)
+        return asdict(segment)
+
+    @app.patch("/segments/{segment_id}/heading")
+    async def set_segment_heading(segment_id: str, body: SetSegmentHeading):
+        try:
+            segment = store.set_segment_heading(segment_id, heading=body.heading)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return asdict(segment)
 
     @app.post("/segments/{segment_id}/split")
