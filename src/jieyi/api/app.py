@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from jieyi.api.pdf_routes import install_pdf_routes
 from jieyi.api.term_routes import install_term_routes
 from jieyi.domain.models import (
     JobStatus,
@@ -274,7 +275,8 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         yield
         await manager.shutdown()
         await terminology_manager.shutdown()
-        discovery_tasks = list(getattr(_app.state, "term_discovery_tasks", ()))
+        discovery_tasks = (list(getattr(_app.state, "term_discovery_tasks", ()))
+                           + list(getattr(_app.state, "pdf_tasks", ())))
         for task in discovery_tasks:
             task.cancel()
         await asyncio.gather(*discovery_tasks, return_exceptions=True)
@@ -350,6 +352,8 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return asdict(document)
+
+    install_pdf_routes(app, store)
 
     @app.post("/projects/{project_id}/documents/epub", status_code=201)
     async def post_epub_document(
@@ -622,6 +626,22 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                             chapters.append(chapter_row(entry.label, start, later - 1, entry.level))
             except (NotFoundError, ValueError):
                 chapters = []
+        if document.source_format == "pdf":
+            metadata = store.get_pdf_metadata(document_id)
+            starts = []
+            for entry in metadata["navigation"]:
+                start = next((segment.ordinal for segment in segments
+                    if any(int(ref.rsplit(":", 1)[-1]) >= entry["page"]
+                           for ref in segment.source_refs if ref.startswith("pdf:page:"))), None)
+                if start is not None:
+                    starts.append((start, entry))
+            if starts and starts[0][0] > 0:
+                chapters.append(chapter_row("封面与前言", 0, starts[0][0] - 1))
+            for index, (start, entry) in enumerate(starts):
+                end = next((value for value, _ in starts[index + 1:] if value > start),
+                           len(segments)) - 1
+                chapters.append(chapter_row(entry["title"], start, end, entry["level"]))
+
         manual_headings = [
             item
             for item in segments
@@ -817,9 +837,9 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         return [store.job_progress(item.id) for item in store.list_jobs(document_id)]
 
     @app.get("/jobs/{job_id}/segments/{segment_id}/prompt-preview")
-    async def preview_prompt(job_id: str, segment_id: str):
+    async def preview_prompt(job_id: str, segment_id: str, optimized: bool = False):
         try:
-            return engine.preview(job_id, segment_id)
+            return engine.preview(job_id, segment_id, optimized=optimized)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

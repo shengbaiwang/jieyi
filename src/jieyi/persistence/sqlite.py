@@ -247,6 +247,12 @@ CREATE TABLE IF NOT EXISTS term_candidate_evidence (
     reason TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pdf_sources (
+    document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    original_pdf BLOB NOT NULL,
+    metadata_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS epub_packages (
     document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
     original_epub BLOB NOT NULL,
@@ -328,6 +334,7 @@ CREATE TABLE IF NOT EXISTS app_meta (
 CREATE INDEX IF NOT EXISTS idx_segments_document_ordinal ON segments(document_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_terms_project ON terms(project_id);
 CREATE INDEX IF NOT EXISTS idx_candidates_segment ON candidates(segment_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_entity_action ON audit_events(entity_type, entity_id, action);
 CREATE INDEX IF NOT EXISTS idx_job_batches_job ON job_batches(job_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_issues_segment ON issues(segment_id, resolved);
 CREATE INDEX IF NOT EXISTS idx_tm_project_source ON tm_entries(project_id, source_normalized);
@@ -612,6 +619,24 @@ class SQLiteStore:
                 (project_id, source_hash),
             ).fetchone()
         return self._document(row) if row is not None else None
+
+    def get_pdf_metadata(self, document_id: str) -> dict:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM pdf_sources WHERE document_id = ?", (document_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("PDF source not found")
+        return json.loads(row["metadata_json"])
+
+    def get_original_pdf(self, document_id: str) -> bytes:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT original_pdf FROM pdf_sources WHERE document_id = ?", (document_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("PDF source not found")
+        return bytes(row["original_pdf"])
 
     def attach_epub_archive(self, document_id: str, archive) -> None:
         """Attach or refresh byte-perfect EPUB resources without touching translation records."""
@@ -1025,7 +1050,10 @@ class SQLiteStore:
             raise NotFoundError(f"Document not found: {document_id}")
         return self._project(row)
 
-    def create_document(self, document: Document, segments: list[Segment]) -> Document:
+    def create_document(
+        self, document: Document, segments: list[Segment], *,
+        pdf_data: bytes | None = None, pdf_metadata: dict | None = None,
+    ) -> Document:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
@@ -1070,6 +1098,11 @@ class SQLiteStore:
                     for item in segments
                 ],
             )
+            if pdf_data is not None:
+                connection.execute(
+                    "INSERT INTO pdf_sources VALUES (?, ?, ?)",
+                    (document.id, pdf_data, json.dumps(pdf_metadata, ensure_ascii=False)),
+                )
             self._audit(
                 connection,
                 "document",
@@ -1533,6 +1566,9 @@ class SQLiteStore:
                         (index, document_id, atom_id),
                     )
                 part_refs = [tuple(items) for items in refs_by_part]
+            elif row["source_format"] == "pdf":
+                # A manual split retains the original page range as provenance.
+                part_refs = [refs for _ in parts]
             else:
                 part_refs = [() for _ in parts]
 
@@ -1685,7 +1721,7 @@ class SQLiteStore:
             right_blocks = self._source_blocks_for_row(connection, right)
             left_refs = tuple(json.loads(left["source_refs_json"] or "[]"))
             right_refs = tuple(json.loads(right["source_refs_json"] or "[]"))
-            combined_refs = left_refs + right_refs
+            combined_refs = tuple(dict.fromkeys(left_refs + right_refs))
             if current["source_format"] == "epub":
                 if not left_refs or not right_refs:
                     raise ValueError("这些 EPUB 段落没有可安全合并的结构边界")
@@ -1982,6 +2018,14 @@ class SQLiteStore:
                 AND resolved = 0""",
                 (job_id,),
             ).fetchone()
+            calls = connection.execute(
+                """SELECT COUNT(*) AS model_call_count,
+                COALESCE(SUM(json_extract(payload_json, '$.attempt') > 1), 0) AS retry_call_count,
+                COALESCE(SUM(json_extract(payload_json, '$.stage') = 'repair'), 0) AS repair_call_count
+                FROM audit_events WHERE entity_type = 'job' AND entity_id = ?
+                AND action = 'model_call'""",
+                (job_id,),
+            ).fetchone()
             values = dict(batch)
             for key in (
                 "batches",
@@ -2006,6 +2050,9 @@ class SQLiteStore:
             "total_segments": total_segments,
             "processed_segments": processed,
             "batch_count": int(values["batches"] or 0),
+            "model_call_count": int(calls["model_call_count"]),
+            "retry_call_count": int(calls["retry_call_count"]),
+            "repair_call_count": int(calls["repair_call_count"]),
             "prompt_tokens": int(values["prompt_tokens"] or 0),
             "completion_tokens": int(values["completion_tokens"] or 0),
             "reasoning_tokens": int(values["reasoning_tokens"] or 0),
@@ -2017,6 +2064,10 @@ class SQLiteStore:
             "eta_seconds": eta_seconds,
             "deferred_segments": int(deferred["deferred_segments"] or 0),
         }
+
+    def record_model_call(self, job_id: str, payload: dict[str, Any]) -> None:
+        with self._connect() as connection:
+            self._audit(connection, "job", job_id, "model_call", payload)
 
     def record_candidate(
         self,

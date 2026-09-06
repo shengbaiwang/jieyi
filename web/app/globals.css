@@ -899,3 +899,24 @@ nav { display: grid; gap: 3px; }
 .term-policy select.reference { color: var(--blue); background: var(--blue-soft); }
 .term-policy > span[role="status"] { color: var(--muted); font-size: 10px; }
 .term-reference-label { margin-left: 6px; color: var(--blue); font-size: 10px; }
+
+.pdf-page-link { color: var(--accent-text); border: 1px solid var(--line); background: var(--blue-soft); border-radius: 6px; padding: 5px 9px; font-size: 12px; white-space: nowrap; }
+.pdf-reader-page-links { grid-column: 1 / -1; display: flex; gap: 6px; margin-bottom: 8px; }
+.pdf-source-overlay { position: fixed; inset: 0; z-index: 100; background: rgba(10, 16, 25, .28); display: flex; justify-content: flex-end; backdrop-filter: blur(3px); }
+.pdf-source-panel { width: min(780px, 94vw); height: 100%; display: flex; flex-direction: column; background: var(--paper); color: var(--text); box-shadow: -12px 0 60px rgba(0, 0, 0, .15); }
+.pdf-source-panel > header { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 22px 26px; border-bottom: 1px solid var(--line); }
+.pdf-source-panel header span, .pdf-source-panel footer, .pdf-page-label { font-size: 12px; color: var(--muted); }
+.pdf-source-panel h2 { font-size: 17px; line-height: 1.4; margin: 5px 0 0; }
+.pdf-source-panel header button { background: var(--surface-hover); border: 0; border-radius: 50%; width: 32px; height: 32px; font-size: 24px; flex-shrink: 0; }
+.pdf-page-controls { display: flex; align-items: center; gap: 10px; padding: 12px 24px; flex-wrap: wrap; border-bottom: 1px solid var(--line); font-size: 12px; }
+.pdf-page-controls button { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 6px 12px; }
+.pdf-page-controls button:disabled { opacity: .35; }
+.pdf-page-controls input { width: 60px; padding: 5px; border: 1px solid var(--line); background: var(--paper); border-radius: 5px; text-align: center; }
+.pdf-page-controls .pdf-zoom { margin-left: auto; }
+.pdf-page-controls a { color: var(--accent-text); }
+.pdf-page-label { padding: 8px 24px; }
+.pdf-page-image { overflow: auto; flex: 1; min-height: 0; padding: 20px; background: var(--surface-subtle); }
+.pdf-page-image img { display: block; width: 100%; height: auto; background: white; box-shadow: 0 2px 14px rgba(0,0,0,.08); }
+.pdf-page-image img.zoomed { width: 1300px; max-width: none; }
+.pdf-page-image p { text-align: center; color: var(--muted); font-size: 13px; }
+.pdf-source-panel footer { padding: 12px 24px; border-top: 1px solid var(--line); }

@@ -68,7 +68,15 @@ def build_system_prompt(request: TranslationRequest) -> str:
         structure_rule += "\nSourceAtom boundary pairs (open → close): " + "; ".join(
             f"{opening} → {closing}" for opening, closing in request.atom_boundaries
         ) + ". No translated text may appear before, between, or after these pairs."
-    return f"{instruction}\n{invariant_rule}\n{structure_rule}\n\n{request.context}"
+    elif not placeholder_tokens:
+        structure_rule = ""
+    elif not request.atom_boundaries:
+        structure_rule = (
+            "Preserve inline formatting, links, notes and line breaks. "
+            "Keep text inside its corresponding placeholder pairs."
+        )
+    rules = "\n".join(filter(None, [instruction, invariant_rule, structure_rule]))
+    return f"{rules}\n\n{request.context}"
 
 
 def build_user_prompt(request: TranslationRequest) -> str:

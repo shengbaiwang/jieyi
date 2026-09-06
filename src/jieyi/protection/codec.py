@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import escape
 
 _TOKEN = re.compile(r"\[\[JY_PH_(\d{4})\]\]")
@@ -44,6 +44,23 @@ class ProtectedSpan:
 class ProtectedText:
     masked: str
     spans: tuple[ProtectedSpan, ...]
+    local_wrapper: tuple[str, str] | None = None
+
+    def compact_single_atom(self) -> ProtectedText:
+        """Keep a sole outer atom envelope local; every inner span stays protected."""
+        pairs = self.atom_boundaries
+        if len(pairs) != 1 or self.local_wrapper is not None:
+            return self
+        opening, closing = pairs[0]
+        if not self.masked.startswith(opening) or not self.masked.endswith(closing):
+            return self
+        by_token = {span.token: span.text for span in self.spans}
+        return replace(
+            self,
+            masked=self.masked[len(opening):-len(closing)],
+            spans=tuple(span for span in self.spans if span.token not in {opening, closing}),
+            local_wrapper=(by_token[opening], by_token[closing]),
+        )
 
     @property
     def tokens(self) -> tuple[str, ...]:
@@ -113,6 +130,11 @@ class ProtectedText:
     def mask_translation(self, translated_text: str) -> str:
         """Mask restored protected values before sending a draft to a reviewer."""
         masked = translated_text
+        if self.local_wrapper:
+            opening, closing = self.local_wrapper
+            if not masked.startswith(opening) or not masked.endswith(closing):
+                raise PlaceholderIntegrityError("Local SourceAtom envelope is missing before review")
+            masked = masked[len(opening):-len(closing)]
         for span in self.spans:
             if span.text not in masked:
                 raise PlaceholderIntegrityError(
@@ -127,6 +149,8 @@ class ProtectedText:
         restored = candidate
         for span in self.spans:
             restored = restored.replace(span.token, span.text, 1)
+        if self.local_wrapper:
+            return self.local_wrapper[0] + restored + self.local_wrapper[1]
         return restored
 
     def validate(self, candidate: str) -> None:

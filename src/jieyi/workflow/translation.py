@@ -82,6 +82,9 @@ class TranslationEngine:
                     structured_source or segment.source_text
                 )
 
+                if structured:
+                    protected = protected.compact_single_atom()
+
                 draft_spec = job.recipe.draft
                 try:
                     draft, draft_cost = await self._translate_protected(
@@ -152,7 +155,7 @@ class TranslationEngine:
 
         return await run_optimized(self, job_id, max_batches=max_batches)
 
-    def preview(self, job_id: str, segment_id: str) -> dict:
+    def preview(self, job_id: str, segment_id: str, *, optimized: bool = False) -> dict:
         """Return the exact draft messages and protected spans without calling a model."""
         job = self.store.get_job(job_id)
         segment = self.store.get_segment(segment_id)
@@ -160,25 +163,37 @@ class TranslationEngine:
             raise ValueError("Segment does not belong to the job document")
         project = self.store.get_project_for_document(job.document_id)
         document = self.store.get_document(job.document_id)
-        context, terms = self.context_compiler.compile(
-            project,
-            segment,
-            neighbor_radius=job.recipe.neighbor_radius,
-            max_chars=job.recipe.max_context_chars,
-            tm_enabled=job.recipe.tm_enabled,
-            tm_threshold=job.recipe.tm_threshold,
-            tm_max_results=job.recipe.tm_max_results,
-        )
-        structured_source = self.store.epub_translation_source(segment.id)
-        protected = self.protected_text_codec.encode(structured_source or segment.source_text)
-        request = TranslationRequest(
-            project=project,
-            document=document,
-            segment=replace(segment, source_text=protected.masked),
-            atom_boundaries=protected.atom_boundaries if bool(structured_source) else (),
-            context=context,
-            task=CandidateStage.DRAFT,
-        )
+        from jieyi.workflow.requests import initial_output_budget, prepare_translation
+
+        if optimized:
+            prepared = prepare_translation(
+                self.store, self.protected_text_codec, project, document, segment, job.recipe,
+                [term for term in self.store.list_terms(project.id) if term.status.value == "approved"],
+                {item.ordinal: item for item in self.store.list_segments(document.id)},
+            )
+            request, protected, terms = prepared.request, prepared.protected, prepared.terms
+        else:
+            context, terms = self.context_compiler.compile(
+                project,
+                segment,
+                neighbor_radius=job.recipe.neighbor_radius,
+                max_chars=job.recipe.max_context_chars,
+                tm_enabled=job.recipe.tm_enabled,
+                tm_threshold=job.recipe.tm_threshold,
+                tm_max_results=job.recipe.tm_max_results,
+            )
+            structured_source = self.store.epub_translation_source(segment.id)
+            protected = self.protected_text_codec.encode(structured_source or segment.source_text)
+            if structured_source:
+                protected = protected.compact_single_atom()
+            request = TranslationRequest(
+                project=project,
+                document=document,
+                segment=replace(segment, source_text=protected.masked),
+                atom_boundaries=protected.atom_boundaries if bool(structured_source) else (),
+                context=context,
+                task=CandidateStage.DRAFT,
+            )
         return {
             "job_id": job.id,
             "segment_id": segment.id,
@@ -186,6 +201,11 @@ class TranslationEngine:
             "model": job.recipe.draft.model,
             "messages": build_messages(request),
             "protected_spans": [asdict(span) for span in protected.spans],
+            "local_wrapper": protected.local_wrapper,
+            "execution_mode": "optimized" if optimized else "standard",
+            "max_output_tokens": initial_output_budget(
+                request, job.recipe.draft_compute_mode, job.recipe.max_output_tokens,
+            ) if optimized else None,
             "relevant_terms": [asdict(term) for term in terms],
         }
 

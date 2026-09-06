@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import replace
 
-from jieyi.context.compiler import compile_neighbor_context
 from jieyi.domain.models import (
     CandidateStage,
     IssueSeverity,
@@ -23,14 +23,16 @@ from jieyi.quality.checks import (
     DETECTOR_VERSION,
     run_deterministic_checks,
 )
-from jieyi.terminology import matching_terms, render_terminology_constraints
 from jieyi.workflow.provider_responses import (
     EmptyProviderResponseError,
     content_filter_audit_payload,
     inspect_empty_result,
     is_content_filtered_error,
+    is_incomplete_result,
+    response_stop_reason,
     should_expand_output_budget,
 )
+from jieyi.workflow.requests import initial_output_budget, prepare_translation, project_context
 
 _PLACEHOLDER_REPAIR_ATTEMPTS = 3
 
@@ -85,26 +87,6 @@ def _visible_translation(segment: Segment) -> str:
     )
 
 
-def _project_context(project, max_chars: int) -> str:
-    lines = [
-        "# PROJECT",
-        f"Source language: {project.source_lang}",
-        f"Target language: {project.target_lang}",
-        f"Domain: {project.domain}",
-        f"Quote policy: {project.quote_policy}",
-    ]
-    if project.style_guide.strip():
-        lines.extend(["", "# STYLE GUIDE", project.style_guide.strip()])
-    value = "\n".join(lines)
-    if len(value) > max_chars:
-        return value[: max(0, max_chars - 40)] + "\n[context truncated by budget]"
-    return value
-
-
-def _term_context(source: str, terms: list[TermEntry]) -> str:
-    return render_terminology_constraints(source, terms)
-
-
 def _groups(segments: list[Segment], batch_size: int, max_chars: int) -> list[list[Segment]]:
     groups: list[list[Segment]] = []
     current: list[Segment] = []
@@ -153,6 +135,7 @@ async def _complete_one(
     compute_mode: str,
     max_tokens: int,
     max_output_tokens: int,
+    record_call: Callable[[dict[str, object]], None] | None = None,
 ) -> TranslationResult:
     """Retry only failures that diagnostics identify as recoverable."""
     results: list[TranslationResult] = []
@@ -160,6 +143,7 @@ async def _complete_one(
     budget = min(max_tokens, max_output_tokens)
     messages = build_messages(request)
     for attempt_number in range(1, 4):
+        started = time.monotonic()
         result = await provider.complete(
             messages,
             model_spec,
@@ -170,14 +154,40 @@ async def _complete_one(
         )
         results.append(result)
         text = _strip_fence(result.text)
-        if text:
-            return _sum_results(results, text)
-
+        stop_reason = response_stop_reason(result)
         attempt = inspect_empty_result(
             result,
             attempt=attempt_number,
             max_tokens=budget,
         )
+        if record_call is not None:
+            record_call({
+                "segment_id": request.segment.id,
+                "stage": request.task.value,
+                "attempt": attempt_number,
+                "provider": model_spec.provider,
+                "model": model_spec.model,
+                "compute_mode": compute_mode,
+                "max_tokens": budget,
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "reasoning_tokens": result.reasoning_tokens,
+                "cache_hit_tokens": result.prompt_cache_hit_tokens,
+                "cache_miss_tokens": result.prompt_cache_miss_tokens,
+                "cost_usd": result.cost_usd,
+                "source_chars": len(request.segment.source_text),
+                "context_chars": len(request.context) + len(request.segment_context),
+                "prompt_chars": sum(len(message["content"]) for message in messages),
+                "output_chars": len(text),
+                "finish_reason": stop_reason,
+                "outcome": (
+                    "complete" if text and not is_incomplete_result(result)
+                    and attempt.kind != "content_filtered" else attempt.kind
+                ),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            })
+        if text and not is_incomplete_result(result) and attempt.kind != "content_filtered":
+            return _sum_results(results, text)
         attempts.append(attempt)
         if (
             should_expand_output_budget(attempt)
@@ -217,52 +227,18 @@ async def _translate_group(
     stage = CandidateStage.DRAFT
     model_spec = job.recipe.draft
     provider = engine.providers.get(model_spec.provider)
-    source_by_id: dict[str, str] = {}
-    structured_by_id: dict[str, bool] = {}
-    protected_by_id = {}
-    for segment in segments:
-        epub_source = engine.store.epub_translation_source(segment.id)
-        use_structure = bool(epub_source)
-        source = epub_source if use_structure else segment.source_text
-        source_by_id[segment.id] = source
-        structured_by_id[segment.id] = use_structure
-        protected_by_id[segment.id] = engine.protected_text_codec.encode(source)
-    requests: list[TranslationRequest] = []
-    terms_by_id: dict[str, list[TermEntry]] = {}
-    context_by_id: dict[str, str] = {}
-    for segment in segments:
-        protected = protected_by_id[segment.id]
-        relevant = matching_terms(segment.source_text, approved_terms)
-        terms_by_id[segment.id] = relevant
-        term_context = _term_context(segment.source_text, relevant)
-        radius = max(0, job.recipe.neighbor_radius)
-        neighbors = [
-            segments_by_ordinal[ordinal]
-            for ordinal in range(max(0, segment.ordinal - radius), segment.ordinal + radius + 1)
-            if ordinal != segment.ordinal and ordinal in segments_by_ordinal
-        ]
-        neighbor_context = compile_neighbor_context(
-            segment,
-            neighbors,
-            max_chars=max(
-                0, job.recipe.max_context_chars - len(project_context) - len(term_context) - 4
-            ),
-            include_translations=False,
+    prepared = [
+        prepare_translation(
+            engine.store, engine.protected_text_codec, project, document, segment,
+            job.recipe, approved_terms, segments_by_ordinal, shared_context=project_context,
         )
-        context_by_id[segment.id] = "\n\n".join(filter(None, [term_context, neighbor_context]))
-        requests.append(
-            TranslationRequest(
-                project=project,
-                document=document,
-                segment=replace(segment, source_text=protected.masked),
-                atom_boundaries=protected.atom_boundaries if structured_by_id[segment.id] else (),
-                context=project_context,
-                segment_context=context_by_id[segment.id],
-                task=stage,
-                existing_translation=None,
-                issue_summary="",
-            )
-        )
+        for segment in segments
+    ]
+    requests = [item.request for item in prepared]
+    protected_by_id = {item.request.segment.id: item.protected for item in prepared}
+    structured_by_id = {item.request.segment.id: item.structured for item in prepared}
+    terms_by_id = {item.request.segment.id: item.terms for item in prepared}
+    context_by_id = {item.request.segment.id: item.request.segment_context for item in prepared}
     started = time.monotonic()
     translations: dict[str, str] = {}
     usage_results: list[TranslationResult] = []
@@ -271,7 +247,6 @@ async def _translate_group(
     compute_mode = job.recipe.draft_compute_mode
 
     async def translate_one(request: TranslationRequest) -> tuple[str, TranslationResult]:
-        source_chars = len(request.segment.source_text) + len(request.existing_translation or "")
         async def operation():
             return await _complete_one(
                 provider,
@@ -280,11 +255,9 @@ async def _translate_group(
                 thinking=thinking,
                 reasoning_effort=reasoning_effort,
                 compute_mode=compute_mode,
-                max_tokens=min(
-                    job.recipe.max_output_tokens,
-                    max(512, source_chars * 2),
-                ),
+                max_tokens=initial_output_budget(request, compute_mode, job.recipe.max_output_tokens),
                 max_output_tokens=job.recipe.max_output_tokens,
+                record_call=lambda payload: engine.store.record_model_call(job.id, payload),
             )
         result = await limiter.complete(operation)
         return request.segment.id, result
@@ -391,6 +364,7 @@ async def _translate_group(
                                 max(512, source_chars * 2),
                             ),
                             max_output_tokens=job.recipe.max_output_tokens,
+                            record_call=lambda payload: engine.store.record_model_call(job.id, payload),
                         )
                     repaired = await limiter.complete(repair_operation)
                     usage_results.append(repaired)
@@ -562,7 +536,7 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
         and not _visible_translation(segment)
     ]
     groups = _groups(eligible, job.recipe.batch_size, job.recipe.max_batch_chars)
-    project_context = _project_context(project, job.recipe.max_context_chars)
+    shared_context = project_context(project, job.recipe.max_context_chars)
     limiter = _AdaptiveConcurrencyLimiter(
         job.recipe.concurrency,
         job.recipe.max_concurrency,
@@ -591,7 +565,7 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                 project,
                 document,
                 group,
-                project_context=project_context,
+                project_context=shared_context,
                 approved_terms=approved_terms,
                 segments_by_ordinal=segments_by_ordinal,
                 limiter=limiter,

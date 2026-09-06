@@ -97,17 +97,21 @@ type ImportedBook = {
 type ImportFile = {
   name: string;
   size: number;
-  format: "txt" | "markdown" | "epub";
+  format: "txt" | "markdown" | "epub" | "pdf";
   text: string;
   bytes?: ArrayBuffer;
   blockCount: number;
   chapterCount?: number;
+  pageCount?: number;
+  warnings?: string[];
 };
 
 type EpubInspection = {
   title: string;
   block_count: number;
   chapter_count: number;
+  page_count?: number;
+  warnings?: string[];
   preview: { kind: string; text: string; heading_path: string }[];
 };
 
@@ -123,15 +127,15 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return payload as T;
 }
 
-async function epubApi<T>(path: string, data: ArrayBuffer): Promise<T> {
+async function epubApi<T>(path: string, data: ArrayBuffer, format = "epub", signal?: AbortSignal): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/epub+zip" },
-    body: data,
+    headers: { "Content-Type": format === "pdf" ? "application/pdf" : "application/epub+zip" },
+    body: data, signal,
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.detail || `EPUB 请求失败（${response.status}）`);
+    throw new Error(payload.detail || `文件请求失败（${response.status}）`);
   }
   return payload as T;
 }
@@ -755,6 +759,11 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
   const [styleGuide, setStyleGuide] = useState<string>(STYLE_PRESETS[0].guide);
   const [file, setFile] = useState<ImportFile | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [inspecting, setInspecting] = useState(false);
+  const [inspectionProgress, setInspectionProgress] = useState({ done: 0, total: 0 });
+  const inspectionRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => inspectionRequest.current?.abort(), []);
+
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<ImportedBook | null>(null);
@@ -769,51 +778,71 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
   const paragraphs = useMemo(() => file?.text.split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean) || [], [file]);
 
   async function acceptFile(selected: File | undefined) {
-    if (!selected) return;
+    if (!selected || importing) return;
+    inspectionRequest.current?.abort();
+    const controller = new AbortController();
+    inspectionRequest.current = controller;
+    setFile(null);
     setError("");
     setResult(null);
+    setInspecting(false);
+    setInspectionProgress({ done: 0, total: 0 });
     const extension = selected.name.split(".").pop()?.toLowerCase() || "";
-    if (!["txt", "md", "markdown", "epub"].includes(extension)) {
-      setError("当前支持 EPUB、TXT、MD 和 Markdown 文件。");
+    if (!["txt", "md", "markdown", "epub", "pdf"].includes(extension)) {
+      setError("当前支持 PDF、EPUB、TXT、MD 和 Markdown 文件。");
       return;
     }
-    const sizeLimit = extension === "epub" ? 128 : 25;
+    const sizeLimit = ["epub", "pdf"].includes(extension) ? 128 : 25;
     if (selected.size > sizeLimit * 1024 * 1024) {
-      setError(`文件大于 ${sizeLimit} MB，请先压缩或拆分后再导入。`);
+      setError(`文件大于 ${sizeLimit} MB，请先拆分后再导入。`);
       return;
     }
-    if (extension === "epub") {
-      try {
+    setInspecting(true);
+    try {
+      if (extension === "epub" || extension === "pdf") {
         const bytes = await selected.arrayBuffer();
-        const inspection = await epubApi<EpubInspection>("/imports/epub/inspect", bytes);
-        const previewText = inspection.preview.map((item) => item.text).join("\n\n");
-        setFile({
-          name: selected.name,
-          size: selected.size,
-          format: "epub",
-          text: previewText,
-          bytes,
-          blockCount: inspection.block_count,
-          chapterCount: inspection.chapter_count,
-        });
-        const bookTitle = inspection.title === "Untitled EPUB" ? selected.name.replace(/\.epub$/i, "") : inspection.title;
+        if (controller.signal.aborted) return;
+        type InspectionJob = EpubInspection & { id: string; status: string; completed_pages: number; total_pages: number; detail?: string };
+        let inspection = await epubApi<InspectionJob>(`/imports/${extension}/inspect`, bytes, extension, controller.signal);
+        while (extension === "pdf" && inspection.status === "processing") {
+          setInspectionProgress({ done: inspection.completed_pages, total: inspection.total_pages });
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          if (controller.signal.aborted) return;
+          inspection = await api<InspectionJob>(`/imports/pdf/inspect/${inspection.id}`, { signal: controller.signal });
+        }
+        if (controller.signal.aborted) return;
+        if (inspection.status === "failed") throw new Error(inspection.detail || "PDF 解析失败");
+        setFile({ name: selected.name, size: selected.size, format: extension,
+          text: inspection.preview.map((item) => item.text).join("\n\n"), bytes,
+          blockCount: inspection.block_count, chapterCount: inspection.chapter_count,
+          pageCount: inspection.page_count, warnings: inspection.warnings });
+        const bookTitle = /^Untitled (EPUB|PDF)$/.test(inspection.title)
+          ? selected.name.replace(/\.(epub|pdf)$/i, "") : inspection.title;
         setTitle(bookTitle);
         setProjectName((current) => current || bookTitle);
-      } catch (caught) {
-        setError(caught instanceof Error ? caught.message : "EPUB 解析失败");
+      } else {
+        const text = await selected.text();
+        if (controller.signal.aborted) return;
+        if (!text.trim()) throw new Error("文件内容为空，无法导入。");
+        const cleanTitle = selected.name.replace(/\.(txt|md|markdown)$/i, "");
+        const blocks = text.split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
+        setFile({ name: selected.name, size: selected.size, text,
+          format: extension === "txt" ? "txt" : "markdown", blockCount: blocks.length });
+        setTitle(cleanTitle);
+        setProjectName((current) => current || cleanTitle);
       }
-      return;
+    } catch (caught) {
+      if (!controller.signal.aborted) setError(caught instanceof Error ? caught.message : "文件解析失败");
+    } finally {
+      if (!controller.signal.aborted) setInspecting(false);
     }
-    const text = await selected.text();
-    if (!text.trim()) {
-      setError("文件内容为空，无法导入。");
-      return;
-    }
-    const cleanTitle = selected.name.replace(/\.(txt|md|markdown)$/i, "");
-    const textBlocks = text.split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
-    setFile({ name: selected.name, size: selected.size, text, format: extension === "txt" ? "txt" : "markdown", blockCount: textBlocks.length });
-    setTitle((current) => current || cleanTitle);
-    setProjectName((current) => current || cleanTitle);
+  }
+
+  function cancelInspection() {
+    inspectionRequest.current?.abort();
+    setInspecting(false);
+    setFile(null);
+    if (inputRef.current) inputRef.current.value = "";
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
@@ -838,6 +867,7 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
         selectedProjectId = project.id;
         setProjects((items) => [project, ...items]);
         setProjectId(project.id);
+        setProjectMode("existing");
       } else {
         await api<Project>(`/projects/${selectedProjectId}/style`, {
           method: "PATCH",
@@ -848,8 +878,8 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
           body: JSON.stringify({ source_lang: sourceLang, target_lang: targetLang }),
         });
       }
-      const document = file.format === "epub" && file.bytes
-        ? await epubApi<{ id: string }>(`/projects/${selectedProjectId}/documents/epub?title=${encodeURIComponent(title)}`, file.bytes)
+      const document = (file.format === "epub" || file.format === "pdf") && file.bytes
+        ? await epubApi<{ id: string }>(`/projects/${selectedProjectId}/documents/${file.format}?title=${encodeURIComponent(title)}`, file.bytes, file.format)
         : await api<{ id: string }>(`/projects/${selectedProjectId}/documents`, {
             method: "POST",
             body: JSON.stringify({ title, text: file.text, source_format: file.format }),
@@ -871,11 +901,12 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
       <div className="import-scroll">
         {!result ? <>
           <div role="button" tabIndex={0} aria-label="选择或拖入书稿文件" className={`drop-zone ${dragging ? "dragging" : ""} ${file ? "has-file" : ""}`} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") inputRef.current?.click(); }} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={handleDrop} onClick={() => inputRef.current?.click()}>
-            <input ref={inputRef} type="file" accept=".epub,.txt,.md,.markdown,application/epub+zip,text/plain,text/markdown" hidden onChange={(event) => void acceptFile(event.target.files?.[0])} />
-            {file ? <><div className={`file-icon ${file.format === "epub" ? "epub" : ""}`}>{file.format === "txt" ? "TXT" : file.format === "epub" ? "EPUB" : "MD"}</div><div><strong>{file.name}</strong><span>{(file.size / 1024 / (file.size > 1024 * 1024 ? 1024 : 1)).toFixed(1)} {file.size > 1024 * 1024 ? "MB" : "KB"} · {file.blockCount} 个结构块{file.chapterCount ? ` · ${file.chapterCount} 个章节文件` : " · UTF-8"}</span></div><button type="button" onClick={(event) => { event.stopPropagation(); setFile(null); }}>更换文件</button></> : <><div className="upload-mark">⇧</div><div><strong>拖入 EPUB 或文本书稿</strong><span>支持 EPUB、TXT、Markdown · EPUB 最大 128 MB</span></div></>}
+            <input ref={inputRef} type="file" disabled={importing} accept=".pdf,.epub,.txt,.md,.markdown,application/pdf,application/epub+zip,text/plain,text/markdown" hidden onChange={(event) => { void acceptFile(event.target.files?.[0]); event.target.value = ""; }} />
+            {inspecting ? <div className="pdf-inspection" role="status" aria-live="polite"><strong>正在整理书稿…</strong><span>{inspectionProgress.total ? `已解析 ${inspectionProgress.done} / ${inspectionProgress.total} 页` : "正在读取文件与目录"}</span><progress max={inspectionProgress.total || 1} value={inspectionProgress.total ? inspectionProgress.done : undefined} /><button type="button" onClick={(event) => { event.stopPropagation(); cancelInspection(); }}>取消预览</button></div> : file ? <><div className={`file-icon ${file.format === "epub" ? "epub" : ""}`}>{file.format === "txt" ? "TXT" : file.format === "epub" ? "EPUB" : file.format === "pdf" ? "PDF" : "MD"}</div><div><strong>{file.name}</strong><span>{(file.size / 1024 / (file.size > 1024 * 1024 ? 1024 : 1)).toFixed(1)} {file.size > 1024 * 1024 ? "MB" : "KB"} · {file.blockCount} 个结构块{file.pageCount ? ` · ${file.pageCount} 页` : ""}{file.chapterCount ? ` · ${file.chapterCount} 个章节` : file.format === "pdf" ? " · 按页定位" : ""}</span></div><button type="button" onClick={(event) => { event.stopPropagation(); if (!importing) { cancelInspection(); inputRef.current?.click(); } }}>更换文件</button></> : <><div className="upload-mark">⇧</div><div><strong>拖入 PDF、EPUB 或文本书稿</strong><span>支持 PDF、EPUB、TXT、Markdown · PDF / EPUB 最大 128 MB</span></div></>}
           </div>
 
-          {error && <div className="import-error"><i>!</i>{error}</div>}
+          {file?.warnings?.map((warning) => <div className="pdf-import-note" key={warning}>{warning}</div>)}
+          {error && <div role="alert" className="import-error"><i>!</i>{error}</div>}
 
           <div className="import-form-grid">
             <section className="import-card">
@@ -887,14 +918,14 @@ export function ImportBookPanel({ onImported }: { onImported?: (result: Imported
             </section>
 
             <section className="import-card preview-card">
-              <div className="card-title"><span>分段预览</span>{file && <small>{file.format === "epub" ? "按 EPUB 书脊顺序" : `显示前 ${Math.min(4, paragraphs.length)} 段`}</small>}</div>
+              <div className="card-title"><span>分段预览</span>{file && <small>{file.format === "pdf" ? "按原页顺序 · 自动整理断行" : file.format === "epub" ? "按 EPUB 书脊顺序" : `显示前 ${Math.min(4, paragraphs.length)} 段`}</small>}</div>
               {file ? <div className="paragraph-preview">{paragraphs.slice(0, 4).map((paragraph, index) => <div key={`${index}-${paragraph.slice(0, 8)}`}><b>{String(index + 1).padStart(2, "0")}</b><p>{paragraph}</p></div>)}</div> : <div className="empty-preview"><i>¶</i><span>选择书稿后，这里会显示标题与段落识别结果。</span></div>}
             </section>
           </div>
         </> : <div className="import-success"><i>✓</i><span className="page-kicker">导入完成</span><h2>《{result.title}》已经准备好</h2><p>书稿已写入项目数据库并完成稳定分段，可以继续配置模型并创建翻译任务。</p><div><button className="secondary-action" onClick={() => { setResult(null); setFile(null); setTitle(""); }}>继续导入</button><button className="blue-action" onClick={() => onImported?.(result)}>打开这本书</button></div></div>}
       </div>
 
-      {!result && <footer className="setup-footer"><div><span className="privacy-note">书稿只保存在本机项目数据库中</span></div><button className="blue-action import-action" disabled={!file || !title.trim() || importing || (projectMode === "new" ? !projectName.trim() : !projectId)} onClick={importBook}>{importing ? "正在解析并导入…" : "导入并创建项目"}</button></footer>}
+      {!result && <footer className="setup-footer"><div><span className="privacy-note">书稿只保存在本机项目数据库中</span></div><button className="blue-action import-action" disabled={!file || !title.trim() || importing || inspecting || (projectMode === "new" ? !projectName.trim() : !projectId)} onClick={importBook}>{importing ? "正在解析并导入…" : projectMode === "new" ? "导入并创建项目" : "导入到项目"}</button></footer>}
     </section>
   );
 }

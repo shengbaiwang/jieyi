@@ -99,6 +99,23 @@ def create_epub_document(
     return created
 
 
+def create_pdf_document(store, *, project_id: str, file_data: bytes,
+                        title: str | None = None, book=None) -> Document:
+    from jieyi.ingestion.pdf import extract_pdf
+
+    store.get_project(project_id)
+    source_hash = hashlib.sha256(file_data).hexdigest()
+    existing = store.find_document_by_source_hash(project_id, source_hash)
+    if existing is not None:
+        return existing
+    book = book or extract_pdf(file_data)
+    document = Document(id=new_id("doc"), project_id=project_id,
+        title=title or book.title, source_format="pdf", source_hash=source_hash)
+    return store.create_document(document, segments_from_blocks(document.id, list(book.blocks)),
+        pdf_data=file_data, pdf_metadata={"pages": book.pages,
+            "navigation": book.navigation, "warnings": book.warnings})
+
+
 def create_job(
     store,
     *,

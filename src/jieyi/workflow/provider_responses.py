@@ -52,6 +52,32 @@ class EmptyResponseAttempt:
         return asdict(self)
 
 
+def response_stop_reason(result: TranslationResult) -> str:
+    try:
+        payload = json.loads(result.raw_response or "{}")
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices") or []
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+    details = payload.get("incomplete_details") or {}
+    candidates = payload.get("candidates") or []
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else {}
+    reason = (
+        reason or payload.get("finish_reason") or payload.get("stop_reason")
+        or (details.get("reason") if isinstance(details, dict) else None)
+        or (candidate.get("finishReason") if isinstance(candidate, dict) else None)
+        or ("max_output_tokens" if payload.get("status") == "incomplete" else "")
+    )
+    return str(reason).strip().lower().replace("-", "_")
+
+
+def is_incomplete_result(result: TranslationResult) -> bool:
+    return response_stop_reason(result) in _BUDGET_REASONS
+
+
 def inspect_empty_result(
     result: TranslationResult,
     *,
@@ -74,7 +100,7 @@ def inspect_empty_result(
     message = choice.get("message")
     if not isinstance(message, dict):
         message = {}
-    finish_reason = str(choice.get("finish_reason") or payload.get("finish_reason") or "")
+    finish_reason = response_stop_reason(result)
     refusal_value = message.get("refusal") or choice.get("refusal") or payload.get("refusal")
     refusal = str(refusal_value or "").strip()[:300]
     normalized_reason = finish_reason.strip().lower().replace("-", "_")
@@ -156,7 +182,7 @@ def deferred_content_filter_message(store, segment_id: str) -> str:
 
 
 class EmptyProviderResponseError(RuntimeError):
-    """A model call succeeded at the transport layer but produced no visible text."""
+    """A model call succeeded at transport but produced no complete usable translation."""
 
     def __init__(
         self,
@@ -192,7 +218,7 @@ class EmptyProviderResponseError(RuntimeError):
             detail = "上游模型拒绝或过滤了该内容"
             guidance = "请更换模型或人工处理该段。"
         elif self.kind == "output_budget_exhausted":
-            detail = "模型的推理/输出预算用尽，仍未产生可见译文"
+            detail = "模型的推理/输出预算用尽，仍未产生完整译文"
             guidance = "请增加输出额度、降低推理强度或重试该段。"
         else:
             detail = "上游返回了零 token 空响应，未提供明确原因"
