@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { PdfLayoutReader } from "./pdf-layout-reader";
 import { PdfSourcePanel, pdfPages } from "./pdf-source-panel";
 import { ImportBookPanel, ProviderSettingsPanel } from "./setup-panels";
 import { TermDiscoveryPanel } from "./term-discovery-panel";
@@ -122,7 +123,7 @@ function modelsForProfile(settings: ProviderSettings | null, profileId: string):
   return [...new Set([...(preset?.default_models || []), ...bound].filter(Boolean))];
 }
 function exportName(document: Document, bilingual: boolean) {
-  const extension = document.source_format === "epub" ? "epub" : document.source_format === "markdown" ? "md" : "txt";
+  const extension = document.source_format === "epub" ? "epub" : document.source_format === "pdf" ? "pdf" : document.source_format === "markdown" ? "md" : "txt";
   const cleanTitle = Array.from(document.title, (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127 ? "_" : character).join("");
   const title = cleanTitle.replace(/[/\\:*?"<>|]/g, "_").replace(/^[ .]+|[ .]+$/g, "") || "书籍";
   return `${title}-${bilingual ? "原文译文对照" : "仅译文"}.${extension}`;
@@ -214,6 +215,7 @@ export default function Home() {
   const [readerLoading, setReaderLoading] = useState(false);
   const [readerMode, setReaderMode] = useState<ReaderMode>("bilingual");
   const [readerLayout, setReaderLayout] = useState<ReaderLayout>("faithful");
+  const [pdfReaderPage, setPdfReaderPage] = useState(1);
   const [pdfSource, setPdfSource] = useState<{ documentId: string; title: string; page: number } | null>(null);
   const [epubReader, setEpubReader] = useState<EpubReaderManifest | null>(null);
   const [epubSpineHeights, setEpubSpineHeights] = useState<Record<number, number>>({});
@@ -444,7 +446,7 @@ export default function Home() {
 
   useEffect(() => {
     const root = readerView.current;
-    if (panel !== "reader" || readerLoading || !root) return;
+    if (panel !== "reader" || readerLoading || !root || overview?.document.source_format === "pdf") return;
     const navigation = createReaderNavigation(root, {
       documentId: epubReader?.document_id,
       targets: readerPageTargets,
@@ -463,7 +465,7 @@ export default function Home() {
       readerRestoreOrdinal.current = null;
     }
     return () => { navigation.destroy(); readerNavigation.current = null; };
-  }, [epubReader, panel, readerLoading, readerPageTargets, readerSegments, readerMode, readerLayout, notify]);
+  }, [epubReader, panel, readerLoading, readerPageTargets, readerSegments, readerMode, readerLayout, notify, overview?.document.source_format]);
 
   useEffect(() => {
     if (!activeJobId || !jobsDocumentId) return;
@@ -946,6 +948,7 @@ export default function Home() {
         legacySegments.current.set(document.id, items);
         setOverview(summary);
         setReaderSegments(items);
+        setPdfReaderPage(pdfPages(items.find((segment) => segment.ordinal === seedOrdinal)?.source_refs)[0] || 1);
         const startOrdinal = seedOrdinal || items[0]?.ordinal || 0;
         readerRestoreOrdinal.current = startOrdinal || null;
         setReaderOrdinal(startOrdinal);
@@ -957,6 +960,11 @@ export default function Home() {
 
   function jumpToReaderChapter(chapter: Chapter) {
     if (readerLoading) return;
+    if (overview?.document.source_format === "pdf") {
+      setPdfReaderPage(pdfPages(readerSegments.find((segment) => segment.ordinal === chapter.start_ordinal)?.source_refs)[0] || 1);
+      setReaderOrdinal(chapter.start_ordinal);
+      return;
+    }
     readerNavigation.current?.goTo(chapter.start_ordinal);
   }
 
@@ -1158,7 +1166,7 @@ export default function Home() {
           {selectedDocument && <><fieldset className="export-options"><legend>选择导出内容</legend>
             <label aria-label="仅译文" htmlFor="export-translated" className={!exportBilingual ? "selected" : ""}><input id="export-translated" type="radio" name="book-export-mode" checked={!exportBilingual} onChange={() => setExportBilingual(false)} /><span><strong>仅译文</strong><small>只包含译文，适合连续阅读。</small></span></label>
             <label aria-label="原文译文对照" htmlFor="export-bilingual" className={exportBilingual ? "selected" : ""}><input id="export-bilingual" type="radio" name="book-export-mode" checked={exportBilingual} onChange={() => setExportBilingual(true)} /><span><strong>原文译文对照</strong><small>逐段保留原文与译文，方便对照阅读。</small></span></label>
-          </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : selectedDocument.source_format === "pdf" ? "PDF 译文导出为 TXT，可选双语对照；原 PDF 可从原页面板下载。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
+          </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : selectedDocument.source_format === "pdf" ? "导出为 PDF，保留原页尺寸、图片、图表与目录；双语版逐页交替原文和译文。放不下或无法安全替换的译文附在续页。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
         </section>}
 
         {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
@@ -1198,7 +1206,7 @@ export default function Home() {
             <strong>{currentChapter?.title || (epubReader ? `${epubReader.spine.filter((item) => item.linear).length} 个书脊文档` : `${readerSegments.length} 段`)}</strong></div>
             <div className="reader-toolbar-actions">{overview?.document.source_format === "pdf" && <button className="pdf-page-link" onClick={() => setPdfSource({ documentId: overview.document.id, title: overview.document.title, page: pdfPages(readerSegments.find((segment) => segment.ordinal === readerOrdinal)?.source_refs)[0] || 1 })}>查看 PDF 原页 ↗</button>}
               {epubReader?.spine.some((item) => item.fixed_layout) && <div className="segmented" aria-label="定版 EPUB 排版策略"><button className={readerLayout === "faithful" ? "active" : ""} onClick={() => changeReaderLayout("faithful")}>忠实排版</button><button className={readerLayout === "comfort" ? "active" : ""} onClick={() => changeReaderLayout("comfort")}>舒适阅读</button></div>}<div className="segmented" aria-label="显示"><button className={readerMode === "original" ? "active" : ""} onClick={() => changeReaderMode("original")}>原文</button><button className={readerMode === "translated" ? "active" : ""} onClick={() => changeReaderMode("translated")}>译文</button><button className={readerMode === "bilingual" ? "active" : ""} onClick={() => changeReaderMode("bilingual")}>双语</button></div></div></div>
-          {readerLoading ? <div className="empty-workspace">正在准备原书资源…</div> : epubReader ? <div className={`epub-reader-stack layout-${readerLayout}`}>{epubReader.cover_url && <section className="epub-cover-sheet"><img src={API_BASE + epubReader.cover_url} alt={`《${overview?.document.title || "EPUB"}》封面`} /></section>}
+          {readerLoading ? <div className="empty-workspace">正在准备原书资源…</div> : overview?.document.source_format === "pdf" ? <PdfLayoutReader key={`${overview.document.id}-${pdfReaderPage}-${readerMode}`} apiBase={API_BASE} documentId={overview.document.id} page={pdfReaderPage} mode={readerMode} onPage={(number) => { setPdfReaderPage(number); const segment = readerSegments.find((item) => pdfPages(item.source_refs).includes(number)); if (segment) setReaderOrdinal(segment.ordinal); }} /> : epubReader ? <div className={`epub-reader-stack layout-${readerLayout}`}>{epubReader.cover_url && <section className="epub-cover-sheet"><img src={API_BASE + epubReader.cover_url} alt={`《${overview?.document.title || "EPUB"}》封面`} /></section>}
             {epubReader.spine.filter((item) => item.linear).map((item, index) =>
               <section id={`reader-spine-${item.spine_index}`} data-reader-ordinal={readerOrdinalForSpine(item.spine_index)} data-reader-page={index + 1} className={`epub-spine-sheet ${item.fixed_layout ? "fixed-layout" : "reflowable"}`} key={item.spine_index}>
                 <iframe title={`${overview?.document.title || "EPUB"} · 第 ${index + 1} 页 · ${item.path}`}

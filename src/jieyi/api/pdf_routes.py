@@ -13,6 +13,7 @@ from fastapi import HTTPException, Query, Request, Response
 
 from jieyi.domain.models import new_id
 from jieyi.ingestion.pdf import extract_pdf, render_pdf_page
+from jieyi.ingestion.pdf_export import compose_pdf, ensure_pdf_layout
 from jieyi.workflow.services import create_pdf_document
 
 MAX_BYTES = 128 * 1024 * 1024
@@ -35,6 +36,8 @@ def install_pdf_routes(app, store):
     app.state.pdf_tasks = tasks
     parsing = asyncio.Semaphore(2)
     images: OrderedDict = OrderedDict()
+    pending: dict[tuple, asyncio.Task] = {}
+    rendering = asyncio.Semaphore(2)
 
     def public(item):
         return {key: value for key, value in item.items() if key not in {"book", "hash", "created"}}
@@ -145,7 +148,14 @@ def install_pdf_routes(app, store):
 
     @app.get("/documents/{document_id}/pdf")
     async def manifest(document_id: str):
-        return {"document_id": document_id, **store.get_pdf_metadata(document_id)}
+        return {
+            "document_id": document_id,
+            **{
+                key: value
+                for key, value in store.get_pdf_metadata(document_id).items()
+                if key != "layout"
+            },
+        }
 
     @app.get("/documents/{document_id}/pdf/original")
     async def original(document_id: str):
@@ -158,29 +168,70 @@ def install_pdf_routes(app, store):
             },
         )
 
-    @app.get("/documents/{document_id}/pdf/pages/{page_number}")
-    async def page(
-        document_id: str, page_number: int, width: int = Query(default=1200, ge=320, le=1800)
-    ):
+    async def page_variant(document_id, page_number, width, mode):
         metadata = store.get_pdf_metadata(document_id)
         if not 1 <= page_number <= len(metadata["pages"]):
             raise HTTPException(404, "PDF 页码超出范围")
-        key = (document_id, page_number, width)
+        segments = store.list_segments(document_id) if mode == "translated" else []
+        revision = hashlib.sha256(repr(segments).encode()).hexdigest() if segments else "original"
+        key = (document_id, page_number, width, mode, revision)
         if key in images:
             images.move_to_end(key)
-            image = images[key]
-        else:
+            return images[key]
+
+        def build():
+            source = store.get_original_pdf(document_id)
+            report = {"overflow": [], "overflow_count": 0}
+            number = page_number
+            if mode == "translated":
+                layout = ensure_pdf_layout(store, document_id)
+                source, report = compose_pdf(source, layout, segments, only_page=page_number)
+                number = 1
+            return render_pdf_page(source, number, width), report
+
+        async def render():
             try:
-                image = await asyncio.to_thread(
-                    render_pdf_page, store.get_original_pdf(document_id), page_number, width
-                )
+                async with rendering:
+                    result = await asyncio.to_thread(build)
+                images[key] = result
+                while len(images) > 12:
+                    images.popitem(last=False)
+                return result
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
             except Exception as exc:
                 raise HTTPException(422, "此页暂时无法渲染，请下载原 PDF 查看。") from exc
-            images[key] = image
-            while len(images) > 12:
-                images.popitem(last=False)
+            finally:
+                pending.pop(key, None)
+
+        if key not in pending:
+            task = asyncio.create_task(render())
+            pending[key] = task
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        # The image and continuation notes share one render; navigation cancellation
+        # must not cancel a result still needed by another request.
+        return await asyncio.shield(pending[key])
+
+    @app.get("/documents/{document_id}/pdf/pages/{page_number}")
+    async def page(
+        document_id: str,
+        page_number: int,
+        width: int = Query(default=1200, ge=320, le=1800),
+        mode: str = Query(default="original", pattern="^(original|translated)$"),
+    ):
+        image, report = await page_variant(document_id, page_number, width, mode)
         return Response(
             image,
             media_type="image/png",
-            headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"},
+            headers={
+                "Cache-Control": "no-cache" if mode == "translated" else "private, max-age=3600",
+                "X-Content-Type-Options": "nosniff",
+                "X-PDF-Overflow": str(report["overflow_count"]),
+            },
         )
+
+    @app.get("/documents/{document_id}/pdf/pages/{page_number}/translation-notes")
+    async def page_notes(document_id: str, page_number: int):
+        _, report = await page_variant(document_id, page_number, 1200, "translated")
+        return report

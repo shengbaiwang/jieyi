@@ -920,3 +920,21 @@ nav { display: grid; gap: 3px; }
 .pdf-page-image img.zoomed { width: 1300px; max-width: none; }
 .pdf-page-image p { text-align: center; color: var(--muted); font-size: 13px; }
 .pdf-source-panel footer { padding: 12px 24px; border-top: 1px solid var(--line); }
+
+.pdf-layout-reader { padding-bottom: 28px; }
+.pdf-layout-reader > .pdf-page-controls { position: sticky; top: 0; z-index: 2; background: var(--paper); }
+.pdf-layout-reader .pdf-page-controls span { color: var(--muted); flex: 1; }
+.pdf-layout-pages { display: grid; grid-template-columns: minmax(0, 850px); justify-content: center; gap: 20px; padding: 24px; align-items: start; }
+.pdf-layout-pages.paired { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.pdf-layout-sheet { margin: 0; min-width: 0; }
+.pdf-layout-sheet figcaption { font-size: 12px; color: var(--muted); padding: 0 0 10px; }
+.pdf-layout-sheet img { display: block; width: 100%; height: auto; background: white; box-shadow: 0 2px 12px rgba(0,0,0,.12); }
+.pdf-overflow-notes { margin: 0 24px; padding: 20px 28px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
+.pdf-overflow-notes p { white-space: pre-wrap; line-height: 1.85; }
+.pdf-overflow-notes > p, .pdf-overflow-notes small { color: var(--muted); font-size: 12px; }
+.pdf-layout-error { color: var(--danger-text); padding: 12px 24px; }
+@media (max-width: 900px) { .pdf-layout-pages.paired { grid-template-columns: minmax(0, 1fr); } }
+
+.pdf-layout-scroll { overflow-x: auto; }
+.pdf-layout-pages.zoomed { grid-template-columns: 1100px; width: max-content; min-width: 100%; }
+.pdf-layout-pages.paired.zoomed { grid-template-columns: repeat(2, 900px); }

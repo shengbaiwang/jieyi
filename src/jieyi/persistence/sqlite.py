@@ -629,6 +629,100 @@ class SQLiteStore:
             raise NotFoundError("PDF source not found")
         return json.loads(row["metadata_json"])
 
+    def update_pdf_metadata(self, document_id: str, metadata: dict) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE pdf_sources SET metadata_json = ? WHERE document_id = ?",
+                (json.dumps(metadata, ensure_ascii=False), document_id),
+            )
+            if not cursor.rowcount:
+                raise NotFoundError("PDF source not found")
+
+    def replace_pdf_segmentation(self, document_id: str, segments: list[Segment],
+                                 metadata: dict) -> dict:
+        """Upgrade extracted structure atomically; never discard an existing translation."""
+        from collections import defaultdict, deque
+
+        if not segments or any(item.document_id != document_id for item in segments):
+            raise ValueError("PDF 分段为空或文档不匹配")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM pdf_sources WHERE document_id = ?", (document_id,),
+            ).fetchone() is None:
+                raise ValueError("该文档不是 PDF")
+            self._ensure_no_active_structure_job(connection, document_id)
+            old = connection.execute(
+                "SELECT * FROM segments WHERE document_id = ? ORDER BY ordinal", (document_id,),
+            ).fetchall()
+            by_source = defaultdict(deque)
+            for row in old:
+                by_source[(row["source_text"], tuple(json.loads(row["source_refs_json"])))].append(row)
+            pairs = []
+            retained = set()
+            for item in segments:
+                matches = by_source[(item.source_text, item.source_refs)]
+                row = matches.popleft() if matches else None
+                if row is not None:
+                    retained.add(row["id"])
+                pairs.append((item, row))
+            removed = [row for row in old if row["id"] not in retained]
+            source_edits = {row["entity_id"] for row in connection.execute(
+                """SELECT a.entity_id FROM audit_events a JOIN segments s ON s.id = a.entity_id
+                WHERE s.document_id = ? AND a.entity_type = 'segment'
+                AND a.action = 'source_updated'""", (document_id,),
+            )}
+            if any(
+                any(row[field] for field in ("machine_translation", "edited_translation",
+                                             "reviewed_translation", "accepted_translation"))
+                or row["segmenter_version"].startswith("manual")
+                or row["id"] in source_edits
+                for row in removed
+            ):
+                raise ValueError("部分新段落无法与已有译文或手工分段准确对应，已停止升级并保留原文档")
+            # Move both uniqueness constraints out of the way before assigning
+            # new ordinals/keys. Retained IDs keep translations and review history.
+            connection.execute(
+                "UPDATE segments SET ordinal = -ordinal - 1, stable_key = 'pdf-upgrade:' || id "
+                "WHERE document_id = ?", (document_id,),
+            )
+            removed_ids = [row["id"] for row in removed]
+            self._clear_segment_derivatives(connection, removed_ids)
+            connection.executemany("DELETE FROM segments WHERE id = ?", [(i,) for i in removed_ids])
+            for item, row in pairs:
+                if row is not None:
+                    manual = row["segmenter_version"].startswith("manual")
+                    connection.execute(
+                        """UPDATE segments SET stable_key = ?, ordinal = ?, kind = ?,
+                        heading_path = ?, segmentation_confidence = ?, segmentation_reason = ?,
+                        segmenter_version = ? WHERE id = ?""",
+                        (item.stable_key, item.ordinal, row["kind"] if manual else item.kind.value,
+                         row["heading_path"] if manual else item.heading_path,
+                         row["segmentation_confidence"] if manual else item.segmentation_confidence,
+                         row["segmentation_reason"] if manual else item.segmentation_reason,
+                         row["segmenter_version"] if manual else item.segmenter_version, row["id"]),
+                    )
+                else:
+                    connection.execute(
+                        """INSERT INTO segments
+                        (id, document_id, stable_key, ordinal, kind, source_text, heading_path,
+                         status, source_refs_json, segmentation_confidence, segmentation_reason,
+                         segmenter_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (new_id("seg") if item.id in retained else item.id,
+                         document_id, item.stable_key, item.ordinal, item.kind.value,
+                         item.source_text, item.heading_path, item.status.value,
+                         json.dumps(item.source_refs), item.segmentation_confidence,
+                         item.segmentation_reason, item.segmenter_version),
+                    )
+            connection.execute(
+                "UPDATE pdf_sources SET metadata_json = ? WHERE document_id = ?",
+                (json.dumps(metadata, ensure_ascii=False), document_id),
+            )
+            result = {"previous_count": len(old), "segment_count": len(segments),
+                      "preserved_count": len(retained), "replaced_count": len(removed)}
+            self._audit(connection, "document", document_id, "pdf_resegmented", result)
+        return result
+
     def get_original_pdf(self, document_id: str) -> bytes:
         with self._connect() as connection:
             row = connection.execute(

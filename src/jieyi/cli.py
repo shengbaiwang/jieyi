@@ -58,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     document.add_argument("--title")
     document.add_argument("--format", choices=["txt", "markdown", "epub"])
 
+    resegment = sub.add_parser("pdf-resegment", help="Upgrade PDF paragraphs, preserving translations")
+    resegment.add_argument("--document", required=True)
+
     term = sub.add_parser("term-add")
     term.add_argument("--project", required=True)
     term.add_argument("--source", required=True)
@@ -152,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
                 source_format=source_format,
             )
         print(json.dumps(asdict(item), ensure_ascii=False))
+    elif args.command == "pdf-resegment":
+        from jieyi.workflow.services import resegment_pdf_document
+
+        print(json.dumps(resegment_pdf_document(store, args.document), ensure_ascii=False))
     elif args.command == "term-add":
         item = store.add_term(
             TermEntry(

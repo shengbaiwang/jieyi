@@ -38,6 +38,7 @@ from jieyi.ingestion.epub_reader import (
     safe_resource,
 )
 from jieyi.ingestion.epub_roundtrip import parse_epub_archive
+from jieyi.ingestion.pdf_export import export_translated_pdf
 from jieyi.persistence.sqlite import NotFoundError, SQLiteStore
 from jieyi.providers import EchoProvider, OpenAICompatibleProvider, ProviderRegistry
 from jieyi.quality import (
@@ -971,6 +972,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         document = store.get_document(document_id)
         extension = (
             "epub" if format == "book" and document.source_format == "epub"
+            else "pdf" if format == "book" and document.source_format == "pdf"
             else "md" if document.source_format == "markdown" else "txt"
         )
         title = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]', "_", document.title).strip(" .") or "书籍"
@@ -987,6 +989,14 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                     "X-Content-Type-Options": "nosniff",
                 },
             )
+        if format == "book" and document.source_format == "pdf":
+            try:
+                content = await asyncio.to_thread(export_translated_pdf, store, document_id,
+                                                  bilingual=bilingual)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            return Response(content=content, media_type="application/pdf", headers={
+                "Content-Disposition": disposition, "X-Content-Type-Options": "nosniff"})
         media_type = (
             "text/markdown; charset=utf-8"
             if document.source_format == "markdown"
