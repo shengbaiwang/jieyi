@@ -7,6 +7,8 @@ import { ImportBookPanel, ProviderSettingsPanel } from "./setup-panels";
 import { TermDiscoveryPanel } from "./term-discovery-panel";
 import { TerminologyReviewPanel } from "./terminology-review-panel";
 import { createReaderNavigation, type ReaderPageTarget } from "./reader-navigation";
+import { activeChapter, toggleChapter, normalizeSegmentRanges, type ChapterLocation } from "./chapter-navigation";
+import { createSubmissionGate } from "./submission-gate";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
 const PAGE_SIZE = 120;
@@ -23,7 +25,7 @@ type Segment = {
   source_text: string; heading_path: string; machine_translation: string | null; edited_translation: string | null; reviewed_translation: string | null;
   accepted_translation: string | null; status: "source" | "machine_translated" | "human_confirmed";
 };
-type Chapter = { title: string; level: number; start_ordinal: number; end_ordinal: number; segment_count: number; translated_count: number; confirmed_count: number };
+type Chapter = ChapterLocation & { title: string; segment_count: number; translated_count: number; confirmed_count: number };
 type Overview = { document: Document; project: Project; segment_count: number; translated_count: number; confirmed_count: number; chapters: Chapter[] };
 type SegmentPage = { document: Document; project: Project; total: number; offset: number; limit: number; items: Segment[] };
 type SourceLayout = { source_text: string; blocks: string[] };
@@ -45,6 +47,7 @@ type HumanReviewItem = { segment_id: string; ordinal: number; reason: "error" | 
 type Candidate = { id: string; job_id: string; stage: string; provider: string; model: string; prompt_tokens: number; completion_tokens: number; cost_usd: number; created_at: string };
 type Job = {
   id: string; status: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
+  draining?: boolean;
   next_ordinal: number; total_cost_usd: number; last_error: string | null;
   total_segments?: number; processed_segments?: number; batch_count?: number;
   prompt_tokens?: number; completion_tokens?: number; reasoning_tokens?: number; total_tokens?: number;
@@ -136,18 +139,6 @@ function computeModeFromLegacy(mode: ComputeMode | undefined, effort: ReasoningE
   if (thinking !== undefined) return thinking ? "performance" : "economy";
   return fallback;
 }
-function normalizeSegmentRanges(ranges: [number, number][]) {
-  const sorted = ranges
-    .map(([start, end]) => [Math.min(start, end), Math.max(start, end)] as [number, number])
-    .sort((left, right) => left[0] - right[0] || left[1] - right[1]);
-  const merged: [number, number][] = [];
-  for (const [start, end] of sorted) {
-    const previous = merged.at(-1);
-    if (!previous || start > previous[1] + 1) merged.push([start, end]);
-    else previous[1] = Math.max(previous[1], end);
-  }
-  return merged;
-}
 function jobMatchesSettings(job: Job, settings: ProviderSettings, segmentRanges: [number, number][] = []) {
   if (JSON.stringify(normalizeSegmentRanges(job.recipe.segment_ranges || [])) !== JSON.stringify(normalizeSegmentRanges(segmentRanges))) return false;
   if (job.recipe.draft.provider !== settings.draft_provider || job.recipe.draft.model !== settings.draft_model) return false;
@@ -159,7 +150,7 @@ function overviewFromSegments(document: Document, project: Project, segments: Se
   for (const segment of segments) {
     const startsChapter = segment.kind === "heading";
     const title = startsChapter ? segment.source_text : segment.heading_path.split(" / ", 1)[0].trim() || "正文";
-    if (!chapters.length || startsChapter) chapters.push({ title, level: startsChapter ? Math.max(0, segment.heading_path.split(" / ").length - 1) : 0, start_ordinal: segment.ordinal, end_ordinal: segment.ordinal, segment_count: 0, translated_count: 0, confirmed_count: 0 });
+    if (!chapters.length || startsChapter) chapters.push({ id: `${document.id}:segment:${segment.id}`, title, level: startsChapter ? Math.max(0, segment.heading_path.split(" / ").length - 1) : 0, start_ordinal: segment.ordinal, end_ordinal: segment.ordinal, segment_count: 0, translated_count: 0, confirmed_count: 0 });
     const chapter = chapters.at(-1)!;
     chapter.end_ordinal = segment.ordinal; chapter.segment_count += 1;
     if (segmentTranslation(segment)) chapter.translated_count += 1;
@@ -207,8 +198,10 @@ export default function Home() {
   const sourceEditor = useRef<HTMLTextAreaElement | null>(null);
   const [loading, setLoading] = useState(true);
   const [startingTask, setStartingTask] = useState(false);
+  const taskSubmission = useRef(createSubmissionGate());
   const [draftPicker, setDraftPicker] = useState<{ document: Document; overview: Overview } | null>(null);
-  const [selectedChapterStarts, setSelectedChapterStarts] = useState<number[]>([]);
+  const [selectedChapterIds, setSelectedChapterIds] = useState<string[]>([]);
+  const [preferredChapterId, setPreferredChapterId] = useState<string | null>(null);
   const [draftPickerLoading, setDraftPickerLoading] = useState(false);
   const [segmentDraft, setSegmentDraft] = useState<{ documentId: string; segmentId: string; ordinal: number; jobId: string } | null>(null);
   const [readerSegments, setReaderSegments] = useState<Segment[]>([]);
@@ -252,8 +245,16 @@ export default function Home() {
   const currentSegment = useMemo(() => page?.items.find((item) => item.ordinal === ordinal) || null, [ordinal, page]);
   const currentChapter = useMemo(() => {
     const activeOrdinal = panel === "reader" ? readerOrdinal : ordinal;
-    return overview?.chapters.find((item) => activeOrdinal >= item.start_ordinal && activeOrdinal <= item.end_ordinal) || null;
-  }, [ordinal, overview, panel, readerOrdinal]);
+    return activeChapter(overview?.chapters || [], activeOrdinal, preferredChapterId);
+  }, [ordinal, overview, panel, readerOrdinal, preferredChapterId]);
+  useEffect(() => {
+    if (loading || readerLoading || !overview || overview.document.id !== selectedDocumentId
+      || (panel !== "translate" && panel !== "reader")) return;
+    const key = `jieyi.chapter.${overview.document.id}`;
+    if (currentChapter) localStorage.setItem(key, currentChapter.id);
+    else localStorage.removeItem(key);
+    localStorage.setItem(`jieyi.ordinal.${overview.document.id}`, String(panel === "reader" ? readerOrdinal : ordinal));
+  }, [currentChapter, loading, readerLoading, overview, selectedDocumentId, panel, readerOrdinal, ordinal]);
   const currentIssues = useMemo(() => issues.filter((item) => item.segment_id === currentSegment?.id), [currentSegment, issues]);
   const errorIssues = useMemo(() => issues.filter((item) => item.severity === "error"), [issues]);
   const displayIssues = useMemo(() => issues.filter((item) => item.severity !== "info").sort((a, b) => Number(a.severity !== "error") - Number(b.severity !== "error") || a.ordinal - b.ordinal), [issues]);
@@ -285,7 +286,7 @@ export default function Home() {
   const structureLocked = structureBusy || draftDirty || saveState === "saving" || sourceDirty || sourceSaveState === "saving" || Boolean(segmentDraft);
   const completion = overview?.segment_count ? Math.round((overview.confirmed_count / overview.segment_count) * 100) : 0;
   const translationProgress = overview?.segment_count ? Math.round((overview.translated_count / overview.segment_count) * 100) : 0;
-  const selectedDraftChapters = draftPicker?.overview.chapters.filter((chapter) => selectedChapterStarts.includes(chapter.start_ordinal)) || [];
+  const selectedDraftChapters = draftPicker?.overview.chapters.filter((chapter) => selectedChapterIds.includes(chapter.id)) || [];
   const selectedDraftRanges = normalizeSegmentRanges(selectedDraftChapters.map((chapter) => [chapter.start_ordinal, chapter.end_ordinal]));
   const selectedDraftSegmentCount = selectedDraftRanges.reduce((total, [start, end]) => total + end - start + 1, 0);
 
@@ -386,6 +387,7 @@ export default function Home() {
         api<Job[]>(`/documents/${document.id}/jobs`).catch(() => []),
       ]);
       setOverview(summary); setTerms(termItems); setIssues(issueItems); setHumanReviewQueue(reviewItems); setJobs(jobItems); setJobsDocumentId(document.id);
+      setPreferredChapterId(localStorage.getItem(`jieyi.chapter.${document.id}`));
       const remembered = Number(localStorage.getItem(`jieyi.ordinal.${document.id}`) || 0);
       await loadPageAt(document.id, targetOrdinal ?? remembered);
       const rememberedPanel = localStorage.getItem("jieyi.panel");
@@ -818,7 +820,7 @@ export default function Home() {
     }
   }
 
-  async function navigateTo(target: number) {
+  async function navigateTo(target: number, chapterId: string | null = preferredChapterId) {
     if (!overview || target < 0 || target >= overview.segment_count) return;
     if (sourceDirty) {
       notify("原文有未保存修改，请先保存或取消编辑。");
@@ -828,6 +830,15 @@ export default function Home() {
     catch { notify("当前译文保存失败，已停留在本段。"); return; }
     if (!page || target < page.offset || target >= page.offset + page.items.length) await loadPageAt(overview.document.id, target);
     else setOrdinal(target);
+    rememberChapter(activeChapter(overview.chapters, target, chapterId)?.id || null);
+  }
+
+  function rememberChapter(id: string | null) {
+    setPreferredChapterId(id);
+    if (!overview) return;
+    const key = `jieyi.chapter.${overview.document.id}`;
+    if (id) localStorage.setItem(key, id);
+    else localStorage.removeItem(key);
   }
 
   async function confirmCurrent() {
@@ -904,6 +915,7 @@ export default function Home() {
 
   async function openReader(document: Document) {
     setReaderLoading(true);
+    setPreferredChapterId(localStorage.getItem(`jieyi.chapter.${document.id}`));
     setPanel("reader");
     setSelectedDocumentId(document.id);
     setEpubSpineHeights({});
@@ -960,8 +972,9 @@ export default function Home() {
 
   function jumpToReaderChapter(chapter: Chapter) {
     if (readerLoading) return;
+    rememberChapter(chapter.id);
     if (overview?.document.source_format === "pdf") {
-      setPdfReaderPage(pdfPages(readerSegments.find((segment) => segment.ordinal === chapter.start_ordinal)?.source_refs)[0] || 1);
+      setPdfReaderPage(chapter.target?.page || pdfPages(readerSegments.find((segment) => segment.ordinal === chapter.start_ordinal)?.source_refs)[0] || 1);
       setReaderOrdinal(chapter.start_ordinal);
       return;
     }
@@ -1005,16 +1018,14 @@ export default function Home() {
         : await api<Overview>("/documents/" + document.id + "/overview");
       const remaining = summary.chapters.filter((chapter) => chapter.translated_count < chapter.segment_count);
       setDraftPicker({ document, overview: summary });
-      setSelectedChapterStarts([...new Set((remaining.length ? remaining : summary.chapters).map((chapter) => chapter.start_ordinal))]);
+      setSelectedChapterIds((remaining.length ? remaining : summary.chapters).map((chapter) => chapter.id));
     } catch (error) {
       notify(error instanceof Error ? error.message : "无法读取目录");
     } finally { setDraftPickerLoading(false); }
   }
 
-  function toggleDraftChapter(startOrdinal: number) {
-    setSelectedChapterStarts((current) => current.includes(startOrdinal)
-      ? current.filter((item) => item !== startOrdinal)
-      : [...current, startOrdinal]);
+  function toggleDraftChapter(id: string) {
+    setSelectedChapterIds((current) => toggleChapter(current, id));
   }
 
   async function draftCurrentSegment() {
@@ -1031,24 +1042,25 @@ export default function Home() {
   }
 
   async function runWholeBook(document: Document, segmentRanges: [number, number][] = []) {
-    if (startingTask) return;
-    const normalizedRanges = normalizeSegmentRanges(segmentRanges);
-    const singleOrdinal = normalizedRanges.length === 1 && normalizedRanges[0][0] === normalizedRanges[0][1] ? normalizedRanges[0][0] : null;
-    const providerSettings = settings || await api<ProviderSettings>("/settings/provider").catch(() => null);
-    if (!providerSettings) { setPanel("settings"); notify("请先配置并测试草译模型。"); return; }
-    const bookConfig = settingsForBook(document.id, providerSettings);
-    const draftProfile = providerSettings.profiles.find((item) => item.id === bookConfig.draft_profile_id);
-    if (!draftProfile?.base_url || !bookConfig.draft_model) { openBookSettings(document); notify("请先为这本书选择草译连接与模型。"); return; }
-    const currentSettings: ProviderSettings = {
-      ...providerSettings,
-      base_url: draftProfile.base_url,
-      draft_profile_id: bookConfig.draft_profile_id,
-      draft_provider: `profile:${bookConfig.draft_profile_id}`,
-      draft_model: bookConfig.draft_model,
-      draft_compute_mode: bookConfig.draft_compute_mode,
-    };
+    const release = taskSubmission.current.acquire();
+    if (!release) return;
     setStartingTask(true);
     try {
+      const normalizedRanges = normalizeSegmentRanges(segmentRanges);
+      const singleOrdinal = normalizedRanges.length === 1 && normalizedRanges[0][0] === normalizedRanges[0][1] ? normalizedRanges[0][0] : null;
+      const providerSettings = settings || await api<ProviderSettings>("/settings/provider").catch(() => null);
+      if (!providerSettings) { setPanel("settings"); notify("请先配置并测试草译模型。"); return; }
+      const bookConfig = settingsForBook(document.id, providerSettings);
+      const draftProfile = providerSettings.profiles.find((item) => item.id === bookConfig.draft_profile_id);
+      if (!draftProfile?.base_url || !bookConfig.draft_model) { openBookSettings(document); notify("请先为这本书选择草译连接与模型。"); return; }
+      const currentSettings: ProviderSettings = {
+        ...providerSettings,
+        base_url: draftProfile.base_url,
+        draft_profile_id: bookConfig.draft_profile_id,
+        draft_provider: `profile:${bookConfig.draft_profile_id}`,
+        draft_model: bookConfig.draft_model,
+        draft_compute_mode: bookConfig.draft_compute_mode,
+      };
       const existingJobs = await api<Job[]>("/documents/" + document.id + "/jobs");
       let job = existingJobs.find((item) => ["pending", "running", "paused", "failed"].includes(item.status) && jobMatchesSettings(item, currentSettings, normalizedRanges));
       if (!job) {
@@ -1071,14 +1083,15 @@ export default function Home() {
           : "全书草译已在后台启动；已有译文的段落会自动跳过。");
       return started;
     } catch (error) { notify(error instanceof Error ? error.message : "草译启动失败"); }
-    finally { setStartingTask(false); }
+    finally { release(); setStartingTask(false); }
   }
 
   async function controlJob(job: Job, action: "pause" | "cancel") {
     try {
       const updated = await api<Job>("/jobs/" + job.id + "/" + action, { method: "POST" });
       setJobs((items) => items.map((item) => item.id === updated.id ? updated : item));
-      notify(action === "pause" ? "任务已暂停，进度与译文均已保存。" : "任务已取消，已有译文仍会保留。");
+      notify(updated.draining ? "已停止派发新请求，正在保存已发请求的结果。"
+        : action === "pause" ? "任务已暂停，进度与译文均已保存。" : "任务已取消，已有译文仍会保留。");
     } catch (error) { notify(error instanceof Error ? error.message : "任务控制失败"); }
   }
 
@@ -1092,6 +1105,7 @@ export default function Home() {
       setSelectedDocumentId(remaining[0]?.id || "");
       legacySegments.current.delete(pendingDelete.id);
       localStorage.removeItem("jieyi.ordinal." + pendingDelete.id);
+      localStorage.removeItem("jieyi.chapter." + pendingDelete.id);
       localStorage.removeItem("jieyi.book-settings." + pendingDelete.id);
       setBookSettings((current) => { const next = { ...current }; delete next[pendingDelete.id]; return next; });
       if (overview?.document.id === pendingDelete.id) {
@@ -1145,11 +1159,12 @@ export default function Home() {
         {selectedJob && <details className="workspace-job"><summary><span>当前任务</span><strong>{jobStatusLabel(selectedJob.status, selectedJob.deferred_segments)}</strong></summary>{selectedJob && <div className={"job-progress-card status-" + selectedJob.status}><div className="job-progress-head"><div><span>{selectedJob.recipe.segment_ranges?.length ? "篇章草译" : "全书草译"}</span><strong>{jobStatusLabel(selectedJob.status, selectedJob.deferred_segments)}</strong></div><small>{selectedJob.processed_segments ?? selectedJob.next_ordinal} / {selectedJob.total_segments ?? "—"} 段</small></div><div className="job-progress-track"><span style={{ width: String(Math.min(100, Math.round(((selectedJob.processed_segments ?? selectedJob.next_ordinal) / Math.max(1, selectedJob.total_segments || 1)) * 100))) + "%" }} /></div><div className="job-metrics"><span><b>{selectedJob.batch_count || 0}</b> 批</span><span><b>{formatTokens(selectedJob.total_tokens)}</b> token</span><span><b>{formatTokens(selectedJob.reasoning_tokens)}</b> 推理</span>{Boolean(selectedJob.model_call_count) && <span><b>{selectedJob.model_call_count}</b> 已记录请求</span>}{Boolean(selectedJob.retry_call_count) && <span><b>{selectedJob.retry_call_count}</b> 重试</span>}{Boolean(selectedJob.repair_call_count) && <span><b>{selectedJob.repair_call_count}</b> 结构修复</span>}{Boolean(selectedJob.deferred_segments) && <span><b>{selectedJob.deferred_segments}</b> 隔离待复核</span>}<span><b>{formatDuration(selectedJob.eta_seconds)}</b> 预计剩余</span></div><p>{`单段隔离、${selectedJob.recipe.concurrency || 3}→${selectedJob.recipe.max_concurrency || selectedJob.recipe.concurrency || 3} 路自适应并发；异常段不会覆盖正文。`}</p>{selectedJob.last_error && <div className="job-progress-error">{selectedJob.last_error}</div>}<div className="job-controls">{selectedJob.status === "running" && <button onClick={() => void controlJob(selectedJob, "pause")}>暂停</button>}{(selectedJob.status === "paused" || selectedJob.status === "failed") && selectedDocument && <button className="accent" onClick={() => void runWholeBook(selectedDocument, selectedJob.recipe.segment_ranges || [])}>继续</button>}{!["completed", "cancelled"].includes(selectedJob.status) && <button className="danger" onClick={() => void controlJob(selectedJob, "cancel")}>取消任务</button>}</div></div>}</details>}
 
         {overview && overview.document.id === selectedDocumentId && ["translate", "reader", "quality"].includes(panel) && <><div className="eyebrow section-label">
-          <span>目录</span><small>{overview.chapters.length} 节</small></div><div className="chapter-list real-chapters">{overview.chapters.map((chapter, index) => <button key={`${chapter.start_ordinal}-${chapter.level}-${chapter.title}`} data-level={chapter.level} style={{ paddingLeft: `${9 + Math.min(chapter.level, 3) * 12}px` }} className={`chapter ${currentChapter?.start_ordinal === chapter.start_ordinal ? "active" : ""}`}
-          aria-current={currentChapter?.start_ordinal === chapter.start_ordinal ? "location" : undefined} disabled={panel === "reader" && readerLoading}
-          onClick={() => { if (panel === "reader") jumpToReaderChapter(chapter); else void navigateTo(chapter.start_ordinal); }}
+          <span>目录</span><small>{overview.chapters.length} 节</small></div><div className="chapter-list real-chapters">{overview.chapters.map((chapter, index) => <button key={chapter.id} data-level={chapter.level} style={{ paddingLeft: `${9 + Math.min(chapter.level, 3) * 12}px` }} className={`chapter ${currentChapter?.id === chapter.id ? "active" : ""}`}
+          aria-current={currentChapter?.id === chapter.id ? "location" : undefined} disabled={panel === "reader" && readerLoading}
+          onClick={() => { if (panel === "reader") jumpToReaderChapter(chapter); else void navigateTo(chapter.start_ordinal, chapter.id); }}
           title={panel === "reader" && readerPageTargets[chapter.start_ordinal] ? `${chapter.title} · 第 ${readerPageTargets[chapter.start_ordinal].pageNumber} 页` : chapter.title}><span>{String(index + 1).padStart(2, "0")}</span>
           <div><strong>{chapter.title}</strong>
+            {chapter.target && <small>PDF 第 {chapter.target.page} 页{chapter.shared_range ? " · 共享范围" : ""}</small>}
             <small>{panel === "reader" && readerPageTargets[chapter.start_ordinal] ? `第 ${readerPageTargets[chapter.start_ordinal].pageNumber} 页 · ${chapter.segment_count} 段` : `${chapter.confirmed_count} 已确认 · ${chapter.segment_count} 段`}</small>
           </div>
         </button>)}</div></>}
@@ -1166,7 +1181,7 @@ export default function Home() {
           {selectedDocument && <><fieldset className="export-options"><legend>选择导出内容</legend>
             <label aria-label="仅译文" htmlFor="export-translated" className={!exportBilingual ? "selected" : ""}><input id="export-translated" type="radio" name="book-export-mode" checked={!exportBilingual} onChange={() => setExportBilingual(false)} /><span><strong>仅译文</strong><small>只包含译文，适合连续阅读。</small></span></label>
             <label aria-label="原文译文对照" htmlFor="export-bilingual" className={exportBilingual ? "selected" : ""}><input id="export-bilingual" type="radio" name="book-export-mode" checked={exportBilingual} onChange={() => setExportBilingual(true)} /><span><strong>原文译文对照</strong><small>逐段保留原文与译文，方便对照阅读。</small></span></label>
-          </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : selectedDocument.source_format === "pdf" ? "导出为 PDF，保留原页尺寸、图片、图表与目录；双语版逐页交替原文和译文。放不下或无法安全替换的译文附在续页。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
+          </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : selectedDocument.source_format === "pdf" ? "导出为 PDF，保留原页尺寸、图片、图表与目录；双语版逐页交替原文和译文。较长译文会在原页文字区内自适应重排。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
         </section>}
 
         {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
@@ -1206,7 +1221,7 @@ export default function Home() {
             <strong>{currentChapter?.title || (epubReader ? `${epubReader.spine.filter((item) => item.linear).length} 个书脊文档` : `${readerSegments.length} 段`)}</strong></div>
             <div className="reader-toolbar-actions">{overview?.document.source_format === "pdf" && <button className="pdf-page-link" onClick={() => setPdfSource({ documentId: overview.document.id, title: overview.document.title, page: pdfPages(readerSegments.find((segment) => segment.ordinal === readerOrdinal)?.source_refs)[0] || 1 })}>查看 PDF 原页 ↗</button>}
               {epubReader?.spine.some((item) => item.fixed_layout) && <div className="segmented" aria-label="定版 EPUB 排版策略"><button className={readerLayout === "faithful" ? "active" : ""} onClick={() => changeReaderLayout("faithful")}>忠实排版</button><button className={readerLayout === "comfort" ? "active" : ""} onClick={() => changeReaderLayout("comfort")}>舒适阅读</button></div>}<div className="segmented" aria-label="显示"><button className={readerMode === "original" ? "active" : ""} onClick={() => changeReaderMode("original")}>原文</button><button className={readerMode === "translated" ? "active" : ""} onClick={() => changeReaderMode("translated")}>译文</button><button className={readerMode === "bilingual" ? "active" : ""} onClick={() => changeReaderMode("bilingual")}>双语</button></div></div></div>
-          {readerLoading ? <div className="empty-workspace">正在准备原书资源…</div> : overview?.document.source_format === "pdf" ? <PdfLayoutReader key={`${overview.document.id}-${pdfReaderPage}-${readerMode}`} apiBase={API_BASE} documentId={overview.document.id} page={pdfReaderPage} mode={readerMode} onPage={(number) => { setPdfReaderPage(number); const segment = readerSegments.find((item) => pdfPages(item.source_refs).includes(number)); if (segment) setReaderOrdinal(segment.ordinal); }} /> : epubReader ? <div className={`epub-reader-stack layout-${readerLayout}`}>{epubReader.cover_url && <section className="epub-cover-sheet"><img src={API_BASE + epubReader.cover_url} alt={`《${overview?.document.title || "EPUB"}》封面`} /></section>}
+          {readerLoading ? <div className="empty-workspace">正在准备原书资源…</div> : overview?.document.source_format === "pdf" ? <PdfLayoutReader key={`${overview.document.id}-${readerMode}`} apiBase={API_BASE} documentId={overview.document.id} page={pdfReaderPage} mode={readerMode} onPage={(number) => { rememberChapter(null); setPdfReaderPage(number); const segment = readerSegments.find((item) => pdfPages(item.source_refs).includes(number)); if (segment) setReaderOrdinal(segment.ordinal); }} /> : epubReader ? <div className={`epub-reader-stack layout-${readerLayout}`}>{epubReader.cover_url && <section className="epub-cover-sheet"><img src={API_BASE + epubReader.cover_url} alt={`《${overview?.document.title || "EPUB"}》封面`} /></section>}
             {epubReader.spine.filter((item) => item.linear).map((item, index) =>
               <section id={`reader-spine-${item.spine_index}`} data-reader-ordinal={readerOrdinalForSpine(item.spine_index)} data-reader-page={index + 1} className={`epub-spine-sheet ${item.fixed_layout ? "fixed-layout" : "reflowable"}`} key={item.spine_index}>
                 <iframe title={`${overview?.document.title || "EPUB"} · 第 ${index + 1} 页 · ${item.path}`}
@@ -1271,7 +1286,7 @@ export default function Home() {
 
     {pdfSource && <PdfSourcePanel key={`${pdfSource.documentId}-${pdfSource.page}`} apiBase={API_BASE} documentId={pdfSource.documentId} title={pdfSource.title} initialPage={pdfSource.page} onClose={() => setPdfSource(null)} />}
     {searchOpen && <div className="command-overlay"><div className="command-palette search-palette"><form onSubmit={(event) => void performSearch(event)}><Mark>⌕</Mark><input ref={searchInput} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索当前书籍的原文或译文…" /><button type="submit" className="search-submit" disabled={!searchQuery.trim() || searching}>{searching ? "搜索中" : "搜索"}</button><button type="button" className="search-close" aria-label="关闭搜索" onClick={() => setSearchOpen(false)}>×</button></form><div className="command-results">{searching ? <div className="search-message">正在搜索…</div> : searchResults.length ? searchResults.map((item) => <button key={item.id} onClick={() => { setSearchOpen(false); setPanel("translate"); void navigateTo(item.ordinal); }}><span><strong>第 {item.ordinal + 1} 段</strong><small>{item.source_text.slice(0, 120)}</small></span><Mark>↵</Mark></button>) : <div className="search-message">输入关键词，搜索整本书的原文和译文。</div>}</div></div></div>}
-    {draftPicker && <div className="command-overlay chapter-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !startingTask) setDraftPicker(null); }}><div className="chapter-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="chapter-picker-title"><header><div><span>草译范围</span><h2 id="chapter-picker-title">选择要翻译的篇章</h2><p>《{draftPicker.document.title}》· 可多选，任务只处理勾选范围。</p></div><button aria-label="关闭篇章选择" onClick={() => setDraftPicker(null)} disabled={startingTask}>×</button></header><div className="chapter-picker-tools"><strong>目录 · {draftPicker.overview.chapters.length} 节</strong><div><button onClick={() => setSelectedChapterStarts([...new Set(draftPicker.overview.chapters.map((chapter) => chapter.start_ordinal))])}>全选</button><button onClick={() => setSelectedChapterStarts([])}>清空</button></div></div><div className="chapter-picker-list" role="group" aria-label="选择草译篇章">{draftPicker.overview.chapters.map((chapter, index) => { const checked = selectedChapterStarts.includes(chapter.start_ordinal); return <label className={checked ? "selected" : ""} key={chapter.start_ordinal + "-" + chapter.title}><input type="checkbox" checked={checked} onChange={() => toggleDraftChapter(chapter.start_ordinal)} /><span className="chapter-check" aria-hidden="true">✓</span><span className="chapter-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{chapter.title}</strong><small>{chapter.segment_count} 段 · 已草译 {chapter.translated_count} · 已确认 {chapter.confirmed_count}</small></div></label>; })}</div><footer><span>已选 <strong>{selectedDraftChapters.length}</strong> 篇 · 去重后共 <strong>{selectedDraftSegmentCount}</strong> 段</span><div><button onClick={() => setDraftPicker(null)} disabled={startingTask}>取消</button><button className="accent" disabled={!selectedDraftRanges.length || startingTask} onClick={() => void runWholeBook(draftPicker.document, selectedDraftRanges)}>{startingTask ? "正在启动…" : "开始草译所选篇章"}</button></div></footer></div></div>}
+    {draftPicker && <div className="command-overlay chapter-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !startingTask) setDraftPicker(null); }}><div className="chapter-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="chapter-picker-title"><header><div><span>草译范围</span><h2 id="chapter-picker-title">选择要翻译的篇章</h2><p>《{draftPicker.document.title}》· 可多选，任务只处理勾选范围。共享范围的目录项可独立勾选，重叠段落只翻译一次。</p></div><button aria-label="关闭篇章选择" onClick={() => setDraftPicker(null)} disabled={startingTask}>×</button></header><div className="chapter-picker-tools"><strong>目录 · {draftPicker.overview.chapters.length} 节</strong><div><button onClick={() => setSelectedChapterIds(draftPicker.overview.chapters.map((chapter) => chapter.id))}>全选</button><button onClick={() => setSelectedChapterIds([])}>清空</button></div></div><div className="chapter-picker-list" role="group" aria-label="选择草译篇章">{draftPicker.overview.chapters.map((chapter, index) => { const checked = selectedChapterIds.includes(chapter.id); return <label className={checked ? "selected" : ""} key={chapter.id}><input type="checkbox" checked={checked} onChange={() => toggleDraftChapter(chapter.id)} /><span className="chapter-check" aria-hidden="true">✓</span><span className="chapter-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{chapter.title}</strong><small>{chapter.segment_count} 段 · 已草译 {chapter.translated_count} · 已确认 {chapter.confirmed_count}{chapter.shared_range ? " · 与其他目录项共享范围" : ""}</small></div></label>; })}</div><footer><span>已选 <strong>{selectedDraftChapters.length}</strong> 篇 · 去重后共 <strong>{selectedDraftSegmentCount}</strong> 段</span><div><button onClick={() => setDraftPicker(null)} disabled={startingTask}>取消</button><button className="accent" disabled={!selectedDraftRanges.length || startingTask} onClick={() => void runWholeBook(draftPicker.document, selectedDraftRanges)}>{startingTask ? "正在启动…" : "开始草译所选篇章"}</button></div></footer></div></div>}
     {sourceSaveWarning && <div className="command-overlay delete-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && sourceSaveState !== "saving") setSourceSaveWarning(false); }}>
       <div className="structure-dialog" role="dialog" aria-modal="true" aria-labelledby="source-save-title">
         <div className="structure-mark danger">!</div>

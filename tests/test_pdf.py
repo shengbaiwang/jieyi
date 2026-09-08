@@ -60,6 +60,57 @@ def test_pdf_layout_provenance_and_bookmarks():
     assert book.pages[1]["label"] == "2"
 
 
+def test_pdf_directory_identity_is_independent_of_page_and_segment(tmp_path):
+    # Legacy metadata stores only page-level destinations. No reimport or
+    # segmentation rewrite should be required to give every entry an identity.
+    writer = PdfWriter(clone_from=io.BytesIO(pdf_fixture()))
+    parent = writer.add_outline_item("Index", 0)
+    for title in ["F", "G", "H", "I", "F"]:
+        writer.add_outline_item(title, 0, parent=parent)
+    writer.add_outline_item("Continuation", 1)
+    output = io.BytesIO()
+    writer.write(output)
+    with TestClient(create_app(str(tmp_path / "directory.db"))) as client:
+        project = client.post(
+            "/projects", json={"name": "Directory", "source_lang": "en", "target_lang": "zh-CN"}
+        ).json()
+        doc = client.post(f"/projects/{project['id']}/documents/pdf", content=output.getvalue()).json()
+        root = f"/documents/{doc['id']}"
+        before_segments = client.get(root + "/segments").json()
+        chapters = client.get(root + "/overview").json()["chapters"]
+        assert len(chapters) == 9
+        assert len({item["id"] for item in chapters}) == len(chapters)
+        assert [item["title"] for item in chapters].count("F") == 2
+        siblings = [item for item in chapters if item["title"] in {"F", "G", "H", "I"}]
+        assert len({item["start_ordinal"] for item in siblings}) == 1
+        assert all(item["shared_range"] for item in siblings)
+        assert all(item["target"] == {"format": "pdf", "page": 1} for item in siblings)
+        # Navigation keeps the source page independently of its segment ordinal.
+        continuation = next(item for item in chapters if item["title"] == "Continuation")
+        assert continuation["start_ordinal"] == 1
+        assert continuation["target"]["page"] == 2
+        assert client.get(root + "/overview").json()["chapters"] == chapters
+        assert client.get(root + "/segments").json() == before_segments
+
+        first = before_segments[0]
+        assert client.patch(f"/segments/{first['id']}/draft",
+                            json={"translation": "保存的译文"}).status_code == 200
+        assert client.patch(f"/segments/{first['id']}/heading",
+                            json={"heading": True}).status_code == 200
+        edited = client.get(root + "/overview").json()["chapters"]
+        assert [item["id"] for item in edited] == [item["id"] for item in chapters]
+        assert len(edited) == len(chapters), "manual headings must not collapse same-page bookmarks"
+        assert client.get(root + "/segments").json()[0]["edited_translation"] == "保存的译文"
+        segment = before_segments[1]
+        split = client.post(f"/segments/{segment['id']}/split", json={
+            "source_text": segment["source_text"], "selection_start": 0, "selection_end": 5,
+        })
+        assert split.status_code == 200, split.text
+        shifted = client.get(root + "/overview").json()["chapters"]
+        assert [item["id"] for item in shifted] == [item["id"] for item in chapters]
+        assert shifted[-1]["start_ordinal"] > chapters[-1]["start_ordinal"]
+
+
 def test_ligatures_preserve_words_without_duplicate_glyphs():
     chars = [
         {"text": text, "x0": x, "x1": x + 5, "top": 0, "size": 10}
@@ -114,6 +165,14 @@ def test_pdf_api_import_reuse_translate_export_delete(tmp_path):
         assert doc["source_format"] == "pdf"
         assert client.post(path, content=data).json()["id"] == doc["id"]
         root = f"/documents/{doc['id']}"
+        library = client.get(f"/projects/{project['id']}/documents").json()
+        assert library == [
+            {
+                **doc,
+                "cover_url": f"/documents/{doc['id']}/pdf/pages/1?width=320",
+            }
+        ]
+        assert client.get(library[0]["cover_url"]).headers["content-type"] == "image/png"
         assert client.get(root + "/pdf/original").content == data
         assert client.get(root + "/pdf/pages/2").headers["content-type"] == "image/png"
         assert client.get(root + "/pdf/pages/4").status_code == 404

@@ -659,7 +659,33 @@ class WorkflowTests(unittest.TestCase):
             text="\n\n".join(f"Segment {index}." for index in range(12)),
             source_format="txt",
         )
-        provider = ConcurrentProbeProvider()
+        class AdaptiveBarrierProvider:
+            # Explicit request waves exercise 2 -> 3 -> 4 slots without relying
+            # on whether local SQLite commits take more or less than 20 ms.
+            def __init__(self):
+                self.calls = 0
+                self.active = 0
+                self.max_active = 0
+                self.waves = [asyncio.Event() for _ in range(3)]
+                self.arrivals = [0, 0, 0]
+
+            async def complete(self, messages, model, **kwargs):
+                self.calls += 1
+                number = self.calls
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    wave = 0 if number <= 2 else 1 if number <= 5 else 2 if number <= 9 else None
+                    if wave is not None:
+                        self.arrivals[wave] += 1
+                        if self.arrivals[wave] == (2, 3, 4)[wave]:
+                            self.waves[wave].set()
+                        await asyncio.wait_for(self.waves[wave].wait(), timeout=2)
+                    return TranslationResult(text=f"translated:{_sources_from_messages(messages)[0]}")
+                finally:
+                    self.active -= 1
+
+        provider = AdaptiveBarrierProvider()
         registry = ProviderRegistry()
         registry.register("adaptive", provider)
         engine = TranslationEngine(self.store, registry)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -39,6 +40,7 @@ from jieyi.ingestion.epub_reader import (
 )
 from jieyi.ingestion.epub_roundtrip import parse_epub_archive
 from jieyi.ingestion.pdf_export import export_translated_pdf
+from jieyi.persistence.execution import DocumentBusyError
 from jieyi.persistence.sqlite import NotFoundError, SQLiteStore
 from jieyi.providers import EchoProvider, OpenAICompatibleProvider, ProviderRegistry
 from jieyi.quality import (
@@ -302,6 +304,11 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     async def not_found_handler(_, exc: NotFoundError):
         return PlainTextResponse(str(exc), status_code=404)
 
+    @app.exception_handler(DocumentBusyError)
+    async def document_busy_handler(_, exc: DocumentBusyError):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     @app.get("/health")
     async def health():
         return {
@@ -343,6 +350,11 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                 cover_path = package.get("cover_path")
                 if cover_path:
                     payload["cover_url"] = f"/documents/{item.id}/epub/resources/{cover_path}"
+            elif item.source_format == "pdf":
+                # PDFs do not expose a separate cover resource. The first page is
+                # the conventional cover and is already rendered by the bounded,
+                # cached PDF preview route.
+                payload["cover_url"] = f"/documents/{item.id}/pdf/pages/1?width=320"
             documents.append(payload)
         return documents
 
@@ -564,9 +576,14 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         segments = store.list_segments(document_id)
         chapters: list[dict] = []
 
-        def chapter_row(title: str, start: int, end: int, level: int = 0) -> dict:
+        def chapter_row(
+            title: str, start: int, end: int, level: int = 0,
+            *, identity: str | None = None, target: dict | None = None,
+        ) -> dict:
             members = [item for item in segments if start <= item.ordinal <= end]
             return {
+                "id": identity or f"{document_id}:segment:{segments[start].id}",
+                **({"target": target} if target else {}),
                 "title": title,
                 "level": level,
                 "start_ordinal": start,
@@ -600,22 +617,21 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                             continue
                     atoms = store.list_epub_mappings(document_id)["atoms"]
                     positioned = position_navigation(navigation, roots, atoms)
+                    navigation_order = {id(entry): order for order, entry in enumerate(navigation)}
                     segment_ordinals = {item.id: item.ordinal for item in segments}
                     navigation_starts = []
-                    seen = set()
-                    for order, item in enumerate(positioned):
+                    for item in positioned:
+                        order = navigation_order[id(item.entry)]
                         start = segment_ordinals.get(item.atom["segment_id"])
-                        key = (start, item.entry.label, item.entry.level)
-                        if start is None or key in seen:
+                        if start is None:
                             continue
-                        seen.add(key)
                         navigation_starts.append((start, order, item.entry))
                     navigation_starts.sort(key=lambda item: (item[0], item[1]))
                     if navigation_starts:
                         first_start = navigation_starts[0][0]
                         if first_start > 0:
                             chapters.append(chapter_row("正文", 0, first_start - 1))
-                        for index, (start, _, entry) in enumerate(navigation_starts):
+                        for index, (start, order, entry) in enumerate(navigation_starts):
                             later = next(
                                 (
                                     candidate[0]
@@ -624,24 +640,32 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                                 ),
                                 len(segments),
                             )
-                            chapters.append(chapter_row(entry.label, start, later - 1, entry.level))
+                            chapters.append(chapter_row(
+                                entry.label, start, later - 1, entry.level,
+                                identity=f"{document_id}:epub:{order}",
+                            ))
             except (NotFoundError, ValueError):
                 chapters = []
         if document.source_format == "pdf":
             metadata = store.get_pdf_metadata(document_id)
             starts = []
-            for entry in metadata["navigation"]:
+            for order, entry in enumerate(metadata["navigation"]):
                 start = next((segment.ordinal for segment in segments
                     if any(int(ref.rsplit(":", 1)[-1]) >= entry["page"]
                            for ref in segment.source_refs if ref.startswith("pdf:page:"))), None)
                 if start is not None:
-                    starts.append((start, entry))
+                    starts.append((start, order, entry))
+            starts.sort(key=lambda item: (item[0], item[1]))
             if starts and starts[0][0] > 0:
                 chapters.append(chapter_row("封面与前言", 0, starts[0][0] - 1))
-            for index, (start, entry) in enumerate(starts):
-                end = next((value for value, _ in starts[index + 1:] if value > start),
+            for index, (start, order, entry) in enumerate(starts):
+                end = next((value for value, _, _ in starts[index + 1:] if value > start),
                            len(segments)) - 1
-                chapters.append(chapter_row(entry["title"], start, end, entry["level"]))
+                chapters.append(chapter_row(
+                    entry["title"], start, end, entry["level"],
+                    identity=f"{document_id}:pdf:{order}",
+                    target={"format": "pdf", "page": entry["page"]},
+                ))
 
         manual_headings = [
             item
@@ -650,33 +674,28 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
             and item.segmentation_reason in {"manual_split", "manual_heading"}
         ]
         if chapters and manual_headings:
-            boundaries = {
-                int(chapter["start_ordinal"]): (
-                    str(chapter["title"]),
-                    int(chapter["level"]),
-                )
-                for chapter in chapters
-            }
+            # Preserve source entries even when several bookmarks share a boundary.
+            # A manually promoted/renamed heading replaces only the first entry there.
             for heading in manual_headings:
-                boundaries[heading.ordinal] = (
-                    heading.source_text,
-                    max(0, heading.heading_path.count(" / ")),
-                )
-            ordered_boundaries = sorted(boundaries.items())
+                match = next((item for item in chapters
+                              if item["start_ordinal"] == heading.ordinal), None)
+                if match is not None:
+                    match["title"] = heading.source_text
+                else:
+                    chapters.append(chapter_row(
+                        heading.source_text, heading.ordinal, heading.ordinal,
+                        max(0, heading.heading_path.count(" / ")),
+                    ))
+            chapters.sort(key=lambda item: item["start_ordinal"])
+            boundaries = sorted({item["start_ordinal"] for item in chapters} | {len(segments)})
             chapters = [
                 chapter_row(
-                    title,
-                    start,
-                    (
-                        ordered_boundaries[index + 1][0] - 1
-                        if index + 1 < len(ordered_boundaries)
-                        else len(segments) - 1
-                    ),
-                    level,
+                    item["title"], item["start_ordinal"],
+                    next(value for value in boundaries if value > item["start_ordinal"]) - 1,
+                    item["level"], identity=item["id"], target=item.get("target"),
                 )
-                for index, (start, (title, level)) in enumerate(ordered_boundaries)
+                for item in chapters
             ]
-
 
         if not chapters:
             for segment in segments:
@@ -690,6 +709,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                     level = max(0, segment.heading_path.count(" / ")) if starts_chapter else 0
                     chapters.append(
                         {
+                            "id": f"{document_id}:segment:{segment.id}",
                             "title": title,
                             "level": level,
                             "start_ordinal": segment.ordinal,
@@ -711,6 +731,9 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                     chapter["translated_count"] += 1
                 if segment.status.value == "human_confirmed":
                     chapter["confirmed_count"] += 1
+        ranges = Counter((item["start_ordinal"], item["end_ordinal"]) for item in chapters)
+        for chapter in chapters:
+            chapter["shared_range"] = ranges[(chapter["start_ordinal"], chapter["end_ordinal"])] > 1
         return {
             "document": asdict(document),
             "project": asdict(project),
@@ -810,6 +833,8 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     async def start_job(job_id: str):
         try:
             return manager.start(job_id)
+        except DocumentBusyError:
+            raise
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -825,7 +850,9 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     async def run_job(job_id: str, max_segments: int | None = Query(default=None, ge=1)):
         try:
             return asdict(await engine.run(job_id, max_segments=max_segments))
-        except KeyError as exc:
+        except DocumentBusyError:
+            raise
+        except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/jobs/{job_id}")

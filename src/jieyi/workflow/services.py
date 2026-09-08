@@ -174,12 +174,16 @@ def create_job(
         draft_request or ("high" if draft_thinking else "none"), "economy"
     )
     resolved_draft_effort = legacy_effort_for_mode(resolved_draft_mode)
-    normalized_ranges = tuple(sorted((int(start), int(end)) for start, end in segment_ranges))
-    for index, (start, end) in enumerate(normalized_ranges):
+    normalized_ranges: list[tuple[int, int]] = []
+    for start, end in sorted(segment_ranges):
+        if not isinstance(start, int) or not isinstance(end, int) or isinstance(start, bool) or isinstance(end, bool):
+            raise ValueError("segment_ranges must contain integer ordinals")  # noqa: TRY004 -- validation API
         if start < 0 or end < start or end >= segment_count:
             raise ValueError("segment_ranges must contain valid inclusive document ordinals")
-        if index and start <= normalized_ranges[index - 1][1]:
-            raise ValueError("segment_ranges must be ordered and non-overlapping")
+        if normalized_ranges and start <= normalized_ranges[-1][1] + 1:
+            normalized_ranges[-1] = (normalized_ranges[-1][0], max(normalized_ranges[-1][1], end))
+        else:
+            normalized_ranges.append((start, end))
     recipe = TranslationRecipe(
         draft=ModelSpec(provider=draft_provider, model=draft_model),
         tm_enabled=tm_enabled,
@@ -194,6 +198,8 @@ def create_job(
         draft_reasoning_effort=resolved_draft_effort,
         max_output_tokens=max_output_tokens,
         token_budget=token_budget,
-        segment_ranges=normalized_ranges,
+        segment_ranges=tuple(normalized_ranges),
     )
-    return store.create_job(Job(id=new_id("job"), document_id=document_id, recipe=recipe))
+    return store.create_job(
+        Job(id=new_id("job"), document_id=document_id, recipe=recipe), reuse_unfinished=True,
+    )

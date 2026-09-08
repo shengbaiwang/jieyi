@@ -1,0 +1,180 @@
+--- a/src/jieyi/workflow/translation.py
++++ b/src/jieyi/workflow/translation.py
+@@ -33,6 +33,11 @@
+ _PLACEHOLDER_REPAIR_ATTEMPTS = 3
+ 
+ 
++class _RunStopped(Exception):
++    def __init__(self, cost: float):
++        self.cost = cost
++
++
+ class TranslationEngine:
+     """Durable segment workflow. Every completed segment is its own checkpoint."""
+ 
+@@ -48,13 +53,31 @@
+             raise ValueError("Cancelled jobs cannot be resumed")
+         return self.store.reserve_document(job.document_id)
+ 
++    async def _execute(self, job_id, operation, reservation):
++        # A cancelled coroutine cannot stop an issued blocking HTTP request.
++        # Retain ownership until its response is saved. PAUSED stops dispatch.
++        with reservation:
++            work = asyncio.create_task(operation())
++            try:
++                return await asyncio.shield(work)
++            except asyncio.CancelledError:
++                if self.store.get_job(job_id).status is JobStatus.RUNNING:
++                    self.store.set_job_status(job_id, JobStatus.PAUSED)
++                while not work.done():
++                    try:
++                        await asyncio.shield(work)
++                    except asyncio.CancelledError:
++                        continue
++                    except Exception:
++                        break
++                if not work.cancelled():
++                    work.exception()
++                raise
++
+     async def run(self, job_id: str, *, max_segments: int | None = None) -> Job:
+-        with self.reserve(job_id):
+-            try:
+-                return await self._run(job_id, max_segments=max_segments)
+-            except asyncio.CancelledError:
+-                self.store.set_job_status(job_id, JobStatus.PAUSED)
+-                raise
++        return await self._execute(
++            job_id, lambda: self._run(job_id, max_segments=max_segments), self.reserve(job_id),
++        )
+ 
+     async def _run(self, job_id: str, *, max_segments: int | None = None) -> Job:
+         job = self.store.get_job(job_id)
+@@ -69,6 +92,9 @@
+ 
+         try:
+             for segment in segments:
++                job = self.store.get_job(job_id)
++                if job.status is not JobStatus.RUNNING:
++                    return job
+                 if segment.ordinal < job.next_ordinal:
+                     continue
+                 if job.recipe.segment_ranges and not any(
+@@ -117,6 +143,11 @@
+                         stage=CandidateStage.DRAFT,
+                         model_spec=draft_spec,
+                     )
++                except _RunStopped as stopped:
++                    current = self.store.get_job(job_id)
++                    return self.store.save_job(replace(
++                        current, total_cost_usd=current.total_cost_usd + stopped.cost,
++                    ))
+                 except Exception as exc:
+                     if not is_content_filtered_error(exc):
+                         raise
+@@ -148,6 +179,7 @@
+                         last_error="执行期间原文发生变化，请检查后继续本段。",
+                     ))
+ 
++                job = self.store.get_job(job_id)
+                 job = self.store.save_job(
+                     replace(
+                         job,
+@@ -162,6 +194,9 @@
+             self.store.save_job(failed)
+             raise
+ 
++        job = self.store.get_job(job_id)
++        if job.status is not JobStatus.RUNNING:
++            return job
+         return self.store.save_job(
+             replace(job, status=JobStatus.COMPLETED, next_ordinal=len(segments))
+         )
+@@ -170,14 +205,13 @@
+                             _reservation=None) -> Job:
+         from jieyi.workflow.optimized import run_optimized
+ 
+-        with _reservation or self.reserve(job_id):
+-            if _reservation and self.store.get_job(job_id).status is not JobStatus.RUNNING:
+-                return self.store.get_job(job_id)
+-            try:
+-                return await run_optimized(self, job_id, max_batches=max_batches)
+-            except asyncio.CancelledError:
+-                self.store.set_job_status(job_id, JobStatus.PAUSED)
+-                raise
++        reservation = _reservation or self.reserve(job_id)
++        if _reservation and self.store.get_job(job_id).status is not JobStatus.RUNNING:
++            reservation.release()
++            return self.store.get_job(job_id)
++        return await self._execute(
++            job_id, lambda: run_optimized(self, job_id, max_batches=max_batches), reservation,
++        )
+ 
+     def preview(self, job_id: str, segment_id: str, *, optimized: bool = False) -> dict:
+         """Return the exact draft messages and protected spans without calling a model."""
+@@ -364,6 +398,8 @@
+                         f"{repair_error}"
+                     ),
+                 )
++                if self.store.get_job(job.id).status is not JobStatus.RUNNING:
++                    raise _RunStopped(result.cost_usd + repair_cost)
+                 repaired = await provider.translate(repair_request, model_spec)
+                 repair_cost += repaired.cost_usd
+                 if not repaired.text.strip():
+--- a/src/jieyi/workflow/optimized.py
++++ b/src/jieyi/workflow/optimized.py
+@@ -638,12 +638,24 @@
+     resolved_groups: set[int] = set()
+     pending_tasks: dict[asyncio.Task, tuple[int, list[Segment]]] = {}
+ 
+-    async def cancel_pending() -> None:
++    async def finish_pending() -> None:
+         tasks = list(pending_tasks)
+-        for task in tasks:
+-            task.cancel()
+         if tasks:
+-            await asyncio.gather(*tasks, return_exceptions=True)
++            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
++            for task, outcome in zip(tasks, outcomes, strict=True):
++                if isinstance(outcome, BaseException):
++                    continue
++                _, group = pending_tasks[task]
++                stage, _, translations, _, usage, elapsed, _, _ = outcome
++                engine.store.record_batch(
++                    job_id=job.id, stage=stage, start_ordinal=group[0].ordinal,
++                    end_ordinal=group[-1].ordinal, segment_count=len(translations),
++                    result=usage, elapsed_seconds=elapsed,
++                )
++                current = engine.store.get_job(job.id)
++                engine.store.save_job(replace(
++                    current, total_cost_usd=current.total_cost_usd + usage.cost_usd,
++                ))
+         pending_tasks.clear()
+ 
+     def schedule_group(group_index: int) -> None:
+@@ -792,7 +804,6 @@
+                 )
+ 
+             if fatal_failures:
+-                await cancel_pending()
+                 _, failure = min(fatal_failures, key=lambda item: item[0])
+                 raise failure
+ 
+@@ -813,6 +824,4 @@
+         )
+         raise
+     finally:
+-        # Outer cancellation must await every group and its provider children before
+-        # the document can be resumed. Otherwise old and new runs overlap.
+-        await cancel_pending()
++        await finish_pending()
+--- a/tests/test_execution_safety.py
++++ b/tests/test_execution_safety.py
+@@ -213,7 +213,6 @@
+     assert all(segment.machine_translation for segment in segments)
+ 
+ 
+-@pytest.mark.xfail(strict=True, reason="Known cancellation race; awaiting explicit approval for docs/PENDING_CANCELLATION.patch")
+ def test_cancellation_keeps_ownership_until_issued_request_is_saved(book):
+     store, document = book
+     provider = SlowProvider()

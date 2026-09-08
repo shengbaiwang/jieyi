@@ -37,6 +37,13 @@ from jieyi.workflow.requests import initial_output_budget, prepare_translation, 
 _PLACEHOLDER_REPAIR_ATTEMPTS = 3
 
 
+class _SegmentChanged(Exception):
+    """A queued request became unnecessary before it obtained a provider slot."""
+
+    def __init__(self, results=()):
+        self.results = results
+
+
 class _AdaptiveConcurrencyLimiter:
     """A conservative additive-increase/multiplicative-decrease request gate."""
 
@@ -136,6 +143,7 @@ async def _complete_one(
     max_tokens: int,
     max_output_tokens: int,
     record_call: Callable[[dict[str, object]], None] | None = None,
+    can_dispatch: Callable[[], bool] | None = None,
 ) -> TranslationResult:
     """Retry only failures that diagnostics identify as recoverable."""
     results: list[TranslationResult] = []
@@ -143,6 +151,8 @@ async def _complete_one(
     budget = min(max_tokens, max_output_tokens)
     messages = build_messages(request)
     for attempt_number in range(1, 4):
+        if can_dispatch is not None and not can_dispatch():
+            raise _SegmentChanged(results)
         started = time.monotonic()
         result = await provider.complete(
             messages,
@@ -212,7 +222,52 @@ async def _complete_one(
     )
 
 
-async def _translate_group(
+async def _translate_group(engine, job, project, document, segments, **options):
+    # Validate and checkpoint each segment immediately. A slow sibling must not
+    # make a completed result disappear when the enclosing batch is paused.
+    completed = {}
+    started = time.monotonic()
+
+    async def one(segment):
+        result = await _translate_segment(engine, job, project, document, [segment], **options)
+        completed[segment.id] = result
+        return result
+
+    tasks = [asyncio.create_task(one(segment)) for segment in segments]
+    try:
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if completed:
+            usage = _sum_results([result[4] for result in completed.values()], "")
+            engine.store.record_batch(
+                job_id=job.id, stage=CandidateStage.DRAFT,
+                start_ordinal=segments[0].ordinal, end_ordinal=segments[-1].ordinal,
+                segment_count=sum(len(result[2]) for result in completed.values()),
+                result=usage, elapsed_seconds=time.monotonic() - started,
+            )
+            current = engine.store.get_job(job.id)
+            engine.store.save_job(replace(current, total_cost_usd=current.total_cost_usd + usage.cost_usd))
+        raise
+    translations, stages, terms, failures, usages = {}, {}, {}, {}, []
+    for segment, outcome in zip(segments, outcomes, strict=True):
+        if isinstance(outcome, BaseException):
+            failures[segment.id] = outcome
+            terms[segment.id] = []
+            continue
+        _, _, text, candidate_stages, usage, _, segment_terms, segment_failures = outcome
+        translations.update(text)
+        stages.update(candidate_stages)
+        terms.update(segment_terms)
+        failures.update(segment_failures)
+        usages.append(usage)
+    return (CandidateStage.DRAFT, job.recipe.draft, translations, stages,
+            _sum_results(usages, ""), time.monotonic() - started, terms, failures)
+
+
+async def _translate_segment(
     engine,
     job: Job,
     project,
@@ -246,6 +301,16 @@ async def _translate_group(
     reasoning_effort = job.recipe.draft_reasoning_effort
     compute_mode = job.recipe.draft_compute_mode
 
+    def can_dispatch(segment_id):
+        current = engine.store.get_segment(segment_id)
+        original = next(item for item in segments if item.id == segment_id)
+        return (
+            engine.store.get_job(job.id).status is JobStatus.RUNNING
+            and not _visible_translation(current)
+            and current.status is not SegmentStatus.HUMAN_CONFIRMED
+            and current.source_text == original.source_text
+        )
+
     async def translate_one(request: TranslationRequest) -> tuple[str, TranslationResult]:
         async def operation():
             return await _complete_one(
@@ -258,6 +323,7 @@ async def _translate_group(
                 max_tokens=initial_output_budget(request, compute_mode, job.recipe.max_output_tokens),
                 max_output_tokens=job.recipe.max_output_tokens,
                 record_call=lambda payload: engine.store.record_model_call(job.id, payload),
+                can_dispatch=lambda: can_dispatch(request.segment.id),
             )
         result = await limiter.complete(operation)
         return request.segment.id, result
@@ -270,6 +336,9 @@ async def _translate_group(
         return_exceptions=True,
     )
     for request, outcome in zip(requests, completed, strict=True):
+        if isinstance(outcome, _SegmentChanged):
+            usage_results.extend(outcome.results)
+            continue
         if isinstance(outcome, BaseException):
             failures[request.segment.id] = outcome
             if isinstance(outcome, EmptyProviderResponseError):
@@ -280,6 +349,7 @@ async def _translate_group(
         usage_results.append(result)
     restored: dict[str, str] = {}
     candidate_stages: dict[str, CandidateStage] = {}
+    structured_values: dict[str, str] = {}
     for segment in segments:
         if segment.id not in translations:
             continue
@@ -291,11 +361,12 @@ async def _translate_group(
                 engine.store.capture_epub_translation(
                     segment.id,
                     restored_value,
-                    "draft",
+                    "draft", persist=False,
                 )
                 if structured_by_id[segment.id]
                 else restored_value
             )
+            structured_values[segment.id] = restored_value
             candidate_stages[segment.id] = stage
             continue
         except (PlaceholderIntegrityError, ValueError) as initial_error:
@@ -308,11 +379,12 @@ async def _translate_group(
                         engine.store.capture_epub_translation(
                             segment.id,
                             restored_value,
-                            "draft",
+                            "draft", persist=False,
                         )
                         if structured_by_id[segment.id]
                         else restored_value
                     )
+                    structured_values[segment.id] = restored_value
                     candidate_stages[segment.id] = stage
                     continue
                 except (PlaceholderIntegrityError, ValueError) as deterministic_error:
@@ -365,6 +437,7 @@ async def _translate_group(
                             ),
                             max_output_tokens=job.recipe.max_output_tokens,
                             record_call=lambda payload: engine.store.record_model_call(job.id, payload),
+                            can_dispatch=lambda: can_dispatch(repair_request.segment.id),
                         )
                     repaired = await limiter.complete(repair_operation)
                     usage_results.append(repaired)
@@ -373,11 +446,15 @@ async def _translate_group(
                         if structured_by_id[segment.id] else repaired.text
                     )
                     restored[segment.id] = (
-                        engine.store.capture_epub_translation(segment.id, restored_value, "repair")
+                        engine.store.capture_epub_translation(segment.id, restored_value, "repair", persist=False)
                         if structured_by_id[segment.id]
                         else restored_value
                     )
+                    structured_values[segment.id] = restored_value
                     candidate_stages[segment.id] = CandidateStage.REPAIR
+                    break
+                except _SegmentChanged as stopped:
+                    usage_results.extend(stopped.results)
                     break
                 except EmptyProviderResponseError as exc:
                     usage_results.append(exc.usage_result())
@@ -399,6 +476,19 @@ async def _translate_group(
                         missing=getattr(repair_error, "missing", ()),
                         extra=getattr(repair_error, "extra", ()),
                     )
+    for segment in segments:
+        if segment.id not in restored:
+            continue
+        text = restored[segment.id]
+        issues = run_deterministic_checks(
+            segment.source_text, text, terms_by_id[segment.id], segment_kind=segment.kind,
+        )
+        if not engine.store.commit_generated_translation(
+            job=job, segment=segment, text=text, issues=issues,
+            detector_version=DETECTOR_VERSION, stage=candidate_stages[segment.id],
+            structured_value=structured_values.get(segment.id) if structured_by_id[segment.id] else None,
+        ):
+            restored.pop(segment.id)
     usage = _sum_results(usage_results, "")
     elapsed = time.monotonic() - started
     return (
@@ -548,12 +638,24 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
     resolved_groups: set[int] = set()
     pending_tasks: dict[asyncio.Task, tuple[int, list[Segment]]] = {}
 
-    async def cancel_pending() -> None:
+    async def finish_pending() -> None:
         tasks = list(pending_tasks)
-        for task in tasks:
-            task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            for task, outcome in zip(tasks, outcomes, strict=True):
+                if isinstance(outcome, BaseException):
+                    continue
+                _, group = pending_tasks[task]
+                stage, _, translations, _, usage, elapsed, _, _ = outcome
+                engine.store.record_batch(
+                    job_id=job.id, stage=stage, start_ordinal=group[0].ordinal,
+                    end_ordinal=group[-1].ordinal, segment_count=len(translations),
+                    result=usage, elapsed_seconds=elapsed,
+                )
+                current = engine.store.get_job(job.id)
+                engine.store.save_job(replace(
+                    current, total_cost_usd=current.total_cost_usd + usage.cost_usd,
+                ))
         pending_tasks.clear()
 
     def schedule_group(group_index: int) -> None:
@@ -577,14 +679,13 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
     try:
         while next_group_index < len(groups) or pending_tasks:
             current = engine.store.get_job(job.id)
-            if current.status in {JobStatus.PAUSED, JobStatus.CANCELLED}:
-                await cancel_pending()
+            stopping = current.status in {JobStatus.PAUSED, JobStatus.CANCELLED}
+            if stopping and not pending_tasks:
                 return current
             progress = engine.store.job_progress(job.id)
             run_tokens = max(0, int(progress["total_tokens"]) - run_started_tokens)
-            if run_tokens >= job.recipe.token_budget:
-                await cancel_pending()
-                return engine.store.save_job(
+            if not stopping and run_tokens >= job.recipe.token_budget:
+                engine.store.save_job(
                     replace(
                         current,
                         status=JobStatus.PAUSED,
@@ -596,12 +697,13 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                         ),
                     )
                 )
-            if max_batches is not None and completed_batches >= max_batches:
-                await cancel_pending()
-                return engine.store.save_job(replace(current, status=JobStatus.PAUSED))
+                continue
+            if not stopping and max_batches is not None and completed_batches >= max_batches:
+                engine.store.save_job(replace(current, status=JobStatus.PAUSED))
+                continue
 
             group_window = job.recipe.max_concurrency
-            while next_group_index < len(groups) and len(pending_tasks) < group_window:
+            while not stopping and next_group_index < len(groups) and len(pending_tasks) < group_window:
                 if (
                     max_batches is not None
                     and completed_batches + len(pending_tasks) >= max_batches
@@ -629,38 +731,12 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                     stage,
                     model_spec,
                     translations,
-                    candidate_stages,
+                    _candidate_stages,
                     usage,
                     elapsed,
                     terms_by_id,
                     segment_failures,
                 ) = result
-                for segment in group:
-                    if segment.id not in translations:
-                        continue
-                    text = translations[segment.id]
-                    engine.store.record_candidate(
-                        job_id=job.id,
-                        segment_id=segment.id,
-                        stage=candidate_stages[segment.id],
-                        provider=model_spec.provider,
-                        model=model_spec.model,
-                        result=TranslationResult(text=text),
-                    )
-                    issues = run_deterministic_checks(
-                        segment.source_text,
-                        text,
-                        terms_by_id[segment.id],
-                        segment_kind=segment.kind,
-                    )
-                    engine.store.replace_issues(
-                        job.id,
-                        segment.id,
-                        issues,
-                        target_text=text,
-                        detector_version=DETECTOR_VERSION,
-                    )
-                    engine.store.set_machine_translation(segment.id, text)
                 engine.store.record_batch(
                     job_id=job.id,
                     stage=stage,
@@ -704,7 +780,11 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                     )
                 if blocking_segment_failures:
                     fatal_failures.extend(blocking_segment_failures)
-                else:
+                elif all(
+                    _visible_translation(engine.store.get_segment(segment.id))
+                    or segment.id in segment_failures
+                    for segment in group
+                ):
                     resolved_groups.add(group_index)
 
                 checkpoint = engine.store.get_job(job.id).next_ordinal
@@ -724,15 +804,26 @@ async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) 
                 )
 
             if fatal_failures:
-                await cancel_pending()
                 _, failure = min(fatal_failures, key=lambda item: item[0])
                 raise failure
 
+        current = engine.store.get_job(job.id)
+        if current.status in {JobStatus.PAUSED, JobStatus.CANCELLED}:
+            return current
+        if checkpoint_group_index < len(groups):
+            return engine.store.save_job(replace(
+                current, status=JobStatus.PAUSED,
+                last_error="执行期间原文或译文发生变化，请检查后继续未完成段落。",
+            ))
         return engine.store.save_job(
-            replace(job, status=JobStatus.COMPLETED, next_ordinal=len(all_segments))
+            replace(current, status=JobStatus.COMPLETED, next_ordinal=len(all_segments))
         )
     except Exception as exc:
-        engine.store.save_job(
-            replace(engine.store.get_job(job.id), status=JobStatus.FAILED, last_error=str(exc))
-        )
+        current = engine.store.get_job(job.id)
+        status = current.status if current.status in {
+            JobStatus.PAUSED, JobStatus.CANCELLED,
+        } else JobStatus.FAILED
+        engine.store.save_job(replace(current, status=status, last_error=str(exc)))
         raise
+    finally:
+        await finish_pending()

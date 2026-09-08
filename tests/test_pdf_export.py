@@ -3,7 +3,7 @@ import io
 from dataclasses import replace
 
 from PIL import Image, ImageChops
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
@@ -76,20 +76,30 @@ def test_native_layout_keeps_images_geometry_and_outline():
     )
 
 
-def test_long_translation_is_complete_in_appendix_and_leaves_source_untouched():
+def test_superscript_footnotes_remain_searchable_when_cjk_font_lacks_glyphs():
+    source, metadata, segments = fixture()
+    segments[0] = replace(segments[0], machine_translation="海湾贸易的记载。⁹⁹ 另见¹⁰⁰。")
+    result, report = compose_pdf(source, metadata, segments)
+    text = PdfReader(io.BytesIO(result)).pages[0].extract_text()
+    assert report["overflow_count"] == 0
+    assert "海湾贸易的记载。99 另见100。" in "".join(text.splitlines())
+    assert "\x00" not in text
+
+
+def test_long_translation_stays_complete_on_original_page_without_appendix():
     source, metadata, segments = fixture()
     text = "海湾沿岸的交流与历史。" * 350 + "结束标记。"
     segments[0] = replace(segments[0], machine_translation=text)
     result, report = compose_pdf(source, metadata, segments)
     after = PdfReader(io.BytesIO(result))
-    assert report["overflow_count"] == 1
-    assert len(after.pages) > 2
-    assert "The Gulf connects" in after.pages[0].extract_text()
-    text_exported = "".join(
-        "".join(page.extract_text().splitlines()[2:]) for page in after.pages[2:]
-    )
-    assert text in text_exported
-    assert image_hashes(after)[:2] == image_hashes(PdfReader(io.BytesIO(source)))
+    assert report["overflow_count"] == 0
+    assert report["reflowed_pages"] == [1]
+    assert len(after.pages) == 2
+    first_page = after.pages[0].extract_text()
+    assert "The Gulf connects" not in first_page
+    assert text in "".join(first_page.splitlines())
+    assert "These communities" in first_page
+    assert image_hashes(after) == image_hashes(PdfReader(io.BytesIO(source)))
 
 
 def test_bilingual_pairs_original_and_translated_pages():
@@ -104,14 +114,20 @@ def test_bilingual_pairs_original_and_translated_pages():
     assert image_hashes(reader)[2] == image_hashes(reader)[3]
 
 
-def test_stale_source_mapping_falls_back_without_discarding_translation():
+def test_stale_source_mapping_reflows_on_original_page_without_discarding_translation():
     source, metadata, segments = fixture()
     segments[0] = replace(
         segments[0], source_text="Manually edited text.", machine_translation="修改后的原文译文。"
     )
     result, report = compose_pdf(source, metadata, segments)
-    assert report["overflow_count"] == 1
-    assert "修改后的原文译文" in PdfReader(io.BytesIO(result)).pages[-1].extract_text()
+    after = PdfReader(io.BytesIO(result))
+    assert report["overflow_count"] == 0
+    assert report["reflowed_pages"] == [1]
+    assert len(after.pages) == 2
+    first_page = after.pages[0].extract_text()
+    assert "修改后的原文译文" in first_page
+    assert "The Gulf connects" not in first_page
+    assert "These communities" in first_page
 
 
 def test_centered_title_stays_centered_after_translation():
@@ -190,6 +206,39 @@ def test_duplicate_source_text_maps_to_its_own_occurrence():
         assert len(chinese) == 1
         assert 120 < chinese[0]["top"] < 140
         assert pdf.pages[0].extract_text().count("Shared note") == 1
+
+
+def test_rotated_page_replaces_text_in_place_without_continuation():
+    def draw(canvas):
+        canvas.drawString(35, 530, "A map caption describing the Persian Gulf cultural world.")
+
+    source, _, _ = _book_fixture(draw)
+    rotated = PdfWriter()
+    page = PdfReader(io.BytesIO(source)).pages[0]
+    page.rotate(90)
+    rotated.add_page(page)
+    stream = io.BytesIO()
+    rotated.write(stream)
+    source = stream.getvalue()
+    book = extract_pdf(source)
+    metadata = {"layout": book.layout}
+    segments = segments_from_blocks("test", list(book.blocks))
+    translations = ["地图：", "波斯湾", "文化", "世界", "图注。"]
+    assert len(segments) == len(translations)
+    segments = [
+        replace(segment, machine_translation=translation)
+        for segment, translation in zip(segments, translations, strict=True)
+    ]
+
+    result, report = compose_pdf(source, metadata, segments)
+    after = PdfReader(io.BytesIO(result))
+    text = after.pages[0].extract_text()
+    assert report["overflow_count"] == 0
+    assert report["replaced_blocks"] == len(segments)
+    assert len(after.pages) == 1
+    assert after.pages[0].rotation == 90
+    assert "地图：波斯湾文化世界图注。" in "".join(text.split())
+    assert "map" not in text
 
 
 def test_cross_page_preview_matches_export_without_spurious_continuation():

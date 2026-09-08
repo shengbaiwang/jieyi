@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import unicodedata
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -29,6 +30,7 @@ from jieyi.domain.models import (
     new_id,
     utc_now,
 )
+from jieyi.persistence.execution import DocumentBusyError, DocumentRunLock
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -1076,7 +1078,8 @@ class SQLiteStore:
             )
         return "".join(pieces)
 
-    def capture_epub_translation(self, segment_id: str, value: str, stage: str) -> str:
+    def capture_epub_translation(self, segment_id: str, value: str, stage: str,
+                                 *, persist: bool = True, _connection=None) -> str:
         from jieyi.ingestion.epub_roundtrip import parse_structured_translation
 
         atoms = self.list_epub_atoms_for_segment(segment_id)
@@ -1084,7 +1087,9 @@ class SQLiteStore:
             return value
         expected = tuple(item["atom_id"] for item in atoms)
         plain, translations = parse_structured_translation(value, expected)
-        with self._connect() as connection:
+        if not persist:
+            return plain
+        with nullcontext(_connection) if _connection is not None else self._connect() as connection:
             connection.executemany(
                 """INSERT INTO epub_atom_translations
                 (segment_id, atom_id, stage, translation_text,
@@ -1978,8 +1983,19 @@ class SQLiteStore:
             ).fetchall()
         return [self._term(row) for row in rows]
 
-    def create_job(self, job: Job) -> Job:
+    def create_job(self, job: Job, *, reuse_unfinished: bool = False) -> Job:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if reuse_unfinished:
+                rows = connection.execute(
+                    """SELECT * FROM jobs WHERE document_id = ?
+                    AND status IN ('pending', 'running', 'paused', 'failed')
+                    ORDER BY created_at DESC""", (job.document_id,),
+                ).fetchall()
+                for row in rows:
+                    existing = self._job(row)
+                    if existing.recipe == job.recipe:
+                        return existing
             connection.execute(
                 """INSERT INTO jobs
                 (id, document_id, recipe_json, status, next_ordinal, total_cost_usd,
@@ -2028,12 +2044,25 @@ class SQLiteStore:
         job = self.get_job(job_id)
         return self.save_job(replace(job, status=status, last_error=last_error))
 
+    def reserve_document(self, document_id: str) -> DocumentRunLock:
+        return DocumentRunLock(self.path, document_id)
+
     def pause_interrupted_jobs(self) -> None:
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE jobs SET status = ?, updated_at = ? WHERE status = ?",
-                (JobStatus.PAUSED.value, utc_now(), JobStatus.RUNNING.value),
-            )
+            documents = connection.execute(
+                "SELECT DISTINCT document_id FROM jobs WHERE status = 'running'"
+            ).fetchall()
+        for row in documents:
+            try:
+                with self.reserve_document(row["document_id"]), self._connect() as connection:
+                    connection.execute(
+                        "UPDATE jobs SET status = ?, updated_at = ? "
+                        "WHERE document_id = ? AND status = ?",
+                        (JobStatus.PAUSED.value, utc_now(), row["document_id"], JobStatus.RUNNING.value),
+                    )
+            except DocumentBusyError:
+                # Another API/CLI process still owns this document; it is not interrupted.
+                continue
 
     def record_batch(
         self,
@@ -2172,9 +2201,10 @@ class SQLiteStore:
         provider: str,
         model: str,
         result: TranslationResult,
+        _connection=None,
     ) -> str:
         candidate_id = new_id("cand")
-        with self._connect() as connection:
+        with (nullcontext(_connection) if _connection is not None else self._connect()) as connection:
             connection.execute(
                 """INSERT INTO candidates
                 (id, job_id, segment_id, stage, provider, model, text, prompt_tokens,
@@ -2210,10 +2240,11 @@ class SQLiteStore:
         target_text: str = "",
         detector_version: str = "1",
         replace_codes: set[str] | None = None,
+        _connection=None,
     ) -> None:
         """Supersede prior findings and store the segment's current quality snapshot."""
         target_hash = hashlib.sha256(target_text.encode("utf-8")).hexdigest()
-        with self._connect() as connection:
+        with (nullcontext(_connection) if _connection is not None else self._connect()) as connection:
             where = "segment_id = ? AND resolved = 0"
             parameters: list = [segment_id]
             if replace_codes is not None:
@@ -2242,6 +2273,39 @@ class SQLiteStore:
                     for issue in issues
                 ],
             )
+
+    def commit_generated_translation(
+        self, *, job: Job, segment: Segment, text: str, issues: list[QualityIssue],
+        detector_version: str, stage: CandidateStage, record_candidate: bool = True,
+        structured_value: str | None = None,
+    ) -> bool:
+        """Checkpoint one usable result atomically without replacing newer human work."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM segments WHERE id = ?", (segment.id,)).fetchone()
+            if row is None or row["source_text"] != segment.source_text or (
+                row["status"] == SegmentStatus.HUMAN_CONFIRMED.value or self._effective_translation(row)
+            ):
+                return False
+            if structured_value is not None:
+                self.capture_epub_translation(
+                    segment.id, structured_value, stage.value, _connection=connection,
+                )
+            if record_candidate:
+                self.record_candidate(
+                    job_id=job.id, segment_id=segment.id, stage=stage,
+                    provider=job.recipe.draft.provider, model=job.recipe.draft.model,
+                    result=TranslationResult(text=text), _connection=connection,
+                )
+            self.replace_issues(
+                job.id, segment.id, issues, target_text=text,
+                detector_version=detector_version, _connection=connection,
+            )
+            connection.execute(
+                "UPDATE segments SET machine_translation = ?, status = ? WHERE id = ?",
+                (text, SegmentStatus.MACHINE_TRANSLATED.value, segment.id),
+            )
+        return True
 
     def set_machine_translation(self, segment_id: str, translation: str) -> None:
         with self._connect() as connection:

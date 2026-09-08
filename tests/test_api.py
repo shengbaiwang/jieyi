@@ -366,6 +366,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([item["start_ordinal"] for item in chapters], [0, 4])
         self.assertEqual([item["segment_count"] for item in chapters], [4, 2])
         self.assertEqual([item["level"] for item in chapters], [0, 0])
+        self.assertEqual(len({item["id"] for item in chapters}), 2)
+        self.assertEqual(
+            chapters, self.client.get(f"/documents/{document['id']}/overview").json()["chapters"]
+        )
 
         rendered = self.client.get(
             f"/documents/{document['id']}/epub/spine/0",
