@@ -9,6 +9,8 @@ import { TerminologyReviewPanel } from "./terminology-review-panel";
 import { createReaderNavigation, type ReaderPageTarget } from "./reader-navigation";
 import { activeChapter, toggleChapter, normalizeSegmentRanges, type ChapterLocation } from "./chapter-navigation";
 import { createSubmissionGate } from "./submission-gate";
+import { SourceEditor } from "./source-editor";
+import { sourceSelectionOffsets } from "./source-editing";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
 const PAGE_SIZE = 120;
@@ -66,7 +68,7 @@ type ProviderSettings = {
   draft_provider: string;
   draft_profile_id: string;
   term_discovery_provider: string; term_discovery_model: string; term_discovery_compute_mode: ComputeMode;
-  profiles: Array<{ id: string; name: string; provider_type: string; base_url: string }>;
+  profiles: Array<{ id: string; name: string; provider_type: string; base_url: string; selected_models?: string[] | null }>;
   presets: Array<{ id: string; default_models: string[] }>;
 };
 type BookTranslationSettings = {
@@ -123,7 +125,7 @@ function modelsForProfile(settings: ProviderSettings | null, profileId: string):
   const profile = settings.profiles.find((item) => item.id === profileId);
   const preset = settings.presets.find((item) => item.id === profile?.provider_type);
   const bound = settings.draft_profile_id === profileId ? [settings.draft_model] : [];
-  return [...new Set([...(preset?.default_models || []), ...bound].filter(Boolean))];
+  return [...new Set([...(profile?.selected_models ?? preset?.default_models ?? []), ...bound].filter(Boolean))];
 }
 function exportName(document: Document, bilingual: boolean) {
   const extension = document.source_format === "epub" ? "epub" : document.source_format === "pdf" ? "pdf" : document.source_format === "markdown" ? "md" : "txt";
@@ -195,7 +197,12 @@ export default function Home() {
   const [sourceSelection, setSourceSelection] = useState({ start: 0, end: 0 });
   const [structureAction, setStructureAction] = useState<StructureAction | null>(null);
   const [structureBusy, setStructureBusy] = useState(false);
-  const sourceEditor = useRef<HTMLTextAreaElement | null>(null);
+  const [deletedSegments, setDeletedSegments] = useState<{ id: string; documentId: string; ordinal: number }[]>([]);
+  const deletedSegment = deletedSegments.filter((item) => item.documentId === overview?.document.id).at(-1) || null;
+  const structurePending = useRef(false);
+  const sourceUnsaved = useRef(false);
+  const sourceSaving = useRef(false);
+  const sourceTouched = useRef(false);
   const [loading, setLoading] = useState(true);
   const [startingTask, setStartingTask] = useState(false);
   const taskSubmission = useRef(createSubmissionGate());
@@ -367,6 +374,7 @@ export default function Home() {
   }, [overview?.document.id]);
 
   const openDocument = useCallback(async (document: Document, targetOrdinal?: number, targetPanel?: "translate" | "quality" | "terms" | "export") => {
+    if (sourceUnsaved.current || sourceSaving.current || structurePending.current) { setPanel("translate"); notify("请先保存或取消原文修改。"); return; }
     setLoading(true);
     setSelectedDocumentId(document.id);
     try {
@@ -380,13 +388,15 @@ export default function Home() {
         if (!project) throw new Error("找不到这本书所属的项目。");
         summary = overviewFromSegments(document, project, allSegments);
       }
-      const [termItems, issueItems, reviewItems, jobItems] = await Promise.all([
+      const [termItems, issueItems, reviewItems, jobItems, trashedItems] = await Promise.all([
         api<Term[]>(`/projects/${summary.project.id}/terms`).catch(() => []),
         api<Issue[]>(`/documents/${document.id}/issues`).catch(() => []),
         api<HumanReviewItem[]>(`/documents/${document.id}/human-review-queue`).catch(() => []),
         api<Job[]>(`/documents/${document.id}/jobs`).catch(() => []),
+        api<{ id: string; documentId: string; ordinal: number }[]>(`/documents/${document.id}/deleted-segments`).catch(() => []),
       ]);
       setOverview(summary); setTerms(termItems); setIssues(issueItems); setHumanReviewQueue(reviewItems); setJobs(jobItems); setJobsDocumentId(document.id);
+      setDeletedSegments(trashedItems);
       setPreferredChapterId(localStorage.getItem(`jieyi.chapter.${document.id}`));
       const remembered = Number(localStorage.getItem(`jieyi.ordinal.${document.id}`) || 0);
       await loadPageAt(document.id, targetOrdinal ?? remembered);
@@ -551,6 +561,8 @@ export default function Home() {
     const segment = currentSegment;
     let disposed = false;
     const timer = window.setTimeout(() => {
+      sourceTouched.current = false;
+      sourceUnsaved.current = false;
       const initial = segment?.source_text || "";
       setSourceDraft(initial);
       setSourceBaseline(initial);
@@ -562,7 +574,7 @@ export default function Home() {
       if (!segment) return;
       void api<SourceLayout>(`/segments/${segment.id}/source`)
         .then((layout) => {
-          if (!disposed && layout.blocks.length > 1) {
+          if (!disposed && !sourceTouched.current && layout.blocks.length > 1) {
             const structured = layout.blocks.join("\n\n");
             setSourceDraft(structured);
             setSourceBaseline(structured);
@@ -612,9 +624,10 @@ export default function Home() {
   }
 
   async function saveSourceImmediately(preserveTranslationForReview = false) {
-    if (!sourceDirty || !currentSegment) return;
+    if (!sourceDirty || !currentSegment || sourceSaving.current) return;
     const value = sourceDraft.trim();
     if (!value) throw new Error("原文不能为空");
+    sourceSaving.current = true;
     setSourceSaveState("saving");
     try {
       const saved = await api<Segment>("/segments/" + currentSegment.id + "/source", {
@@ -632,16 +645,20 @@ export default function Home() {
       setSourceDraft(saved.source_text);
       setSourceBaseline(saved.source_text);
       setSourceDirty(false);
+      sourceUnsaved.current = false;
       setSourceSaveState("saved");
       setSourceEditing(false);
       await refreshQuality();
     } catch (error) {
       setSourceSaveState("error");
       throw error;
+    } finally {
+      sourceSaving.current = false;
     }
   }
 
   async function saveSource(preserveTranslationForReview = false) {
+    if (sourceSaving.current || structureBusy || !sourceDirty) return;
     if (
       !preserveTranslationForReview
       && currentSegment
@@ -681,21 +698,30 @@ export default function Home() {
   }
 
   function startSourceEditing() {
+    sourceTouched.current = true;
     setSourceEditing(true);
-    setSourceSelection({ start: 0, end: 0 });
-    window.setTimeout(() => sourceEditor.current?.focus(), 0);
+  }
+
+  function changeSource(text: string) {
+    sourceTouched.current = true;
+    sourceUnsaved.current = text !== sourceBaseline;
+    setSourceDraft(text);
+    setSourceDirty(text !== sourceBaseline);
+    setSourceSaveState("idle");
   }
 
   function cancelSourceEditing() {
+    if (sourceSaving.current) return;
     if (sourceDirty && !window.confirm("放弃尚未保存的原文修改？")) return;
     setSourceDraft(sourceBaseline);
+    sourceUnsaved.current = false;
     setSourceDirty(false);
     setSourceSaveState("idle");
     setSourceSaveWarning(false);
     setSourceEditing(false);
   }
 
-  function requestSplit() {
+  function requestSplit(asHeading = false) {
     if (!currentSegment || currentSegment.kind === "heading") return;
     if (structureLocked) {
       notify("请先保存或取消当前修改，并等待正在进行的操作结束。");
@@ -717,7 +743,7 @@ export default function Home() {
       end,
       preview,
       resetsTranslation: Boolean(segmentTranslation(currentSegment)),
-      asHeading: false,
+      asHeading,
     });
   }
 
@@ -736,6 +762,8 @@ export default function Home() {
 
   async function performStructureAction(preserveTranslation = false) {
     if (!structureAction || !currentSegment || !overview) return;
+    if (structurePending.current) return;
+    structurePending.current = true;
     setStructureBusy(true);
     try {
       const result = structureAction.kind === "split"
@@ -743,8 +771,8 @@ export default function Home() {
           method: "POST",
           body: JSON.stringify({
             source_text: sourceDraft,
-            selection_start: structureAction.start,
-            selection_end: structureAction.end,
+            selection_start: sourceSelectionOffsets(sourceDraft, structureAction.start, structureAction.end).start,
+            selection_end: sourceSelectionOffsets(sourceDraft, structureAction.start, structureAction.end).end,
             reset_translation: structureAction.resetsTranslation && !preserveTranslation,
             preserve_translation: structureAction.resetsTranslation && preserveTranslation,
             selected_as_heading: structureAction.asHeading,
@@ -781,8 +809,49 @@ export default function Home() {
     } catch (error) {
       notify(error instanceof Error ? error.message : "段落结构修改失败");
     } finally {
+      structurePending.current = false;
       setStructureBusy(false);
     }
+  }
+
+  async function deleteCurrentSegment() {
+    if (!currentSegment || !overview || structureLocked) return;
+    const removed = { id: currentSegment.id, documentId: overview.document.id, ordinal };
+    if (structurePending.current) return;
+    structurePending.current = true;
+    setStructureBusy(true);
+    try {
+      await api(`/segments/${removed.id}`, { method: "DELETE" });
+      setDeletedSegments((items) => [...items.filter((item) => item.id !== removed.id), removed]);
+      legacySegments.current.delete(removed.documentId);
+      const summary = await api<Overview>(`/documents/${removed.documentId}/overview`);
+      setOverview(summary);
+      await loadPageAt(removed.documentId, Math.min(ordinal, Math.max(0, summary.segment_count - 1)));
+      setSourceEditing(false);
+      setSourceSelection({ start: 0, end: 0 });
+      setCandidates([]);
+      await refreshQuality();
+    } catch (error) { notify(error instanceof Error ? error.message : "删除失败，请重试。"); }
+    finally { structurePending.current = false; setStructureBusy(false); }
+  }
+
+  async function restoreDeletedSegment() {
+    if (!deletedSegment || structureLocked) return;
+    if (structurePending.current) return;
+    structurePending.current = true;
+    setStructureBusy(true);
+    try {
+      const result = await api<StructureResult>(`/segments/${deletedSegment.id}/restore`, { method: "POST" });
+      legacySegments.current.delete(deletedSegment.documentId);
+      const summary = await api<Overview>(`/documents/${deletedSegment.documentId}/overview`);
+      setOverview(summary);
+      await loadPageAt(deletedSegment.documentId, result.segment.ordinal);
+      setDeletedSegments((items) => items.filter((item) => item.id !== deletedSegment.id));
+      setSourceEditing(false);
+      await refreshQuality();
+      notify("文段已恢复，原文和译文均已保留。");
+    } catch (error) { notify(error instanceof Error ? error.message : "恢复失败，请重试。"); }
+    finally { structurePending.current = false; setStructureBusy(false); }
   }
 
   async function toggleCurrentHeading() {
@@ -792,6 +861,8 @@ export default function Home() {
       return;
     }
     const makeHeading = currentSegment.kind !== "heading";
+    if (structurePending.current) return;
+    structurePending.current = true;
     setStructureBusy(true);
     try {
       const saved = await api<Segment>(`/segments/${currentSegment.id}/heading`, {
@@ -816,13 +887,14 @@ export default function Home() {
     } catch (error) {
       notify(error instanceof Error ? error.message : "目录标题更新失败");
     } finally {
+      structurePending.current = false;
       setStructureBusy(false);
     }
   }
 
   async function navigateTo(target: number, chapterId: string | null = preferredChapterId) {
     if (!overview || target < 0 || target >= overview.segment_count) return;
-    if (sourceDirty) {
+    if (sourceDirty || sourceSaving.current || structureBusy) {
       notify("原文有未保存修改，请先保存或取消编辑。");
       return;
     }
@@ -914,6 +986,7 @@ export default function Home() {
   }
 
   async function openReader(document: Document) {
+    if (sourceUnsaved.current || sourceSaving.current || structurePending.current) { setPanel("translate"); notify("请先保存或取消原文修改。"); return; }
     setReaderLoading(true);
     setPreferredChapterId(localStorage.getItem(`jieyi.chapter.${document.id}`));
     setPanel("reader");
@@ -1122,7 +1195,18 @@ export default function Home() {
   }, [panel]);
 
   useEffect(() => {
+    function beforeUnload(event: BeforeUnloadEvent) {
+      if (!sourceUnsaved.current && !sourceSaving.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => window.removeEventListener("beforeunload", beforeUnload);
+  }, []);
+
+  useEffect(() => {
     function keydown(event: KeyboardEvent) {
+      if (event.isComposing) return;
       const command = event.metaKey || event.ctrlKey;
       if (command && event.key.toLowerCase() === "k") { event.preventDefault(); setSearchOpen(true); window.setTimeout(() => searchInput.current?.focus(), 30); }
       if (command && event.key === "Enter" && panel === "translate") { event.preventDefault(); void confirmCurrent(); }
@@ -1184,29 +1268,20 @@ export default function Home() {
           </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : selectedDocument.source_format === "pdf" ? "导出为 PDF，保留原页尺寸、图片、图表与目录；双语版逐页交替原文和译文。较长译文会在原页文字区内自适应重排。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
         </section>}
 
-        {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
+        {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : overview ? "这本书已没有文段。" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
           <div className={`editor-columns ${view === "target" ? "target-only" : ""}`}>
-            {view === "split" && <article className={`source-pane content-${currentSegment.kind} ${sourceEditing ? "is-editing" : "is-readonly"}`}>
-              <div className="column-label"><label>原文 · <select aria-label="原文语言" value={overview?.project.source_lang || ""} onChange={(event) => void updateSourceLanguage(event.target.value)}><option value="en">EN</option><option value="fr">FR</option><option value="de">DE</option><option value="ja">JA</option><option value="zh-CN">ZH-CN</option></select></label><div className="source-label-actions">{overview?.document.source_format === "pdf" && pdfPages(currentSegment.source_refs).map((number) => <button className="pdf-page-link" key={number} onClick={() => setPdfSource({ documentId: overview.document.id, title: overview.document.title, page: number })}>原页 {number} ↗</button>)}{sourceEditing ? <button onClick={cancelSourceEditing}>取消编辑</button> : <button className="source-edit-trigger" onClick={startSourceEditing}>编辑原文</button>}<button onClick={() => navigator.clipboard?.writeText(sourceDraft).then(() => notify("原文已复制"))}>复制</button></div></div>
-              {currentSegment.kind === "heading"
-                ? <input className="source-heading-editor" aria-label="原文标题" readOnly={!sourceEditing} value={sourceDraft} onChange={(event) => { setSourceDraft(event.target.value); setSourceDirty(true); setSourceSaveState("idle"); }} spellCheck={false} />
-                : <textarea ref={sourceEditor} className="source-editor" aria-label={sourceEditing ? "原文编辑器" : "原文，只读；可选中文字后拆分"} readOnly={!sourceEditing} value={sourceDraft} onSelect={(event) => setSourceSelection({ start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd })} onChange={(event) => { setSourceDraft(event.target.value); setSourceDirty(true); setSourceSaveState("idle"); }} placeholder="点击“编辑原文”后修改；空行表示段落边界…" spellCheck={false} />}
-              <div className="editor-footer source-footer">
-                <span>{sourceDraft.length} 字 · {sourceDraft.trim() ? sourceDraft.trim().split(/\n\s*\n/).length : 0} 块 · {sourceEditing ? sourceSaveState === "saving" ? "正在保存" : sourceSaveState === "error" ? "保存失败" : sourceDirty ? "待保存" : "编辑模式" : "只读保护"}</span>
-                <div className="editor-footer-actions">
-                  {sourceEditing
-                    ? <button className="confirm-button" onClick={() => void saveSource()} disabled={!sourceDirty || !sourceDraft.trim() || sourceSaveState === "saving"}>保存原文</button>
-                    : <>
-                      <button className="structure-button heading" onClick={() => void toggleCurrentHeading()} disabled={structureLocked}>{currentSegment.kind === "heading" ? "改回正文" : "设为目录标题"}</button>
-                      <button className="structure-button split" onClick={requestSplit} disabled={currentSegment.kind === "heading" || sourceSelection.start === sourceSelection.end || structureLocked}>拆为独立段</button>
-                      <button className="structure-button" onClick={() => requestMerge("previous")} disabled={ordinal === 0 || currentSegment.kind === "heading" || structureLocked}>与上一段合并</button>
-                      <button className="structure-button" onClick={() => requestMerge("next")} disabled={ordinal + 1 >= (overview?.segment_count || 0) || currentSegment.kind === "heading" || structureLocked}>与下一段合并</button>
-                    </>}
-                </div>
-              </div>
-              {!sourceEditing && currentSegment.kind !== "heading" && <div className="source-safety-hint">{sourceSelection.start !== sourceSelection.end ? `已选中 ${sourceDraft.slice(sourceSelection.start, sourceSelection.end).trim().length} 字，可拆为独立段。` : "原文默认锁定；选中文字可拆段，修改内容需先点击“编辑原文”。"}</div>}
-              <div className="context-note"><Mark>¶</Mark><div><strong>结构位置</strong><span>{currentSegment.heading_path || "正文"}</span></div></div>
-            </article>}
+            {view === "split" && <SourceEditor
+              key={`${currentSegment.id}:${sourceBaseline}:${sourceEditing}`}
+              value={sourceDraft} kind={currentSegment.kind} initialSelection={sourceSelection}
+              editing={sourceEditing} dirty={sourceDirty} saveState={sourceSaveState}
+              busy={structureBusy || Boolean(segmentDraft)} structureLocked={structureLocked}
+              canMergePrevious={ordinal > 0} canMergeNext={ordinal + 1 < (overview?.segment_count || 0)}
+              headingPath={currentSegment.heading_path}
+              label={<><label>原文 · <select aria-label="原文语言" value={overview?.project.source_lang || ""} onChange={(event) => void updateSourceLanguage(event.target.value)}><option value="en">EN</option><option value="fr">FR</option><option value="de">DE</option><option value="ja">JA</option><option value="zh-CN">ZH-CN</option></select></label><div className="source-label-actions">{overview?.document.source_format === "pdf" && pdfPages(currentSegment.source_refs).map((number) => <button className="pdf-page-link" key={number} onClick={() => setPdfSource({ documentId: overview.document.id, title: overview.document.title, page: number })}>原页 {number} ↗</button>)}</div></>}
+              onChange={changeSource} onEditing={startSourceEditing} onCancel={cancelSourceEditing}
+              onSave={() => void saveSource()} onHeading={() => void toggleCurrentHeading()}
+              onMerge={requestMerge} onDelete={() => void deleteCurrentSegment()} onSplit={requestSplit} onSelection={setSourceSelection} notify={notify}
+            />}
             <article className="translation-pane">
               <div className="column-label"><span>译文 · {overview?.project.target_lang}</span><div className={`draft-state ${currentStatus === "human_confirmed" ? "confirmed" : ""}`}><i />{statusLabel(currentSegment)}</div></div>
               <textarea aria-label="译文编辑器" readOnly={draftingCurrentSegment} aria-busy={draftingCurrentSegment} value={translation} onChange={(event) => { setTranslation(event.target.value); setDraftDirty(true); setSaveState("idle"); }} placeholder={currentStatus === "source" ? "等待模型草译，或直接输入人工译文…" : "编辑译文…"} spellCheck={false} />
@@ -1278,7 +1353,7 @@ export default function Home() {
         </section>}
 
         {panel === "import" && <ImportBookPanel onImported={(result) => void handleImported(result)} />}
-        {panel === "settings" && <ProviderSettingsPanel onSaved={(value) => { setSettings(value); notify("模型配置已更新。"); }} />}
+        <ProviderSettingsPanel hidden={panel !== "settings"} onSaved={(value) => { setSettings(value); notify("模型配置已更新。"); }} />
 
         <aside className="inspector"><div className="inspector-heading"><strong>检查器</strong><button aria-label="关闭检查器" onClick={() => setInspectorOpen(false)}>×</button></div><div className="inspector-scroll"><div className="quality-card"><div className={`segment-state-mark ${currentStatus}`}><Mark>{currentStatus === "human_confirmed" ? "✓" : currentStatus === "machine_translated" ? "AI" : "—"}</Mark></div><div><strong>{statusLabel(currentSegment)}</strong><small>{currentErrorIssues.length ? `${currentErrorIssues.length} 项确定问题` : currentWarningIssues.length ? `${currentWarningIssues.length} 项建议复核` : currentIssues.some((item) => item.severity === "info") ? "本段术语待机器核验" : "本段没有已报告的问题"}</small></div></div>{currentIssues.length > 0 && <div className="inspector-section"><div className="eyebrow">问题</div>{currentIssues.map((issue) => <div className="issue-chip" key={issue.id}><i>{issue.severity === "error" ? "!" : issue.severity === "info" ? "待" : "?"}</i><span>{issue.message}</span></div>)}</div>}<div className="inspector-section"><div className="eyebrow">本段术语 <button onClick={() => setPanel("terms")}>查看全部</button></div>{relevantTerms.length ? relevantTerms.map((term) => <div className="term-row" key={term.id}><span>{term.source}{term.enforcement === "reference" && <small className="term-reference-label">参考</small>}</span><strong>{term.target}</strong></div>) : <p className="inspector-empty">未命中已批准术语</p>}</div><div className="inspector-section"><div className="eyebrow">生成信息</div>{candidates.length ? <dl><div><dt>模型</dt><dd>{candidates.at(-1)?.model}</dd></div><div><dt>{generationUsage?.task ? "本段任务输入 / 输出" : "输入 / 输出"}</dt><dd>{generationUsage ? `${generationUsage.prompt} / ${generationUsage.completion}` : "用量见任务记录"}</dd></div>{generationUsage && <div><dt>{generationUsage.task ? "本段任务费用" : "费用"}</dt><dd>${generationUsage.cost.toFixed(6)}</dd></div>}</dl> : <p className="inspector-empty">本段还没有模型候选</p>}</div></div></aside>
       </div>
@@ -1287,6 +1362,10 @@ export default function Home() {
     {pdfSource && <PdfSourcePanel key={`${pdfSource.documentId}-${pdfSource.page}`} apiBase={API_BASE} documentId={pdfSource.documentId} title={pdfSource.title} initialPage={pdfSource.page} onClose={() => setPdfSource(null)} />}
     {searchOpen && <div className="command-overlay"><div className="command-palette search-palette"><form onSubmit={(event) => void performSearch(event)}><Mark>⌕</Mark><input ref={searchInput} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索当前书籍的原文或译文…" /><button type="submit" className="search-submit" disabled={!searchQuery.trim() || searching}>{searching ? "搜索中" : "搜索"}</button><button type="button" className="search-close" aria-label="关闭搜索" onClick={() => setSearchOpen(false)}>×</button></form><div className="command-results">{searching ? <div className="search-message">正在搜索…</div> : searchResults.length ? searchResults.map((item) => <button key={item.id} onClick={() => { setSearchOpen(false); setPanel("translate"); void navigateTo(item.ordinal); }}><span><strong>第 {item.ordinal + 1} 段</strong><small>{item.source_text.slice(0, 120)}</small></span><Mark>↵</Mark></button>) : <div className="search-message">输入关键词，搜索整本书的原文和译文。</div>}</div></div></div>}
     {draftPicker && <div className="command-overlay chapter-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !startingTask) setDraftPicker(null); }}><div className="chapter-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="chapter-picker-title"><header><div><span>草译范围</span><h2 id="chapter-picker-title">选择要翻译的篇章</h2><p>《{draftPicker.document.title}》· 可多选，任务只处理勾选范围。共享范围的目录项可独立勾选，重叠段落只翻译一次。</p></div><button aria-label="关闭篇章选择" onClick={() => setDraftPicker(null)} disabled={startingTask}>×</button></header><div className="chapter-picker-tools"><strong>目录 · {draftPicker.overview.chapters.length} 节</strong><div><button onClick={() => setSelectedChapterIds(draftPicker.overview.chapters.map((chapter) => chapter.id))}>全选</button><button onClick={() => setSelectedChapterIds([])}>清空</button></div></div><div className="chapter-picker-list" role="group" aria-label="选择草译篇章">{draftPicker.overview.chapters.map((chapter, index) => { const checked = selectedChapterIds.includes(chapter.id); return <label className={checked ? "selected" : ""} key={chapter.id}><input type="checkbox" checked={checked} onChange={() => toggleDraftChapter(chapter.id)} /><span className="chapter-check" aria-hidden="true">✓</span><span className="chapter-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{chapter.title}</strong><small>{chapter.segment_count} 段 · 已草译 {chapter.translated_count} · 已确认 {chapter.confirmed_count}{chapter.shared_range ? " · 与其他目录项共享范围" : ""}</small></div></label>; })}</div><footer><span>已选 <strong>{selectedDraftChapters.length}</strong> 篇 · 去重后共 <strong>{selectedDraftSegmentCount}</strong> 段</span><div><button onClick={() => setDraftPicker(null)} disabled={startingTask}>取消</button><button className="accent" disabled={!selectedDraftRanges.length || startingTask} onClick={() => void runWholeBook(draftPicker.document, selectedDraftRanges)}>{startingTask ? "正在启动…" : "开始草译所选篇章"}</button></div></footer></div></div>}
+    {deletedSegment && deletedSegment.documentId === overview?.document.id && <div className="segment-undo-notice" role="status">
+      <span>已删除第 {deletedSegment.ordinal + 1} 段</span>
+      <button disabled={structureLocked} title={sourceDirty ? "请先保存或取消当前修改" : "恢复原文与译文"} onClick={() => void restoreDeletedSegment()}>撤销删除</button>
+    </div>}
     {sourceSaveWarning && <div className="command-overlay delete-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && sourceSaveState !== "saving") setSourceSaveWarning(false); }}>
       <div className="structure-dialog" role="dialog" aria-modal="true" aria-labelledby="source-save-title">
         <div className="structure-mark danger">!</div>
@@ -1311,7 +1390,7 @@ export default function Home() {
             <label htmlFor="split-as-heading"><strong>设为目录标题</strong><small>拆分后可单独编辑，并作为新章节显示在目录中。</small></label>
           </div>
 
-        </> : <p>第 {Math.min(currentSegment?.ordinal ?? 0, structureAction.neighborOrdinal) + 1} 段与第 {Math.max(currentSegment?.ordinal ?? 0, structureAction.neighborOrdinal) + 1} 段将合为一段。两段译文会按原顺序保留，但人工确认状态会撤销，需重新复核。</p>}
+        </> : <p>第 {Math.min(currentSegment?.ordinal ?? 0, structureAction.neighborOrdinal) + 1} 段与第 {Math.max(currentSegment?.ordinal ?? 0, structureAction.neighborOrdinal) + 1} 段将合为一段。合并后保留上方块的类型，目录随之更新。两段译文按原顺序保留，并标记为待复核。</p>}
         <div>
           <button onClick={() => setStructureAction(null)} disabled={structureBusy}>取消</button>
           {structureAction.kind === "split" && structureAction.resetsTranslation && <button className="danger" onClick={() => void performStructureAction(false)} disabled={structureBusy}>{structureBusy ? "正在处理…" : "清空译文并拆分"}</button>}

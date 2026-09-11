@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import posixpath
 import re
 import zipfile
@@ -475,6 +476,30 @@ def _inject_resize_reporter(
     head.append(script)
 
 
+def _apply_deleted_source(store, document_id, spine_index, root, paths):
+    """Remove trashed source slots, keeping shared nodes and surrounding markup intact."""
+    deleted = [dict(atom, node_refs=json.loads(atom["node_refs_json"]), translation_text="")
+               for entry in store.list_deleted_segments(document_id)
+               for atom in entry["atoms"] if atom["spine_index"] == spine_index]
+    if not deleted:
+        return
+    affected = {ref for atom in deleted for ref in atom["node_refs"]}
+    active = [dict(atom, translation_text=atom["source_text"])
+              for atom in store.list_epub_atoms_for_spine(document_id, spine_index)
+              if affected.intersection(atom["node_refs"])]
+    nodes = {row["node_id"]: row for row in store.list_epub_text_nodes_for_spine(document_id, spine_index)}
+    _replace_text_nodes(paths, sorted(deleted + active, key=lambda atom: atom["ordinal"]), nodes)
+    for atom in deleted:
+        element = paths.get(atom["dom_path"])
+        if element is None or "".join(element.itertext()).strip():
+            continue
+        if any(_local_name(child.tag) in {"img", "svg", "image", "video", "audio"} for child in element.iter()):
+            continue
+        parent = next((node for node in root.iter() if element in list(node)), None)
+        if parent is not None:
+            _remove_element(parent, element)
+
+
 def render_spine(
     store,
     document_id: str,
@@ -494,6 +519,7 @@ def render_spine(
     resource = store.get_epub_resource(document_id, item["path"])
     root = _parse_xml(bytes(resource["data"]), item["path"])
     paths = _path_map(root)
+    _apply_deleted_source(store, document_id, spine_index, root, paths)
     root = _sanitize_tree(root, document_id=document_id, base_path=item["path"])
 
     atoms = (
@@ -593,6 +619,7 @@ def _render_export_spine(
     resource = store.get_epub_resource(document_id, item["path"])
     root = _parse_xml(bytes(resource["data"]), item["path"])
     paths = _path_map(root)
+    _apply_deleted_source(store, document_id, spine_index, root, paths)
     project = store.get_project_for_document(document_id)
 
     atoms = store.list_epub_atoms_for_spine(document_id, spine_index)

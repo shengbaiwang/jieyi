@@ -37,14 +37,11 @@
 .form-section-title small { color: var(--muted); font-size: 9.5px; }
 
 .provider-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
-.profile-tabs { display: flex; gap: 8px; margin-bottom: 13px; overflow-x: auto; padding-bottom: 2px; }
-.profile-tabs > button { min-width: 145px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; color: var(--text); background: var(--panel); text-align: left; }
-.profile-tabs > button.active { border-color: rgba(10,118,246,.55); background: rgba(10,118,246,.07); }
-.profile-tabs > button > i { width: 23px; height: 23px; display: grid; flex: 0 0 23px; place-items: center; border-radius: 6px; color: var(--accent-text); background: rgba(10,118,246,.1); font-size: 9px; font-style: normal; font-weight: 700; }
-.profile-tabs > button > span { min-width: 0; display: grid; gap: 2px; }
-.profile-tabs strong { overflow: hidden; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
-.profile-tabs small { color: var(--muted); font-size: 8px; }
-.profile-tabs > .add-profile { min-width: 104px; justify-content: center; border-style: dashed; color: var(--accent-text); font-size: 9px; }
+.service-selector.settings-fields { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; padding-left: 0; }
+.service-selector > label { flex: 1 1 220px; min-width: 0; }
+.service-selector select { width: 100%; min-width: 0; text-overflow: ellipsis; }
+.service-selector > button { flex: 0 0 auto; }
+.service-selector-note { margin: 8px 0 14px; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .provider-option { min-width: 0; position: relative; display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 9px; padding: 10px; background: var(--panel); text-align: left; }
 .provider-option:hover { border-color: rgba(10,118,246,.28); background: rgba(10,118,246,.03); }
 .provider-option.selected { border-color: rgba(10,118,246,.55); background: rgba(10,118,246,.075); box-shadow: 0 0 0 1px rgba(10,118,246,.08); }
@@ -271,3 +268,112 @@
 .pdf-inspection progress { width: 100%; height: 6px; accent-color: var(--accent, #3971dc); }
 .pdf-inspection span, .pdf-import-note { font-size: 12px; line-height: 1.7; color: var(--muted, #767b86); }
 .pdf-import-note { padding: 10px 16px; border: 1px solid var(--border, #ddd); border-radius: 8px; margin-top: 10px; }
+
+/* Model configuration: provider workspace and task defaults. */
+.settings-save-state { flex-shrink: 0; color: var(--muted); font-size: 12px; }
+.settings-save-state.dirty { color: var(--warning-text); }
+.settings-tabs { display: flex; gap: 24px; padding: 0 30px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.settings-tabs > button { min-height: 44px; border: 0; border-bottom: 2px solid transparent; padding: 0 2px; background: transparent; color: var(--muted); font-size: 13px; }
+.settings-tabs > button[aria-selected="true"] { color: var(--accent-text); border-bottom-color: var(--blue-solid); font-weight: 650; }
+.settings-tabs > button > span, .provider-model-heading h3 > span { margin-left: 5px; border-radius: 5px; padding: 2px 6px; background: var(--surface-active); font-size: 11px; }
+.settings-workspace { min-width: 0; min-height: 0; display: flex; flex: 1; margin: 0; padding: 0; border: 0; }
+.settings-workspace:disabled { opacity: .65; }
+.provider-workspace { min-width: 0; min-height: 0; flex: 1; display: grid; grid-template-columns: 208px minmax(0, 1fr); }
+.provider-sidebar { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; padding: 18px 12px; border-right: 1px solid var(--line); background: var(--panel); }
+.provider-sidebar > input, .model-manager-toolbar > input, .manual-model-form > input { min-width: 0; min-height: 34px; width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--paper); font-size: 12px; }
+.provider-list { min-height: 0; flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 5px; }
+.provider-list > button { display: flex; align-items: center; gap: 9px; width: 100%; border: 1px solid transparent; border-radius: 8px; padding: 11px 8px; background: transparent; text-align: left; color: var(--text); }
+.provider-list > button:hover { background: var(--surface-active); }
+.provider-list > button.active { background: var(--blue-soft); border-color: color-mix(in srgb, var(--blue) 25%, var(--line)); }
+.provider-list > button > i { display: grid; place-items: center; flex: 0 0 30px; height: 30px; border-radius: 7px; background: var(--surface-active); color: var(--muted); font-style: normal; font-weight: 650; }
+.provider-list > button.active > i { background: var(--blue-solid); color: white; }
+.provider-list > button > span { display: grid; gap: 5px; min-width: 0; }
+.provider-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 620; }
+.provider-list small { color: var(--muted); font-size: 11px; }
+.provider-sidebar > .add-provider { min-height: 35px; font-size: 12px; }
+.provider-detail { min-width: 0; overflow: auto; padding: 26px 30px; }
+.provider-detail-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
+.provider-detail-heading h2 { margin: 0 0 6px; overflow-wrap: anywhere; font-size: 19px; font-weight: 650; }
+.provider-detail-heading p, .provider-model-heading p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.provider-connection.settings-fields { max-width: 780px; padding: 0; gap: 18px; }
+.settings-view .settings-fields label > span, .settings-view .binding-grid label > span, .settings-view .binding-field > span { font-size: 12px; }
+.provider-connection label > span { display: flex; align-items: center; gap: 8px; }
+.provider-connection label > span > small { color: var(--muted); font-size: 11px; font-weight: 400; }
+.settings-view .settings-fields input, .settings-view .settings-fields select, .settings-view .binding-grid select, .settings-view .model-select > button { min-height: 36px; font-size: 13px; }
+.settings-view input:focus-visible, .settings-view button:focus-visible, .settings-view summary:focus-visible, .settings-view select:focus-visible { outline: 2px solid var(--blue-solid); outline-offset: 2px; }
+.settings-view button:disabled { cursor: default; opacity: .45; }
+.settings-view input[aria-invalid="true"] { border-color: var(--red-solid); }
+.field-hint { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; font-weight: 400; }
+.provider-advanced { border-top: 1px solid var(--line); padding-top: 14px; }
+.provider-advanced > summary { cursor: pointer; color: var(--text); font-size: 12px; }
+.provider-advanced > summary > span { margin-left: 6px; color: var(--muted); }
+.provider-advanced .endpoint-fields { margin-top: 16px; grid-template-columns: 1fr 1fr; gap: 14px; }
+.provider-advanced .endpoint-fields > label:first-child { grid-column: 1 / -1; }
+.endpoint-preview { display: grid; gap: 6px; margin: 12px 0 0; color: var(--muted); font-size: 12px; }
+.endpoint-preview code { display: block; padding: 10px; border: 1px solid var(--line); border-radius: 6px; overflow-wrap: anywhere; background: var(--panel); }
+.provider-model-section { margin-top: 25px; padding-top: 24px; border-top: 1px solid var(--line); }
+.provider-model-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 15px; }
+.provider-model-heading h3 { margin: 0 0 6px; font-size: 14px; font-weight: 640; }
+.provider-model-heading > div:last-child { display: flex; gap: 8px; }
+.settings-view .ghost-action, .settings-view .secondary-action, .settings-view .blue-action { min-height: 31px; font-size: 12px; }
+.provider-model-section > .inline-status { margin: 0 0 12px; line-height: 1.6; }
+.model-manager { margin-bottom: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+.model-manager-toolbar, .manual-model-form { display: flex; align-items: center; gap: 10px; }
+.model-manager-toolbar { margin-bottom: 9px; }
+.model-manager-toolbar > button, .manual-model-form > button { flex-shrink: 0; }
+.model-candidates { max-height: 236px; overflow: auto; margin-top: 8px; }
+.model-candidates > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid var(--line); }
+.model-candidates code, .added-model-row code { min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.manual-model-form { margin-bottom: 14px; }
+.added-model-list { display: grid; gap: 8px; margin-bottom: 12px; }
+.added-model { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--panel); }
+.added-model-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.added-model-row > div { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.added-model-row > div:last-child { flex-shrink: 0; }
+.added-model-row .binding-status { font-size: 10px; }
+.model-role { border-radius: 4px; padding: 3px 5px; color: var(--accent-text); background: var(--blue-soft); font-size: 10px; }
+.added-model > .model-capability-card { margin-top: 10px; }
+.settings-empty { margin: 0; padding: 18px 8px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.provider-detail-bottom { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 11px; }
+.provider-detail-bottom > .remove-profile { margin: 0; flex-shrink: 0; font-size: 12px; }
+.provider-add-panel .provider-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.provider-add-panel .provider-option { min-height: 70px; }
+.provider-add-panel .provider-option strong { font-size: 13px; }
+.provider-add-panel .provider-option small { white-space: normal; font-size: 11px; line-height: 1.4; }
+.task-settings-panel .binding-cards { padding-left: 0; }
+.task-settings-panel .binding-card { padding: 18px; gap: 16px; }
+.task-settings-panel .binding-head strong { font-size: 14px; }
+.task-settings-panel .binding-head small, .task-settings-panel .binding-summary { font-size: 12px; }
+.task-settings-panel .binding-head > div:first-child { align-items: flex-start; flex-direction: column; gap: 6px; }
+.task-settings-panel .binding-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 16px; }
+.task-settings-panel .binding-grid > :last-child { grid-column: 1 / -1; }
+.task-settings-panel .mode-segment { max-width: 400px; }
+.task-settings-panel .mode-segment > button { min-height: 31px; }
+.task-settings-panel .mode-segment strong, .settings-view .model-select-list > button { font-size: 12px; }
+.settings-view .model-select-list > button { padding: 9px 8px; overflow-wrap: anywhere; }
+.model-select-list > button.highlighted { outline: 1px solid var(--blue-solid); outline-offset: -1px; background: var(--blue-soft); }
+.settings-view .model-select-pop { width: min(340px, 100%); }
+.settings-view .model-select-pop > input { min-height: 34px; font-size: 12px; }
+.settings-view .inline-status { font-size: 12px; }
+.settings-view .setup-footer { min-height: 66px; }
+.settings-view .setup-footer > div:last-child { flex-shrink: 0; }
+@media (max-width: 1100px) {
+  .provider-workspace { grid-template-columns: 175px minmax(0, 1fr); }
+  .provider-detail { padding: 22px 20px; }
+  .added-model-row { align-items: flex-start; flex-direction: column; }
+  .provider-detail-bottom { align-items: flex-start; flex-direction: column; }
+}
+@media (max-width: 760px) {
+  .settings-tabs { padding-inline: 18px; }
+  .provider-workspace { display: flex; flex-direction: column; overflow: auto; }
+  .provider-sidebar { flex: 0 0 auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 12px; }
+  .provider-list { flex-direction: row; overflow-x: auto; }
+  .provider-list > button { width: 175px; flex-shrink: 0; }
+  .provider-detail { flex: 0 0 auto; overflow: visible; padding: 20px 16px; }
+  .provider-add-panel .provider-grid, .task-settings-panel .binding-grid, .provider-advanced .endpoint-fields { grid-template-columns: minmax(0, 1fr); }
+  .settings-view .setup-header { padding: 18px; gap: 12px; align-items: flex-start; flex-direction: column; }
+  .settings-view .setup-footer { padding: 12px 16px; flex-wrap: wrap; }
+  .settings-view .setup-footer > div:last-child { margin-left: auto; }
+  .model-manager-toolbar { flex-wrap: wrap; }
+  .task-settings-panel .binding-head { align-items: flex-start; flex-direction: column; }
+}

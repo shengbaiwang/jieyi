@@ -328,6 +328,13 @@ CREATE TABLE IF NOT EXISTS epub_atom_translations (
     PRIMARY KEY (segment_id, atom_id, stage)
 );
 
+CREATE TABLE IF NOT EXISTS segment_trash (
+    segment_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    payload_json TEXT NOT NULL,
+    deleted_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS app_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -654,6 +661,8 @@ class SQLiteStore:
             ).fetchone() is None:
                 raise ValueError("该文档不是 PDF")
             self._ensure_no_active_structure_job(connection, document_id)
+            if connection.execute("SELECT 1 FROM segment_trash WHERE document_id = ? LIMIT 1", (document_id,)).fetchone():
+                raise ValueError("文档包含手工删除的文段，已保留现有分段")
             old = connection.execute(
                 "SELECT * FROM segments WHERE document_id = ? ORDER BY ordinal", (document_id,),
             ).fetchall()
@@ -1034,9 +1043,8 @@ class SQLiteStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """SELECT n.* FROM epub_text_nodes n
-                JOIN epub_atoms a
-                  ON a.document_id = n.document_id AND a.atom_id = n.atom_id
-                WHERE n.document_id = ? AND a.spine_index = ?
+                JOIN epub_spine spine ON spine.document_id = n.document_id AND spine.path = n.spine_path
+                WHERE n.document_id = ? AND spine.spine_index = ?
                 ORDER BY n.ordinal""",
                 (document_id, spine_index),
             ).fetchall()
@@ -1297,6 +1305,8 @@ class SQLiteStore:
 
     def get_segment_source_blocks(self, segment_id: str) -> list[str]:
         segment = self.get_segment(segment_id)
+        if segment.kind == SegmentKind.HEADING:
+            return [segment.source_text]
         saved_blocks = [item.strip() for item in re.split(r"\n\s*\n", segment.source_text)]
         if len(saved_blocks) > 1:
             return saved_blocks
@@ -1417,6 +1427,8 @@ class SQLiteStore:
     def _source_blocks_for_row(
         connection: sqlite3.Connection, row: sqlite3.Row
     ) -> list[str]:
+        if row["kind"] == SegmentKind.HEADING.value:
+            return [str(row["source_text"])]
         saved_blocks = [
             item.strip() for item in re.split(r"\n\s*\n", str(row["source_text"]))
         ]
@@ -1811,9 +1823,8 @@ class SQLiteStore:
             if neighbor is None:
                 raise ValueError("该方向没有可合并的相邻段落")
             left, right = (neighbor, current) if direction == "previous" else (current, neighbor)
-            if left["kind"] == SegmentKind.HEADING.value or right["kind"] == SegmentKind.HEADING.value:
-                raise ValueError("标题不能与正文段落合并")
-            if left["kind"] != right["kind"] or left["heading_path"] != right["heading_path"]:
+            has_heading = SegmentKind.HEADING.value in {left["kind"], right["kind"]}
+            if not has_heading and (left["kind"] != right["kind"] or left["heading_path"] != right["heading_path"]):
                 raise ValueError("只能合并同一章节内类型相同的相邻段落")
 
             left_blocks = self._source_blocks_for_row(connection, left)
@@ -1833,9 +1844,11 @@ class SQLiteStore:
                 ).fetchall()
                 atom_ids = [str(item["atom_id"]) for item in atom_rows]
                 atom_ordinals = [int(item["ordinal"]) for item in atom_rows]
-                contiguous = not atom_ordinals or atom_ordinals == list(
-                    range(atom_ordinals[0], atom_ordinals[0] + len(atom_ordinals))
-                )
+                between_ids = [str(item[0]) for item in connection.execute(
+                    "SELECT atom_id FROM epub_atoms WHERE document_id = ? AND ordinal BETWEEN ? AND ? ORDER BY ordinal",
+                    (current["document_id"], atom_ordinals[0], atom_ordinals[-1]),
+                )] if atom_ordinals else []
+                contiguous = between_ids == atom_ids
                 if (
                     atom_ids != list(combined_refs)
                     or len({item["spine_index"] for item in atom_rows}) != 1
@@ -1843,7 +1856,8 @@ class SQLiteStore:
                 ):
                     raise ValueError("EPUB 只能合并同一页面内连续的原始段落")
 
-            merged_source = "\n\n".join(left_blocks + right_blocks)
+            # Like joining blocks in a document editor, the upper block owns the type.
+            merged_source = (" " if left["kind"] == SegmentKind.HEADING.value else "\n\n").join(left_blocks + right_blocks)
             translations = [
                 value
                 for value in (
@@ -1889,6 +1903,9 @@ class SQLiteStore:
             )
             ordered_ids = [item for item in existing_ids if item != removed_id]
             self._renumber_segments(connection, document_id, ordered_ids)
+            if has_heading:
+                self._rebuild_heading_paths(connection, document_id)
+                self._audit(connection, "document", document_id, "outline_edited", {})
             self._audit(
                 connection,
                 "segment",
@@ -1908,6 +1925,111 @@ class SQLiteStore:
             "translation_needs_review": bool(merged_translation),
         }
 
+
+    @staticmethod
+    def _rebuild_heading_paths(connection: sqlite3.Connection, document_id: str, levels: dict[str, int] | None = None) -> None:
+        rows = connection.execute(
+            "SELECT id, kind, source_text, heading_path FROM segments WHERE document_id = ? ORDER BY ordinal",
+            (document_id,),
+        ).fetchall()
+        headings: list[str] = []
+        for row in rows:
+            if row["kind"] == SegmentKind.HEADING.value:
+                level = (levels or {}).get(row["id"], str(row["heading_path"]).count(" / "))
+                headings = headings[:level] + [str(row["source_text"])]
+            connection.execute("UPDATE segments SET heading_path = ? WHERE id = ?",
+                               (" / ".join(headings), row["id"]))
+
+    def has_manual_outline(self, document_id: str) -> bool:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM audit_events WHERE entity_type = 'document' AND entity_id = ? AND action = 'outline_edited' LIMIT 1",
+                (document_id,),
+            ).fetchone() is not None
+
+    def list_deleted_segments(self, document_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM segment_trash WHERE document_id = ? ORDER BY deleted_at",
+                (document_id,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def list_deleted_source_segments(self, document_id: str) -> list[Segment]:
+        return [self._segment(payload["segment"]) for payload in self.list_deleted_segments(document_id)]
+
+    def delete_segment(self, segment_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM segments WHERE id = ?", (segment_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"Segment not found: {segment_id}")
+            document_id = str(row["document_id"])
+            self._ensure_no_active_structure_job(connection, document_id)
+            rows = connection.execute("SELECT id, kind, heading_path FROM segments WHERE document_id = ? ORDER BY ordinal",
+                                      (document_id,)).fetchall()
+            ids = [str(item["id"]) for item in rows]
+            index = ids.index(segment_id)
+            payload = {
+                "segment": dict(row),
+                "previous_id": ids[index - 1] if index else None,
+                "next_id": ids[index + 1] if index + 1 < len(ids) else None,
+                "heading_levels": {item["id"]: str(item["heading_path"]).count(" / ")
+                                   for item in rows if item["kind"] == SegmentKind.HEADING.value},
+                "atoms": [dict(item) for item in connection.execute(
+                    "SELECT * FROM epub_atoms WHERE segment_id = ? ORDER BY ordinal", (segment_id,))],
+                "atom_translations": [dict(item) for item in connection.execute(
+                    "SELECT * FROM epub_atom_translations WHERE segment_id = ?", (segment_id,))],
+            }
+            connection.execute("INSERT OR REPLACE INTO segment_trash VALUES (?, ?, ?, ?)",
+                               (segment_id, document_id, json.dumps(payload, ensure_ascii=False), utc_now()))
+            self._clear_segment_derivatives(connection, [segment_id])
+            connection.execute("DELETE FROM segments WHERE id = ?", (segment_id,))
+            ordered_ids = [item for item in ids if item != segment_id]
+            self._renumber_segments(connection, document_id, ordered_ids)
+            if row["kind"] == SegmentKind.HEADING.value:
+                self._rebuild_heading_paths(connection, document_id)
+                self._audit(connection, "document", document_id, "outline_edited", {})
+            self._audit(connection, "document", document_id, "segment_deleted", {"segment_id": segment_id})
+        next_id = ordered_ids[min(index, len(ordered_ids) - 1)] if ordered_ids else None
+        return {"segment": self.get_segment(next_id) if next_id else None,
+                "segment_count": len(ordered_ids), "deleted_segment_id": segment_id}
+
+    def restore_segment(self, segment_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            trash = connection.execute("SELECT * FROM segment_trash WHERE segment_id = ?", (segment_id,)).fetchone()
+            if trash is None:
+                raise NotFoundError("找不到可恢复的文段")
+            document_id = str(trash["document_id"])
+            self._ensure_no_active_structure_job(connection, document_id)
+            payload = json.loads(trash["payload_json"])
+            row = payload["segment"]
+            ids = [str(item[0]) for item in connection.execute(
+                "SELECT id FROM segments WHERE document_id = ? ORDER BY ordinal", (document_id,))]
+            index = (ids.index(payload["next_id"]) if payload["next_id"] in ids
+                     else ids.index(payload["previous_id"]) + 1 if payload["previous_id"] in ids
+                     else min(row["ordinal"], len(ids)))
+            row["ordinal"] = len(ids)
+            for table, records in (("segments", [row]), ("epub_atoms", payload["atoms"]),
+                                   ("epub_atom_translations", payload["atom_translations"])):
+                for record in records:
+                    columns = list(record)
+                    connection.execute(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                                       [record[column] for column in columns])
+            ids.insert(index, segment_id)
+            self._renumber_segments(connection, document_id, ids)
+            positions = {item_id: index for index, item_id in enumerate(ids)}
+            atoms = connection.execute("SELECT atom_id, segment_id, ordinal FROM epub_atoms WHERE document_id = ?",
+                                       (document_id,)).fetchall()
+            for ordinal, atom in enumerate(sorted(atoms, key=lambda atom: (positions[atom["segment_id"]], atom["ordinal"]))):
+                connection.execute("UPDATE epub_atoms SET ordinal = ? WHERE document_id = ? AND atom_id = ?",
+                                   (ordinal, document_id, atom["atom_id"]))
+            if row["kind"] == SegmentKind.HEADING.value:
+                self._rebuild_heading_paths(connection, document_id, payload.get("heading_levels"))
+            connection.execute("DELETE FROM segment_trash WHERE segment_id = ?", (segment_id,))
+            self._audit(connection, "document", document_id, "segment_restored", {"segment_id": segment_id})
+        return {"segment": self.get_segment(segment_id), "segment_count": len(ids)}
 
     def get_neighbors(self, document_id: str, ordinal: int, radius: int = 1) -> list[Segment]:
         with self._connect() as connection:

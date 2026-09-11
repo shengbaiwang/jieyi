@@ -1,6 +1,7 @@
 "use client";
 
-import { DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { DragEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { endpointPreview, modelSearch, selectedModels, uniqueModels, validBaseUrl } from "./model-config";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
 
@@ -32,6 +33,7 @@ type ProviderProfileForm = {
   api_key: string;
   api_key_configured: boolean;
   key_source: string;
+  selected_models?: string[] | null;
 };
 
 type ProviderForm = {
@@ -140,70 +142,62 @@ async function epubApi<T>(path: string, data: ArrayBuffer, format = "epub", sign
   return payload as T;
 }
 
-function uniqueModels(items: string[]): string[] {
-  return [...new Set(items.filter(Boolean))];
-}
-
 function ModelSelect({ value, options, loading, disabled, onChange }: {
-  value: string;
-  options: string[];
-  loading?: boolean;
-  disabled?: boolean;
-  onChange: (value: string) => void;
+  value: string; options: string[]; loading?: boolean; disabled?: boolean; onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [highlighted, setHighlighted] = useState(0);
   const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
   const search = useRef<HTMLInputElement>(null);
+  const listId = useId();
+  const typed = query.trim();
+  const matches = modelSearch(uniqueModels([value, ...options]), typed);
+  const choices = [...matches, ...(typed && !matches.includes(typed) ? [typed] : [])];
+  const index = Math.min(highlighted, Math.max(choices.length - 1, 0));
 
   useEffect(() => {
-    if (!open) return undefined;
+    if (!open) return;
     search.current?.focus();
-    function onPointerDown(event: MouseEvent) {
-      if (!root.current?.contains(event.target as Node)) setOpen(false);
-    }
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
+    const closeOutside = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) setOpen(false); };
+    const closeOnFocus = (event: FocusEvent) => { if (!root.current?.contains(event.target as Node)) setOpen(false); };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("focusin", closeOnFocus);
+    return () => { document.removeEventListener("pointerdown", closeOutside); document.removeEventListener("focusin", closeOnFocus); };
   }, [open]);
 
-  const typed = query.trim();
-  const matches = options.filter((model) => model.toLowerCase().includes(typed.toLowerCase()));
+  useEffect(() => {
+    if (open) document.getElementById(`${listId}-${index}`)?.scrollIntoView({ block: "nearest" });
+  }, [open, listId, index]);
 
   function commit(model: string) {
-    onChange(model.trim());
-    setQuery("");
-    setOpen(false);
+    onChange(model.trim()); setQuery(""); setOpen(false); trigger.current?.focus();
   }
 
   return <div className="model-select" ref={root}>
-    <button
-      type="button"
-      aria-label="选择模型"
-      aria-expanded={open}
-      className={value ? "" : "empty"}
-      disabled={disabled}
-      onClick={() => { setQuery(""); setOpen((current) => !current); }}
-    >
-      <span>{value || "选择或输入模型"}</span><i />
-    </button>
+    <button type="button" ref={trigger} aria-label="选择模型" aria-haspopup="listbox" aria-expanded={open} aria-controls={listId}
+      className={value ? "" : "empty"} disabled={disabled}
+      onClick={() => { setQuery(""); setHighlighted(0); setOpen((current) => !current); }}
+      onKeyDown={(event) => { if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); setHighlighted(0); setOpen(true); } }}
+    ><span>{value || "选择或输入模型"}</span><i /></button>
     {open && <div className="model-select-pop">
-      <input
-        ref={search}
-        aria-label="搜索或输入模型 ID"
-        value={query}
-        placeholder="搜索列表，或直接输入模型 ID 后回车"
-        onChange={(event) => setQuery(event.target.value)}
+      <input ref={search} aria-label="搜索或输入模型 ID" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls={listId}
+        aria-activedescendant={choices.length ? `${listId}-${index}` : undefined} value={query} placeholder="搜索已添加模型，或输入完整 ID"
+        onChange={(event) => { setQuery(event.target.value); setHighlighted(0); }}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && typed) commit(typed);
-          if (event.key === "Escape") setOpen(false);
-        }}
-      />
-      <div className="model-select-list">
-        {matches.map((model) => <button type="button" key={model} className={model === value ? "active" : ""} onClick={() => commit(model)}>{model}{model === value && <b>✓</b>}</button>)}
-        {typed && !options.includes(typed) && <button type="button" className="manual" onClick={() => commit(typed)}>使用“{typed}”</button>}
-        {!matches.length && !typed && <p>{loading ? "正在读取该连接的模型列表…" : "该连接未返回模型列表，直接输入模型 ID 即可。"}</p>}
-        {!matches.length && typed && options.length > 0 && <p>列表中没有匹配项，回车即可使用手动输入的 ID。</p>}
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault(); setHighlighted(choices.length ? (index + (event.key === "ArrowDown" ? 1 : -1) + choices.length) % choices.length : 0);
+          }
+          if (event.key === "Enter" && choices[index]) { event.preventDefault(); commit(choices[index]); }
+          if (event.key === "Escape") { event.stopPropagation(); setOpen(false); trigger.current?.focus(); }
+        }} />
+      <div className="model-select-list" id={listId} role="listbox" aria-label="模型">
+        {choices.map((model, position) => <button type="button" tabIndex={-1} role="option" aria-selected={model === value} id={`${listId}-${position}`} key={model}
+          className={`${model === value ? "active" : ""} ${position === index ? "highlighted" : ""} ${!matches.includes(model) ? "manual" : ""}`}
+          onPointerDown={(event) => event.preventDefault()} onClick={() => commit(model)}>{matches.includes(model) ? model : `添加并使用“${model}”`}{model === value && <b>✓</b>}</button>)}
       </div>
+      {!choices.length && <p className="field-hint">{loading ? "正在读取模型…" : "尚未添加模型，可到服务中管理，或输入完整模型 ID。"}</p>}
     </div>}
   </div>;
 }
@@ -321,8 +315,9 @@ function TaskBindingCard({ label, note, profiles, profileId, model, models, mode
       <div className="binding-field"><span>计算模式{result ? "（已按实测映射）" : ""}</span><ComputeModeSelect value={mode} probe={result} onChange={onMode} /></div>
     </div>
     <div className="binding-actions">
+      {label === "术语发现" && model && <button type="button" className="ghost-action" onClick={() => onModel("")}>仅本地扫描</button>}
       <button type="button" className="probe-action" onClick={onTest} disabled={!model.trim() || probe?.loading}>{probe?.loading ? "实测中…" : result ? "重新实测" : "实测能力"}</button>
-      <button type="button" className="ghost-action" onClick={onRefresh} disabled={modelsLoading}>{modelsLoading ? "读取模型列表…" : "刷新模型列表"}</button>
+      <button type="button" className="ghost-action" onClick={onRefresh} disabled={modelsLoading}>管理此服务的模型</button>
       {result && <button type="button" className="ghost-action" onClick={() => setShowDetails((current) => !current)}>{showDetails ? "收起详情" : "查看详情"}</button>}
       {result && !showDetails && <span className="binding-summary">{probeSummary(result)}</span>}
     </div>
@@ -330,420 +325,285 @@ function TaskBindingCard({ label, note, profiles, profileId, model, models, mode
   </section>;
 }
 
-export function ProviderSettingsPanel({ onSaved }: { onSaved?: (value: ProviderForm) => void }) {
+export function ProviderSettingsPanel({ onSaved, hidden = false }: { onSaved?: (value: ProviderForm) => void; hidden?: boolean }) {
   const [form, setForm] = useState<ProviderForm>({
-    version: 4,
-    profiles: [],
-    presets: [],
-    draft_profile_id: "",
-    draft_model: "",
-    draft_compute_mode: "economy",
-    term_discovery_profile_id: "",
-    term_discovery_model: "",
-    term_discovery_compute_mode: "balanced",
-    term_discovery_provider: "",
-    warnings: [],
-    draft_provider: "",
-    provider_type: "custom",
-    base_url: "",
-    api_key_configured: false,
-    key_source: "none",
+    version: 4, profiles: [], presets: [], draft_profile_id: "", draft_model: "",
+    draft_compute_mode: "economy", term_discovery_profile_id: "", term_discovery_model: "",
+    term_discovery_compute_mode: "balanced", term_discovery_provider: "", warnings: [],
+    draft_provider: "", provider_type: "custom", base_url: "", api_key_configured: false, key_source: "none",
   });
+  const [savedForm, setSavedForm] = useState<ProviderForm | null>(null);
   const [activeProfileId, setActiveProfileId] = useState("");
+  const [tab, setTab] = useState<"providers" | "tasks">("providers");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
   const [showKey, setShowKey] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [providerQuery, setProviderQuery] = useState("");
+  const [modelQuery, setModelQuery] = useState("");
+  const [manualModel, setManualModel] = useState("");
+  const [managing, setManaging] = useState(false);
   const [status, setStatus] = useState<{ kind: "success" | "warning" | "error"; text: string } | null>(null);
   const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({});
   const [modelLoading, setModelLoading] = useState<Record<string, boolean>>({});
+  const [connectionStatus, setConnectionStatus] = useState<Record<string, { kind: "success" | "warning" | "error"; text: string }>>({});
   const [modelProbes, setModelProbes] = useState<Record<string, ModelProbeState>>({});
-  const autoListedProfiles = useRef<Set<string>>(new Set());
+  // Revisions keep responses from earlier credentials/endpoints out of the current UI.
+  const revisions = useRef<Record<string, number>>({});
+  const listingRequests = useRef(new Set<string>());
 
   useEffect(() => {
-    api<ProviderForm>("/settings/provider")
-      .then((value) => {
-        const profiles = value.profiles.map((item) => ({ ...item, api_key: "" }));
-        const draftPreset = value.presets.find((item) => item.id === profiles.find((profile) => profile.id === value.draft_profile_id)?.provider_type);
-        setForm({
-          ...value,
-          profiles,
-          draft_model: value.draft_model || draftPreset?.default_models[0] || "",
-          draft_compute_mode: value.draft_compute_mode || "economy",
-          term_discovery_profile_id: value.term_discovery_profile_id || value.draft_profile_id,
-          term_discovery_model: value.term_discovery_model ?? value.draft_model ?? "",
-          term_discovery_compute_mode: value.term_discovery_compute_mode || "balanced",
-        });
-        setActiveProfileId(value.draft_profile_id || profiles[0]?.id || "");
-        if (value.warnings?.length) setStatus({ kind: "warning", text: value.warnings.join("；") });
-      })
-      .catch(() => setStatus({ kind: "error", text: "本地 API 尚未启动，请用启动器重新打开介译。" }))
-      .finally(() => setLoading(false));
+    let cancelled = false;
+    api<ProviderForm>("/settings/provider").then((value) => {
+      if (cancelled) return;
+      const normalized = {
+        ...value,
+        profiles: value.profiles.map((item) => ({ ...item, api_key: "", selected_models: selectedModels(item.selected_models, [
+          value.draft_profile_id === item.id ? value.draft_model : "",
+          value.term_discovery_profile_id === item.id ? value.term_discovery_model : "",
+        ]) })),
+      };
+      setForm(normalized);
+      setSavedForm(normalized);
+      setActiveProfileId(value.draft_profile_id || value.profiles[0]?.id || "");
+      if (value.warnings?.length) setStatus({ kind: "warning", text: value.warnings.join("；") });
+    }).catch(() => {
+      if (!cancelled) setStatus({ kind: "error", text: "无法读取配置，请检查本地 API 后重新打开介译。" });
+    }).finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, []);
 
+  const dirty = savedForm !== null && JSON.stringify(form) !== JSON.stringify(savedForm);
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
   const activeProfile = form.profiles.find((item) => item.id === activeProfileId) || form.profiles[0];
+  const boundModels = (profileId: string) => uniqueModels([
+    form.draft_profile_id === profileId ? form.draft_model : "",
+    form.term_discovery_profile_id === profileId ? form.term_discovery_model : "",
+  ]);
+  const modelsForProfile = (profileId: string) => selectedModels(form.profiles.find((item) => item.id === profileId)?.selected_models, boundModels(profileId));
+
+  function selectProfile(id: string) {
+    setActiveProfileId(id); setShowKey(false); setModelQuery(""); setManualModel(""); setManaging(false); setAdding(false);
+  }
+
+  function invalidateProfile(id: string) {
+    revisions.current[id] = (revisions.current[id] || 0) + 1;
+    setAvailableModels((current) => { const next = { ...current }; delete next[id]; return next; });
+    setConnectionStatus((current) => { const next = { ...current }; delete next[id]; return next; });
+    setModelLoading((current) => ({ ...current, [id]: false }));
+  }
 
   function updateActiveProfile(update: Partial<ProviderProfileForm>) {
     if (!activeProfile) return;
-    setForm((current) => ({
-      ...current,
-      profiles: current.profiles.map((item) => item.id === activeProfile.id ? { ...item, ...update } : item),
-    }));
+    if (Object.keys(update).some((key) => !["name", "selected_models"].includes(key))) invalidateProfile(activeProfile.id);
+    setForm((current) => ({ ...current, profiles: current.profiles.map((item) => item.id === activeProfile.id ? { ...item, ...update } : item) }));
     setStatus(null);
   }
 
-  function chooseProvider(preset: ProviderPreset) {
-    if (!activeProfile) return;
-    const recommended = preset.default_models[0] || "";
-    setForm((current) => ({
-      ...current,
-      profiles: current.profiles.map((item) => item.id === activeProfile.id ? {
-        ...item,
-        name: preset.name,
-        provider_type: preset.id,
-        base_url: preset.base_url,
-        chat_path: preset.chat_path,
-        models_path: preset.models_path,
-        protocol: preset.protocol,
-        auth_required: preset.auth_required,
-        capabilities: preset.capabilities,
-      } : item),
-      draft_model: current.draft_profile_id === activeProfile.id && recommended ? recommended : current.draft_model,
-      term_discovery_model: current.term_discovery_profile_id === activeProfile.id && recommended ? recommended : current.term_discovery_model,
-    }));
-    setStatus(recommended ? { kind: "success", text: `已选择 ${preset.name}，推荐模型为 ${recommended}。` } : null);
-    if (preset.default_models[0]) {
-      setAvailableModels((current) => ({ ...current, [activeProfile?.id || ""]: preset.default_models }));
-    }
-  }
-
-  function addProfile() {
-    const preset = form.presets.find((item) => item.id === "custom") || form.presets[0];
-    if (!preset) return;
-    const id = `connection-${Date.now().toString(36)}`;
+  function addProfile(preset: ProviderPreset) {
+    const id = `connection-${crypto.randomUUID()}`;
+    const number = form.profiles.filter((item) => item.provider_type === preset.id).length + 1;
     const profile: ProviderProfileForm = {
-      id,
-      name: "新连接",
-      provider_type: preset.id,
-      base_url: preset.base_url,
-      chat_path: preset.chat_path,
-      models_path: preset.models_path,
-      protocol: preset.protocol,
-      auth_required: preset.auth_required,
-      capabilities: preset.capabilities,
-      api_key: "",
-      api_key_configured: false,
-      key_source: "none",
+      id, name: `${preset.name}${number > 1 ? ` ${number}` : ""}`, provider_type: preset.id,
+      base_url: preset.base_url, chat_path: preset.chat_path, models_path: preset.models_path,
+      protocol: preset.protocol, auth_required: preset.auth_required, capabilities: preset.capabilities,
+      api_key: "", api_key_configured: false, key_source: "none", selected_models: [],
     };
-    setForm((current) => ({ ...current, profiles: [...current.profiles, profile] }));
-    setActiveProfileId(id);
-    setStatus(null);
+    setForm((current) => ({ ...current, profiles: [...current.profiles, profile],
+      draft_profile_id: current.draft_profile_id || id, term_discovery_profile_id: current.term_discovery_profile_id || id }));
+    selectProfile(id); setProviderQuery(""); setStatus(null);
   }
 
   function removeActiveProfile() {
-    if (!activeProfile || form.profiles.length <= 1) return;
+    if (!activeProfile || form.profiles.length <= 1 || form.draft_profile_id === activeProfile.id || form.term_discovery_profile_id === activeProfile.id) return;
     const profiles = form.profiles.filter((item) => item.id !== activeProfile.id);
-    const fallbackId = profiles[0].id;
-    setForm((current) => ({
-      ...current,
-      profiles,
-      draft_profile_id: current.draft_profile_id === activeProfile.id ? fallbackId : current.draft_profile_id,
-      term_discovery_profile_id: current.term_discovery_profile_id === activeProfile.id ? fallbackId : current.term_discovery_profile_id,
-      term_discovery_model: current.term_discovery_profile_id === activeProfile.id ? modelsForProfile(fallbackId)[0] || "" : current.term_discovery_model,
+    invalidateProfile(activeProfile.id);
+    setForm((current) => ({ ...current, profiles }));
+    selectProfile(profiles[0].id);
+    setStatus({ kind: "warning", text: "已从待保存配置中移除连接；保存前可以撤销更改。使用此连接的书籍需要重新选择服务。" });
+  }
+
+  function addModels(models: string[]) {
+    if (!activeProfile) return;
+    updateActiveProfile({ selected_models: uniqueModels([...modelsForProfile(activeProfile.id), ...models]) });
+  }
+
+  function changeBindingModel(role: "draft" | "term_discovery", model: string, profileId = form[`${role}_profile_id`]) {
+    setForm((current) => ({ ...current, [`${role}_profile_id`]: profileId, [`${role}_model`]: model.trim(),
+      profiles: current.profiles.map((profile) => profile.id === profileId
+        ? { ...profile, selected_models: uniqueModels([...(profile.selected_models || []), model]) } : profile),
     }));
-    setActiveProfileId(fallbackId);
     setStatus(null);
   }
 
-  function modelsForProfile(profileId: string): string[] {
+  async function loadModels(profileId: string) {
     const profile = form.profiles.find((item) => item.id === profileId);
-    const defaults = form.presets.find((item) => item.id === profile?.provider_type)?.default_models || [];
-    return uniqueModels([...(availableModels[profileId] || []), ...defaults]);
-  }
-
-  function changeBindingProfile(role: "draft" | "term_discovery", profileId: string) {
-    const recommended = modelsForProfile(profileId)[0] || "";
-    setForm((current) => ({
-      ...current,
-      [`${role}_profile_id`]: profileId,
-      [`${role}_model`]: recommended,
-    }));
-  }
-
-
-  async function loadModels(profileId: string, silent = false) {
-    const profile = form.profiles.find((item) => item.id === profileId);
-    if (!profile?.base_url || modelLoading[profileId]) return;
+    if (!profile || !validBaseUrl(profile.base_url)) return;
+    const revision = revisions.current[profileId] || 0;
+    const requestId = `${profileId}:${revision}`;
+    if (listingRequests.current.has(requestId)) return;
+    listingRequests.current.add(requestId);
     setModelLoading((current) => ({ ...current, [profileId]: true }));
-    if (!silent) setStatus(null);
     try {
       const value = await api<{ models: string[] }>("/settings/provider/test", {
-        method: "POST",
-        body: JSON.stringify({
-          profile_id: profile.id,
-          provider_type: profile.provider_type,
-          base_url: profile.base_url,
-          models_path: profile.models_path,
-          protocol: profile.protocol,
-          api_key: profile.api_key,
-          required_models: [],
-        }),
+        method: "POST", body: JSON.stringify({ profile_id: profile.id, provider_type: profile.provider_type,
+          base_url: profile.base_url, models_path: profile.models_path, protocol: profile.protocol,
+          api_key: profile.api_key, required_models: [] }),
       });
-      setAvailableModels((current) => ({ ...current, [profileId]: value.models }));
-      if (!silent) {
-        setStatus(value.models.length
-          ? { kind: "success", text: `${profile.name} 已读取 ${value.models.length} 个可用模型。` }
-          : { kind: "warning", text: `${profile.name} 不提供模型列表，请在模型框中直接输入模型 ID。` });
-      }
+      if ((revisions.current[profileId] || 0) !== revision) return;
+      setAvailableModels((current) => ({ ...current, [profileId]: uniqueModels(value.models) }));
+      setConnectionStatus((current) => ({ ...current, [profileId]: value.models.length
+        ? { kind: "success", text: `已读取 ${uniqueModels(value.models).length} 个模型。添加所需模型后，可实测验证输出。` }
+        : { kind: "warning", text: "未获取到模型列表。可添加预设或手动输入模型 ID，再实测验证；当前尚未验证模型可用性。" } }));
     } catch (error) {
-      if (!silent) setStatus({ kind: "error", text: error instanceof Error ? error.message : "读取模型列表失败" });
+      if ((revisions.current[profileId] || 0) !== revision) return;
+      setConnectionStatus((current) => ({ ...current, [profileId]: { kind: "error", text: error instanceof Error ? error.message : "获取模型失败，可重试或手动添加模型。" } }));
     } finally {
-      setModelLoading((current) => ({ ...current, [profileId]: false }));
+      listingRequests.current.delete(requestId);
+      if ((revisions.current[profileId] || 0) === revision) setModelLoading((current) => ({ ...current, [profileId]: false }));
     }
-  }
-
-  // Fetch each bound connection's model list once, so choosing a model never
-  // requires a detour through the connection tabs and the footer test button.
-  useEffect(() => {
-    if (loading) return;
-    for (const profileId of [form.draft_profile_id, form.term_discovery_profile_id]) {
-      const profile = form.profiles.find((item) => item.id === profileId);
-      if (!profile?.base_url || availableModels[profileId] || autoListedProfiles.current.has(profileId)) continue;
-      if (profile.auth_required && !profile.api_key_configured && !profile.api_key) continue;
-      autoListedProfiles.current.add(profileId);
-      void loadModels(profileId, true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading, form.draft_profile_id, form.term_discovery_profile_id, form.profiles, availableModels]);
-
-  function mirrorDraftBinding() {
-    setForm((current) => ({
-      ...current,
-      term_discovery_profile_id: current.draft_profile_id,
-      term_discovery_model: current.draft_model,
-      term_discovery_compute_mode: current.draft_compute_mode,
-    }));
-    setStatus({ kind: "success", text: "术语发现已沿用草译的连接、模型与计算模式。" });
   }
 
   function modelProbeKey(profileId: string, model: string): string {
-    const profile = form.profiles.find((item) => item.id === profileId);
-    if (!profile || !model.trim()) return "";
-    return [profile.id, profile.provider_type, profile.base_url, profile.chat_path, profile.protocol, model.trim()].join("|");
+    return model.trim() ? `${profileId}:${revisions.current[profileId] || 0}:${model.trim()}` : "";
   }
 
   async function testModel(profileId: string, model: string) {
     const profile = form.profiles.find((item) => item.id === profileId);
     const key = modelProbeKey(profileId, model);
-    if (!profile || !key) return;
-    const normalizedModel = model.trim().toLowerCase();
-    if (normalizedModel.startsWith("claude-") && profile.protocol !== "anthropic_messages") {
-      setModelProbes((current) => ({ ...current, [key]: { loading: false, error: "Claude 模型需要选择 Anthropic Messages 连接；当前连接使用的是其他协议。" } }));
-      return;
-    }
-    if (normalizedModel.startsWith("gemini-") && profile.protocol !== "gemini_generate_content" && profile.protocol !== "responses") {
-      setModelProbes((current) => ({ ...current, [key]: { loading: false, error: "Gemini 模型需要选择 Gemini generateContent 或 Responses 连接。" } }));
-      return;
-    }
+    if (!profile || !key || modelProbes[key]?.loading) return;
     setModelProbes((current) => ({ ...current, [key]: { loading: true } }));
     try {
       const result = await api<ModelProbeResult>("/settings/provider/model-test", {
-        method: "POST",
-        body: JSON.stringify({
-          profile_id: profile.id,
-          provider_type: profile.provider_type,
-          base_url: profile.base_url,
-          chat_path: profile.chat_path,
-          protocol: profile.protocol,
-          api_key: profile.api_key,
-          model,
-        }),
+        method: "POST", body: JSON.stringify({ profile_id: profile.id, provider_type: profile.provider_type,
+          base_url: profile.base_url, chat_path: profile.chat_path, protocol: profile.protocol, api_key: profile.api_key, model: model.trim() }),
       });
       setModelProbes((current) => ({ ...current, [key]: { loading: false, result } }));
     } catch (error) {
-      setModelProbes((current) => ({
-        ...current,
-        [key]: {
-          loading: false,
-          error: error instanceof Error ? error.message : "能力实测失败",
-        },
-      }));
+      setModelProbes((current) => ({ ...current, [key]: { loading: false, error: error instanceof Error ? error.message : "能力实测失败" } }));
     }
   }
 
   async function saveSettings() {
-    setSaving(true);
-    setStatus(null);
+    if (saving || !dirty) return;
+    setSaving(true); setStatus(null);
     try {
       const value = await api<ProviderForm>("/settings/provider", {
-        method: "PATCH",
-        body: JSON.stringify({
-          version: 4,
-          profiles: form.profiles.map((profile) => ({
-            id: profile.id,
-            name: profile.name,
-            provider_type: profile.provider_type,
-            base_url: profile.base_url,
-            chat_path: profile.chat_path,
-            models_path: profile.models_path,
-            protocol: profile.protocol,
-            auth_required: profile.auth_required,
-            capabilities: profile.capabilities,
-            api_key: profile.api_key,
-          })),
-          draft_profile_id: form.draft_profile_id,
-          draft_model: form.draft_model,
-          draft_compute_mode: form.draft_compute_mode,
-          term_discovery_profile_id: form.term_discovery_profile_id,
-          term_discovery_model: form.term_discovery_model,
+        method: "PATCH", body: JSON.stringify({ version: 4,
+          profiles: form.profiles.map((profile) => ({ ...profile, selected_models: modelsForProfile(profile.id) })),
+          draft_profile_id: form.draft_profile_id, draft_model: form.draft_model, draft_compute_mode: form.draft_compute_mode,
+          term_discovery_profile_id: form.term_discovery_profile_id, term_discovery_model: form.term_discovery_model,
           term_discovery_compute_mode: form.term_discovery_compute_mode,
         }),
       });
-      const profiles = value.profiles.map((item) => ({ ...item, api_key: "" }));
-      const normalized = { ...value, profiles };
-      setForm(normalized);
-      onSaved?.(value);
-      setStatus(value.warnings?.length
-        ? { kind: "warning", text: `配置已保存；${value.warnings.join("；")}` }
-        : { kind: "success", text: "配置已保存，草译和术语发现将使用各自绑定的模型。" });
+      const normalized = { ...value, profiles: value.profiles.map((item) => ({ ...item, api_key: "" })) };
+      setForm(normalized); setSavedForm(normalized); onSaved?.(value);
+      setStatus(value.warnings?.length ? { kind: "warning", text: `已保存；${value.warnings.join("；")}` }
+        : { kind: "success", text: "连接、已添加模型和默认任务设置已保存。" });
     } catch (error) {
-      setStatus({ kind: "error", text: error instanceof Error ? error.message : "保存失败" });
-    } finally {
-      setSaving(false);
-    }
+      setStatus({ kind: "error", text: error instanceof Error ? error.message : "保存失败，请重试。" });
+    } finally { setSaving(false); }
   }
 
-  async function testConnection() {
-    if (!activeProfile) return;
-    setTesting(true);
-    setStatus(null);
-    try {
-      const boundModels = [
-        form.draft_profile_id === activeProfile.id ? form.draft_model : "",
-        form.term_discovery_profile_id === activeProfile.id ? form.term_discovery_model : "",
-      ].filter(Boolean);
-      const value = await api<{ models: string[]; stages: { message: string }[] }>("/settings/provider/test", {
-        method: "POST",
-        body: JSON.stringify({
-          profile_id: activeProfile.id,
-          provider_type: activeProfile.provider_type,
-          base_url: activeProfile.base_url,
-          models_path: activeProfile.models_path,
-          protocol: activeProfile.protocol,
-          api_key: activeProfile.api_key,
-          required_models: boundModels,
-        }),
-      });
-      const suffix = value.models.length ? `，发现 ${value.models.length} 个可用模型` : "";
-      setAvailableModels((current) => ({ ...current, [activeProfile.id]: value.models }));
-      if (value.models[0]) {
-        setForm((current) => ({
-          ...current,
-          draft_model: current.draft_profile_id === activeProfile.id && !current.draft_model ? value.models[0] : current.draft_model,
-        }));
-      }
-      const message = activeProfile.protocol === "anthropic_messages" && !value.models.length
-        ? "Claude 地址已保存；该接口不提供模型列表，请手动输入模型 ID 后点击“实测能力”。"
-        : `地址、认证和已绑定模型均正常${suffix}。`;
-      setStatus({ kind: "success", text: message });
-    } catch (error) {
-      setStatus({ kind: "error", text: error instanceof Error ? error.message : "连接失败" });
-    } finally {
-      setTesting(false);
-    }
+  function discardChanges() {
+    if (!savedForm) return;
+    for (const profile of form.profiles) invalidateProfile(profile.id);
+    setForm(savedForm); selectProfile(savedForm.profiles[0]?.id || ""); setStatus(null);
   }
 
-  const configuredCount = form.profiles.filter((item) => !item.auth_required || item.api_key_configured || item.api_key).length;
-  const draftModels = modelsForProfile(form.draft_profile_id);
-  const discoveryModels = modelsForProfile(form.term_discovery_profile_id);
+  const activeModels = activeProfile ? modelsForProfile(activeProfile.id) : [];
+  const protectedModels = activeProfile ? boundModels(activeProfile.id) : [];
+  const preset = form.presets.find((item) => item.id === activeProfile?.provider_type);
+  const discovered = activeProfile ? availableModels[activeProfile.id] : undefined;
+  const candidates = modelSearch(discovered ?? preset?.default_models ?? [], modelQuery);
+  const missingCandidates = candidates.filter((model) => !activeModels.includes(model));
+  const visibleProfiles = form.profiles.filter((item) => `${item.name} ${item.provider_type}`.toLowerCase().includes(providerQuery.trim().toLowerCase()));
+  const activeStatus = activeProfile ? connectionStatus[activeProfile.id] : undefined;
+  const activeLoading = Boolean(activeProfile && modelLoading[activeProfile.id]);
+  const assigned = activeProfile && (form.draft_profile_id === activeProfile.id || form.term_discovery_profile_id === activeProfile.id);
+  const invalidProfile = form.profiles.find((item) => !item.name.trim() || !validBaseUrl(item.base_url));
+  const sameAsDraft = form.term_discovery_profile_id === form.draft_profile_id && form.term_discovery_model === form.draft_model && form.term_discovery_compute_mode === form.draft_compute_mode;
 
-  const draftProbeState = modelProbes[modelProbeKey(form.draft_profile_id, form.draft_model)];
-  const discoveryProbeState = modelProbes[modelProbeKey(form.term_discovery_profile_id, form.term_discovery_model)];
-  const sameAsDraft = form.term_discovery_profile_id === form.draft_profile_id
-    && form.term_discovery_model === form.draft_model
-    && form.term_discovery_compute_mode === form.draft_compute_mode;
-
-  return (
-    <section className="setup-view settings-view">
-      <header className="setup-header">
-        <div><span className="page-kicker">偏好设置</span><h1>模型配置</h1><p>管理多个模型连接，并分别绑定草译和术语发现任务。</p></div>
-        <div className={`connection-pill ${configuredCount > 0 ? "online" : ""}`}><i />{loading ? "正在读取" : `${configuredCount} / ${form.profiles.length} 个连接就绪`}</div>
-      </header>
-
-      <div className="settings-scroll">
-        <section className="form-section">
-          <div className="form-section-title"><span>1</span><div><strong>服务连接</strong><small>每个连接拥有独立地址、端点和密钥</small></div></div>
-          <div className="profile-tabs">
-            {form.profiles.map((profile) => <button key={profile.id} className={profile.id === activeProfile?.id ? "active" : ""} onClick={() => setActiveProfileId(profile.id)}><i>{profile.name.slice(0, 1)}</i><span><strong>{profile.name}</strong><small>{profile.api_key_configured ? "密钥已保存" : profile.auth_required ? "等待密钥" : "无需密钥"}</small></span></button>)}
-            <button className="add-profile" onClick={addProfile}>＋ 添加连接</button>
+  return <section className="setup-view settings-view" style={hidden ? { display: "none" } : undefined}>
+    <header className="setup-header">
+      <div><span className="page-kicker">偏好设置</span><h1>模型配置</h1><p>连接模型服务，添加常用模型，再为翻译任务分配模型。</p></div>
+      <span className={`settings-save-state ${dirty ? "dirty" : ""}`}>{loading ? "正在读取…" : dirty ? "● 有未保存的更改" : savedForm ? "配置已保存" : "配置未加载"}</span>
+    </header>
+    <div className="settings-tabs" role="tablist" aria-label="模型配置分类">
+      <button role="tab" id="providers-tab" aria-controls="providers-panel" aria-selected={tab === "providers"} onClick={() => setTab("providers")}>模型服务 <span>{form.profiles.length}</span></button>
+      <button role="tab" id="tasks-tab" aria-controls="tasks-panel" aria-selected={tab === "tasks"} onClick={() => setTab("tasks")}>默认任务模型</button>
+    </div>
+    <fieldset className="settings-workspace" disabled={loading || saving}>
+      {tab === "providers" ? <div className="provider-workspace" id="providers-panel" role="tabpanel" aria-labelledby="providers-tab">
+        <aside className="provider-sidebar" aria-label="已配置的模型服务">
+          <input aria-label="搜索服务" placeholder="搜索服务…" value={providerQuery} onChange={(event) => setProviderQuery(event.target.value)} />
+          <div className="provider-list">
+            {visibleProfiles.map((profile) => <button key={profile.id} className={activeProfile?.id === profile.id && !adding ? "active" : ""} aria-pressed={activeProfile?.id === profile.id && !adding} onClick={() => selectProfile(profile.id)}>
+              <i>{profile.name.slice(0, 1) || "M"}</i><span><strong>{profile.name || "未命名服务"}</strong><small>{modelsForProfile(profile.id).length} 个模型 · {!validBaseUrl(profile.base_url) ? "待填地址" : profile.auth_required && !profile.api_key_configured && !profile.api_key ? "待填密钥" : "已填连接"}</small></span>
+            </button>)}
+            {!loading && !visibleProfiles.length && <p className="settings-empty">{form.profiles.length ? "没有匹配的服务" : "添加一个模型服务开始配置"}</p>}
           </div>
-          <div className="provider-grid">
-            {form.presets.map((provider) => (
-              <button key={provider.id} className={`provider-option ${activeProfile?.provider_type === provider.id ? "selected" : ""}`} onClick={() => chooseProvider(provider)}>
-                <i>{provider.name.slice(0, 1)}</i><span><strong>{provider.name}</strong><small>{provider.note}</small></span><b>✓</b>
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section className="form-section">
-          <div className="form-section-title"><span>2</span><div><strong>连接详情</strong><small>端点显式配置，不再猜测 API 版本</small></div></div>
-          <div className="settings-fields">
-            <label className="wide-field"><span>连接名称</span><input value={activeProfile?.name || ""} onChange={(event) => updateActiveProfile({ name: event.target.value })} placeholder="例如 Kimi 草译" /></label>
-            <label className="wide-field"><span>API Base URL</span><input value={activeProfile?.base_url || ""} onChange={(event) => updateActiveProfile({ base_url: event.target.value })} placeholder="https://api.example.com/v1" /></label>
-            <div className="endpoint-fields"><label><span>协议</span><select value={activeProfile?.protocol || "chat_completions"} onChange={(event) => updateActiveProfile({ protocol: event.target.value })}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option><option value="gemini_generate_content">Gemini generateContent</option></select></label><label><span>Chat / Messages 路径</span><input value={activeProfile?.chat_path || ""} onChange={(event) => updateActiveProfile({ chat_path: event.target.value })} /></label><label><span>Models 路径</span><input value={activeProfile?.models_path || ""} onChange={(event) => updateActiveProfile({ models_path: event.target.value })} /></label></div>
-            <label className="wide-field"><span>API 密钥</span><div className="secret-input"><input type={showKey ? "text" : "password"} value={activeProfile?.api_key || ""} onChange={(event) => updateActiveProfile({ api_key: event.target.value })} placeholder={activeProfile?.api_key_configured ? "已安全存储；留空表示不修改" : activeProfile?.auth_required ? "输入该连接的 API Key" : "本地服务无需填写"} /><button type="button" onClick={() => setShowKey((value) => !value)}>{showKey ? "隐藏" : "显示"}</button></div></label>
-          </div>
-          <div className="keychain-note"><i>⌾</i><span><strong>分连接安全存储</strong>优先写入 macOS 钥匙串；授权不可用时自动降级为本次运行会话。</span></div>
-          {form.profiles.length > 1 && <button className="remove-profile" onClick={removeActiveProfile}>移除此连接</button>}
-        </section>
-
-        <section className="form-section">
-          <div className="form-section-title"><span>3</span><div><strong>任务模型</strong><small>草译和术语发现各自绑定连接、模型与计算模式；实测结果按“连接 + 模型”缓存复用</small></div></div>
-          <div className="binding-cards">
-            <TaskBindingCard
-              label="草译"
-              note="逐段生成译文草稿"
-              profiles={form.profiles}
-              profileId={form.draft_profile_id}
-              model={form.draft_model}
-              models={draftModels}
-              modelsLoading={Boolean(modelLoading[form.draft_profile_id])}
-              mode={form.draft_compute_mode}
-              probe={draftProbeState}
-              onProfile={(value) => changeBindingProfile("draft", value)}
-              onModel={(draft_model) => setForm((current) => ({ ...current, draft_model }))}
-              onMode={(draft_compute_mode) => setForm((current) => ({ ...current, draft_compute_mode }))}
-              onTest={() => void testModel(form.draft_profile_id, form.draft_model)}
-              onRefresh={() => void loadModels(form.draft_profile_id)}
-            />
-            <TaskBindingCard
-              label="术语发现"
-              note="候选筛选、义项与译法建议；留空时仅做本地扫描"
-              profiles={form.profiles}
-              profileId={form.term_discovery_profile_id}
-              model={form.term_discovery_model}
-              models={discoveryModels}
-              modelsLoading={Boolean(modelLoading[form.term_discovery_profile_id])}
-              mode={form.term_discovery_compute_mode}
-              probe={discoveryProbeState}
-              mirror={{ label: "沿用草译设置", disabled: sameAsDraft, onClick: mirrorDraftBinding }}
-              onProfile={(value) => changeBindingProfile("term_discovery", value)}
-              onModel={(term_discovery_model) => setForm((current) => ({ ...current, term_discovery_model }))}
-              onMode={(term_discovery_compute_mode) => setForm((current) => ({ ...current, term_discovery_compute_mode }))}
-              onTest={() => void testModel(form.term_discovery_profile_id, form.term_discovery_model)}
-              onRefresh={() => void loadModels(form.term_discovery_profile_id)}
-            />
-          </div>
-        </section>
-      </div>
-
-      <footer className="setup-footer">
-        <div>{status && <span className={`inline-status ${status.kind}`}><i>{status.kind === "success" ? "✓" : "!"}</i>{status.text}</span>}</div>
-        <div><button className="secondary-action" onClick={testConnection} disabled={testing || !activeProfile?.base_url}>{testing ? "正在测试…" : "测试当前连接"}</button><button className="blue-action" onClick={saveSettings} disabled={saving || form.profiles.some((item) => !item.base_url)}>{saving ? "正在保存…" : "保存全部配置"}</button></div>
-      </footer>
-    </section>
-  );
+          <button className="secondary-action add-provider" onClick={() => { setAdding(true); setShowKey(false); }}>＋ 添加服务</button>
+        </aside>
+        <div className="provider-detail">
+          {adding ? <section className="provider-add-panel">
+            <header className="provider-detail-heading"><div><h2>添加模型服务</h2><p>选择服务商，自动填入地址与协议。每次添加都会创建独立连接。</p></div><button className="ghost-action" onClick={() => setAdding(false)}>取消</button></header>
+            <div className="provider-grid">{form.presets.map((item) => <button key={item.id} className="provider-option" onClick={() => addProfile(item)}><i>{item.name.slice(0, 1)}</i><span><strong>{item.name}</strong><small>{item.note}</small></span></button>)}</div>
+          </section> : activeProfile ? <>
+            <header className="provider-detail-heading"><div><h2>{activeProfile.name || "未命名服务"}</h2><p>{preset?.name || activeProfile.provider_type} · 独立连接</p></div><button className="ghost-action" onClick={() => setTab("tasks")}>分配任务 →</button></header>
+            <section className="provider-connection settings-fields">
+              <label><span>服务名称</span><input value={activeProfile.name} onChange={(event) => updateActiveProfile({ name: event.target.value })} placeholder="例如：日常翻译" /></label>
+              <label><span>API 密钥 <small>{activeProfile.api_key ? "待保存" : activeProfile.api_key_configured ? "已存储" : activeProfile.auth_required ? "必填" : "可选"}</small></span><div className="secret-input"><input type={showKey ? "text" : "password"} autoComplete="off" spellCheck={false} value={activeProfile.api_key} onChange={(event) => updateActiveProfile({ api_key: event.target.value })} placeholder={activeProfile.api_key_configured ? "已安全存储；留空保留现有密钥" : "输入此服务的 API Key"} /><button type="button" aria-label={showKey ? "隐藏 API 密钥" : "显示 API 密钥"} onClick={() => setShowKey((value) => !value)}>{showKey ? "隐藏" : "显示"}</button></div></label>
+              <label><span>API 地址</span><input value={activeProfile.base_url} onChange={(event) => updateActiveProfile({ base_url: event.target.value })} placeholder="https://api.example.com/v1" aria-invalid={Boolean(activeProfile.base_url && !validBaseUrl(activeProfile.base_url))} /><small className="field-hint">{activeProfile.base_url && !validBaseUrl(activeProfile.base_url) ? "请输入完整的 http:// 或 https:// 地址。" : "填写基础地址；如果服务商给了完整请求地址，请在高级设置中填写完整请求路径。"}</small></label>
+              <details className="provider-advanced" key={activeProfile.id}><summary>高级设置 <span>协议与请求路径</span></summary><div className="endpoint-fields">
+                <label><span>协议</span><select value={activeProfile.protocol} onChange={(event) => { const protocol = event.target.value; updateActiveProfile({ protocol, chat_path: protocol === "responses" ? "responses" : protocol === "anthropic_messages" ? "messages" : protocol === "gemini_generate_content" ? "models/{model}:generateContent" : "chat/completions" }); }}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option><option value="gemini_generate_content">Gemini generateContent</option></select></label>
+                <label><span>请求路径</span><input value={activeProfile.chat_path} onChange={(event) => updateActiveProfile({ chat_path: event.target.value })} /></label>
+                <label><span>模型列表路径</span><input value={activeProfile.models_path} onChange={(event) => updateActiveProfile({ models_path: event.target.value })} /></label>
+              </div><p className="endpoint-preview">请求地址 <code>{endpointPreview(activeProfile.base_url, activeProfile.chat_path)}</code></p></details>
+            </section>
+            <section className="provider-model-section">
+              <header className="provider-model-heading"><div><h3>已添加模型 <span>{activeModels.length}</span></h3><p>只有已添加的模型会进入任务选择列表。</p></div><div><button className="secondary-action" disabled={activeLoading || !validBaseUrl(activeProfile.base_url)} onClick={() => { setManaging(true); void loadModels(activeProfile.id); }}>{activeLoading ? "正在获取…" : "获取模型"}</button><button className="ghost-action" aria-expanded={managing} onClick={() => setManaging((value) => !value)}>{managing ? "收起管理" : "管理模型"}</button></div></header>
+              {activeStatus && <p className={`inline-status ${activeStatus.kind}`} role="status">{activeStatus.text}</p>}
+              {managing && <div className="model-manager">
+                <div className="model-manager-toolbar"><input aria-label="搜索可添加模型" placeholder="搜索模型名称…" value={modelQuery} onChange={(event) => setModelQuery(event.target.value)} /><button className="ghost-action" disabled={!missingCandidates.length} onClick={() => addModels(missingCandidates)}>添加筛选结果{missingCandidates.length ? `（${missingCandidates.length}）` : ""}</button></div>
+                <p className="field-hint">{discovered ? "来自当前服务的模型列表；是否能生成译文，请以实测为准。" : "服务商预设，仅供参考；获取模型可查看此连接实际返回的列表。"}</p>
+                <div className="model-candidates">{candidates.map((model) => <div key={model}><code>{model}</code><button className="ghost-action" aria-label={`添加模型 ${model}`} disabled={activeModels.includes(model)} onClick={() => addModels([model])}>{activeModels.includes(model) ? "已添加" : "＋ 添加"}</button></div>)}{!candidates.length && <p className="settings-empty">{activeLoading ? "正在获取模型…" : "没有匹配的模型，可在下方手动添加。"}</p>}</div>
+              </div>}
+              <form className="manual-model-form" onSubmit={(event) => { event.preventDefault(); if (manualModel.trim()) { addModels([manualModel]); setManualModel(""); } }}><input aria-label="手动添加模型 ID" placeholder="输入完整模型 ID，回车添加" value={manualModel} onChange={(event) => setManualModel(event.target.value)} /><button className="ghost-action" disabled={!manualModel.trim() || activeModels.includes(manualModel.trim())}>＋ 添加</button></form>
+              <div className="added-model-list">{activeModels.map((model) => {
+                const probe = modelProbes[modelProbeKey(activeProfile.id, model)];
+                const state = bindingStatus(model, probe);
+                return <div className="added-model" key={model}><div className="added-model-row"><div><code>{model}</code><span className={`binding-status ${state.tone}`}>{state.text}</span>{form.draft_profile_id === activeProfile.id && form.draft_model === model && <small className="model-role">草译</small>}{form.term_discovery_profile_id === activeProfile.id && form.term_discovery_model === model && <small className="model-role">术语</small>}</div><div><button className="ghost-action" disabled={probe?.loading} onClick={() => void testModel(activeProfile.id, model)}>实测</button><button className="ghost-action" title={protectedModels.includes(model) ? "请先在默认任务模型中更换此模型" : "从已添加列表中移除"} aria-label={`移除模型 ${model}`} disabled={protectedModels.includes(model)} onClick={() => updateActiveProfile({ selected_models: activeModels.filter((item) => item !== model) })}>移除</button></div></div>{probe && <ModelCapabilityCard state={probe} />}</div>;
+              })}{!activeModels.length && <p className="settings-empty">还没有添加模型。获取模型列表，或输入服务商提供的模型 ID。</p>}</div>
+              <p className="field-hint">实测会发送少量短请求并使用 API 额度。任务正在使用的模型需先更换，再移除。</p>
+            </section>
+            <div className="provider-detail-bottom"><span>密钥按连接存储，优先使用 macOS 钥匙串。</span><button className="remove-profile" disabled={form.profiles.length <= 1 || Boolean(assigned)} title={assigned ? "请先在默认任务模型中切换到其他连接" : "保存后移除此服务连接"} onClick={removeActiveProfile}>移除服务</button></div>
+          </> : <p className="settings-empty">{loading ? "正在读取模型配置…" : "请添加模型服务。"}</p>}
+        </div>
+      </div> : <div className="settings-scroll task-settings-panel" id="tasks-panel" role="tabpanel" aria-labelledby="tasks-tab">
+        <div className="provider-detail-heading"><div><h2>默认任务模型</h2><p>草译用于新书的默认设置；已单独配置的书籍继续使用各自的模型。</p></div></div>
+        <div className="binding-cards">{(["draft", "term_discovery"] as const).map((role) => <TaskBindingCard key={role}
+          label={role === "draft" ? "草译" : "术语发现"} note={role === "draft" ? "逐段生成译文草稿" : "留空时仅做本地术语扫描"}
+          profiles={form.profiles} profileId={form[`${role}_profile_id`]} model={form[`${role}_model`]}
+          models={modelsForProfile(form[`${role}_profile_id`])} modelsLoading={false} mode={form[`${role}_compute_mode`]}
+          probe={modelProbes[modelProbeKey(form[`${role}_profile_id`], form[`${role}_model`])]}
+          onProfile={(id) => changeBindingModel(role, modelsForProfile(id)[0] || "", id)}
+          onModel={(model) => changeBindingModel(role, model)}
+          onMode={(mode) => setForm((current) => ({ ...current, [`${role}_compute_mode`]: mode }))}
+          onTest={() => void testModel(form[`${role}_profile_id`], form[`${role}_model`])}
+          onRefresh={() => { selectProfile(form[`${role}_profile_id`]); setTab("providers"); setManaging(true); }}
+          mirror={role === "term_discovery" ? { label: "沿用草译设置", disabled: sameAsDraft, onClick: () => setForm((current) => ({ ...current, term_discovery_profile_id: current.draft_profile_id, term_discovery_model: current.draft_model, term_discovery_compute_mode: current.draft_compute_mode })) } : undefined}
+        />)}</div>
+      </div>}
+    </fieldset>
+    <footer className="setup-footer"><div aria-live="polite">{status ? <span className={`inline-status ${status.kind}`}><i>{status.kind === "success" ? "✓" : "!"}</i>{status.text}</span> : <span className="field-hint">{invalidProfile ? `请补全“${invalidProfile.name || "未命名服务"}”的名称和有效 API 地址。` : dirty ? "更改会在保存后生效；切换页面会保留当前编辑。" : "模型服务与任务设置统一保存。"}</span>}</div><div><button className="secondary-action" disabled={!dirty || saving} onClick={discardChanges}>撤销更改</button><button className="blue-action" disabled={!dirty || loading || saving || Boolean(invalidProfile) || !form.profiles.length} onClick={() => void saveSettings()}>{saving ? "正在保存…" : "保存配置"}</button></div></footer>
+  </section>;
 }
 
 export function ImportBookPanel({ onImported }: { onImported?: (result: ImportedBook) => void }) {

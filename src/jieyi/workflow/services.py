@@ -101,7 +101,7 @@ def create_epub_document(
 
 def create_pdf_document(store, *, project_id: str, file_data: bytes,
                         title: str | None = None, book=None) -> Document:
-    from jieyi.ingestion.pdf import VERSION, extract_pdf
+    from jieyi.ingestion.pdf import GEOMETRY_VERSION, VERSION, extract_pdf
 
     store.get_project(project_id)
     source_hash = hashlib.sha256(file_data).hexdigest()
@@ -114,18 +114,18 @@ def create_pdf_document(store, *, project_id: str, file_data: bytes,
     return store.create_document(document, segments_from_blocks(document.id, list(book.blocks)),
         pdf_data=file_data, pdf_metadata={"pages": book.pages,
             "navigation": book.navigation, "warnings": book.warnings, "layout": book.layout,
-            "segmenter_version": VERSION})
+            "segmenter_version": VERSION, "geometry_version": GEOMETRY_VERSION})
 
 
 def resegment_pdf_document(store, document_id: str, *, book=None) -> dict:
     """Reparse a saved original using the same engine as every new PDF import."""
-    from jieyi.ingestion.pdf import VERSION, extract_pdf
+    from jieyi.ingestion.pdf import GEOMETRY_VERSION, VERSION, extract_pdf
 
     book = book or extract_pdf(store.get_original_pdf(document_id))
     return store.replace_pdf_segmentation(
         document_id, segments_from_blocks(document_id, list(book.blocks)),
         {"pages": book.pages, "navigation": book.navigation, "warnings": book.warnings,
-         "layout": book.layout, "segmenter_version": VERSION},
+         "layout": book.layout, "segmenter_version": VERSION, "geometry_version": GEOMETRY_VERSION},
     )
 
 

@@ -20,7 +20,8 @@ from pypdf import PdfReader
 from jieyi.domain.models import SegmentKind
 from jieyi.ingestion.plaintext import ParsedBlock
 
-VERSION = "pdf-layout-v2"
+VERSION = "pdf-layout-v3"
+GEOMETRY_VERSION = "baseline-validated-v1"
 # PDFium is not thread-safe, including separate documents.
 _RENDER_LOCK = threading.Lock()
 
@@ -76,6 +77,62 @@ def _text_line(chars: list[dict]) -> dict:
     }
 
 
+def _validated_char(char, height):
+    """Reject impossible font descent metrics, using the actual text baseline.
+
+    Some subset fonts declare a descent below -2 em. pdfminer trusts it,
+    although PDF renderers position the embedded glyph at the text matrix.
+    Only repair horizontal glyphs whose baseline is outside a plausible em box;
+    ordinary fonts, superscripts and rotated text retain their exact metrics.
+    """
+    matrix = char.get("matrix")
+    size = float(char.get("size", 0))
+    if not matrix or size <= 0 or abs(matrix[1]) > 1e-6 or abs(matrix[2]) > 1e-6:
+        return char
+    baseline = matrix[5]
+    if char["y0"] - size * 0.5 <= baseline <= char["y1"] + size * 0.5:
+        return char
+    y0, y1 = baseline - size * 0.25, baseline + size * 0.85
+    return {**char, "y0": y0, "y1": y1, "top": height - y1, "bottom": height - y0}
+
+
+def repair_layout_geometry(data, layout, page_numbers=None):
+    """Rebase legacy regions without changing segment text, IDs or translations."""
+    from copy import deepcopy
+
+    repaired = deepcopy(layout)
+    by_page = {}
+    for item in repaired:
+        for region in item["regions"]:
+            if page_numbers is None or region["page"] in page_numbers:
+                by_page.setdefault(region["page"], []).append(region)
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        for number, regions in by_page.items():
+            page = pdf.pages[number - 1]
+            chars = [(c, _validated_char(c, page.height)) for c in page.chars]
+            if not any(a is not b for a, b in chars):
+                page.close()
+                continue
+            for region in regions:
+                lines = []
+                for x0, y0, x1, y1 in region["lines"]:
+                    members = [b for a, b in chars if not a["text"].isspace()
+                               and a["x0"] >= x0 - .05 and a["x1"] <= x1 + .05
+                               and a["y0"] >= y0 - .05 and a["y1"] <= y1 + .05]
+                    if members:
+                        lines.append([min(c["x0"] for c in members),
+                                      min(c["y0"] for c in members),
+                                      max(c["x1"] for c in members),
+                                      max(c["y1"] for c in members)])
+                    else:
+                        lines.append([x0, y0, x1, y1])
+                region["lines"] = lines
+                region["rect"] = [min(b[0] for b in lines), min(b[1] for b in lines),
+                                  max(b[2] for b in lines), max(b[3] for b in lines)]
+            page.close()
+    return repaired
+
+
 def _page_lines(page) -> list[dict]:
     # Ornament fonts often map flourishes to ASCII digits. Remove those glyphs
     # before line detection: their tall bounds can swallow the chapter label.
@@ -92,6 +149,9 @@ def _page_lines(page) -> list[dict]:
             and (obj["x1"] < page.width * 0.05 or obj["x0"] > page.width * 0.95)
         )
 
+    # Validate before line clustering: a shifted heading can otherwise merge
+    # into body text or overlap the preceding paragraph.
+    page.objects["char"] = [_validated_char(c, page.height) for c in page.chars]
     filtered = page.filter(keep_glyph)
     lines = []
     for raw in filtered.extract_text_lines(x_tolerance=2, y_tolerance=3):

@@ -12,7 +12,7 @@ from dataclasses import asdict
 from fastapi import HTTPException, Query, Request, Response
 
 from jieyi.domain.models import new_id
-from jieyi.ingestion.pdf import extract_pdf, render_pdf_page
+from jieyi.ingestion.pdf import GEOMETRY_VERSION, extract_pdf, render_pdf_page
 from jieyi.ingestion.pdf_export import compose_pdf, ensure_pdf_layout
 from jieyi.workflow.services import create_pdf_document
 
@@ -173,7 +173,9 @@ def install_pdf_routes(app, store):
         if not 1 <= page_number <= len(metadata["pages"]):
             raise HTTPException(404, "PDF 页码超出范围")
         segments = store.list_segments(document_id) if mode == "translated" else []
-        revision = hashlib.sha256(repr(segments).encode()).hexdigest() if segments else "original"
+        deleted = store.list_deleted_source_segments(document_id) if mode == "translated" else []
+        revision = (hashlib.sha256(repr((segments, deleted, GEOMETRY_VERSION)).encode()).hexdigest()
+                    if mode == "translated" else "original")
         key = (document_id, page_number, width, mode, revision)
         if key in images:
             images.move_to_end(key)
@@ -185,7 +187,7 @@ def install_pdf_routes(app, store):
             number = page_number
             if mode == "translated":
                 layout = ensure_pdf_layout(store, document_id)
-                source, report = compose_pdf(source, layout, segments, only_page=page_number)
+                source, report = compose_pdf(source, layout, segments, only_page=page_number, deleted_segments=deleted)
                 number = 1
             return render_pdf_page(source, number, width), report
 

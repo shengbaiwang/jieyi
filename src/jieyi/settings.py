@@ -46,6 +46,7 @@ class ProviderProfile:
     protocol: str = "chat_completions"
     auth_required: bool = True
     capabilities: tuple[str, ...] = ()
+    selected_models: tuple[str, ...] | None = None
 
     @property
     def registry_name(self) -> str:
@@ -238,6 +239,11 @@ class LocalSettingsStore:
                 base_url=str(item.get("base_url", "")),
                 chat_path=str(item.get("chat_path", "chat/completions")),
                 models_path=str(item.get("models_path", "models")),
+                selected_models=(
+                    tuple(dict.fromkeys(value.strip() for value in item["selected_models"]
+                                        if isinstance(value, str) and value.strip()))
+                    if isinstance(item.get("selected_models"), list) else None
+                ),
                 protocol=str(item.get("protocol", "chat_completions")),
                 auth_required=bool(item.get("auth_required", True)),
                 capabilities=_current_capabilities(
@@ -312,6 +318,7 @@ def profile_from_preset(
     protocol: str = "",
     auth_required: bool | None = None,
     capabilities: tuple[str, ...] | None = None,
+    selected_models: tuple[str, ...] | None = None,
 ) -> ProviderProfile:
     preset = get_provider_preset(provider_type)
     return ProviderProfile(
@@ -324,6 +331,9 @@ def profile_from_preset(
         protocol=protocol.strip() or getattr(preset, "protocol", "chat_completions"),
         auth_required=preset.auth_required if auth_required is None else auth_required,
         capabilities=preset.capabilities if capabilities is None else capabilities,
+        selected_models=(tuple(dict.fromkeys(model.strip() for model in selected_models
+                                            if model.strip()))
+                         if selected_models is not None else None),
     )
 
 
@@ -456,7 +466,10 @@ def test_openai_compatible_connection(
         raise RuntimeError(f"无法连接模型服务：{exc}") from exc
 
     model_items = payload.get("data") if isinstance(payload, dict) else None
-    model_ids = [str(item.get("id")) for item in model_items or [] if isinstance(item, dict)]
+    model_ids = list(dict.fromkeys(
+        item["id"].strip() for item in model_items or []
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+    ))
     required = list(dict.fromkeys(model.strip() for model in required_models if model.strip()))
     missing = [model for model in required if model_ids and model not in model_ids]
     if missing:
@@ -466,7 +479,7 @@ def test_openai_compatible_connection(
         )
     return {
         "ok": True,
-        "models": model_ids[:100],
+        "models": model_ids,
         "models_url": models_url,
         "stages": [
             {"id": "url", "ok": True, "message": "地址格式正确"},

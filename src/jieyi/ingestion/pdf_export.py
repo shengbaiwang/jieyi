@@ -18,7 +18,12 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen.canvas import Canvas
 
-from jieyi.ingestion.pdf import _RENDER_LOCK, extract_pdf
+from jieyi.ingestion.pdf import (
+    _RENDER_LOCK,
+    GEOMETRY_VERSION,
+    extract_pdf,
+    repair_layout_geometry,
+)
 
 _EXPORT_LOCK = RLock()
 _SUPERSCRIPT_DIGITS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
@@ -300,16 +305,27 @@ def ensure_pdf_layout(store, document_id):
         if not metadata.get("layout"):
             book = extract_pdf(store.get_original_pdf(document_id))
             metadata["layout"] = book.layout
+            metadata["geometry_version"] = GEOMETRY_VERSION
+            store.update_pdf_metadata(document_id, metadata)
+        if metadata.get("geometry_version") != GEOMETRY_VERSION:
+            metadata["layout"] = repair_layout_geometry(
+                store.get_original_pdf(document_id), metadata["layout"]
+            )
+            metadata["geometry_version"] = GEOMETRY_VERSION
             store.update_pdf_metadata(document_id, metadata)
         return metadata
 
 
-def compose_pdf(source: bytes, metadata: dict, segments, *, bilingual=False, only_page=None):
+def compose_pdf(source: bytes, metadata: dict, segments, *, bilingual=False, only_page=None, deleted_segments=()):
     """Return (PDF bytes, layout report). No images/paths/forms are ever deleted or masked."""
     with _EXPORT_LOCK, _RENDER_LOCK:
         font = _font()
         original = PdfReader(io.BytesIO(source))
-        segments = list(segments)
+        deleted_segments = list(deleted_segments)
+        deleted_ids = {segment.id for segment in deleted_segments}
+        segments = list(segments) + deleted_segments
+        if metadata.get("geometry_version") != GEOMETRY_VERSION:
+            metadata = {**metadata, "layout": repair_layout_geometry(source, metadata["layout"])}
         layouts = defaultdict(list)
         by_page = defaultdict(list)
         page_local_regions = defaultdict(list)
@@ -346,8 +362,8 @@ def compose_pdf(source: bytes, metadata: dict, segments, *, bilingual=False, onl
             )
             if match:
                 consumed.add(match[0])
-            target = _translation(segment)
-            if not target or (only_page and only_page not in refs):
+            target = "" if segment.id in deleted_ids else _translation(segment)
+            if (not target and segment.id not in deleted_ids) or (only_page and only_page not in refs):
                 continue
             if not match:
                 unmatched.append((segment, target, refs))
@@ -572,6 +588,7 @@ def compose_pdf(source: bytes, metadata: dict, segments, *, bilingual=False, onl
                     group_segments.sort(key=lambda item: item.ordinal)
                     target = "\n".join(
                         _translation(segment) or segment.source_text for segment in group_segments
+                        if segment.id not in deleted_ids
                     )
                     rect = [
                         min(r["rect"][0] for r in group_regions),
@@ -615,7 +632,17 @@ def compose_pdf(source: bytes, metadata: dict, segments, *, bilingual=False, onl
                     )
                     reflowed_pages.add(number)
 
-                for number in overlays:
+                for number, draws in overlays.items():
+                    for _, region, _, _ in draws:
+                        native = _native_region(region, pages[number])
+                        rect = native.get("draw_rect", native["rect"])
+                        if any(obj.type == raw.FPDF_PAGEOBJ_TEXT
+                               and geometry[number].get(_object_key(obj))
+                               and _overlaps(_bounds(obj, geometry[number]), rect)
+                               for obj in objects[number]):
+                            raise ValueError(
+                                f"PDF 第 {number} 页译文区域仍有原文对象，已停止输出以避免叠字。"
+                            )
                     pages[number].gen_content()
                 edited_stream = io.BytesIO()
                 if overlays:
@@ -707,4 +734,5 @@ def export_translated_pdf(store, document_id, *, bilingual=False):
         metadata,
         store.list_segments(document_id),
         bilingual=bilingual,
+        deleted_segments=store.list_deleted_source_segments(document_id),
     )[0]

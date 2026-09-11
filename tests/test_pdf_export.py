@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from PIL import Image, ImageChops
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
@@ -267,3 +268,86 @@ def test_cross_page_preview_matches_export_without_spurious_continuation():
         )
         assert render_pdf_page(preview, 1, 400) == render_pdf_page(full, number, 400)
     assert target == "".join(p.extract_text() for p in full_reader.pages).replace("\n", "")
+
+
+def test_broken_embedded_font_descent_repairs_legacy_layout_without_ghosts():
+    """A font's -2.464 em descent used to leave g/p/y and whole source lines."""
+    import pdfplumber
+
+    from jieyi.ingestion.pdf_export import _font
+
+    stream = io.BytesIO()
+    canvas = Canvas(stream, pagesize=(400, 600))
+    canvas.setFont(_font(), 12)
+    canvas.drawString(35, 530, "Poetry gives people joy and meaning.")
+    canvas.drawString(35, 512, "Typography keeps every glyph in place.")
+    canvas.drawString(35, 470, "Another paragraph stays in its own region.")
+    canvas.save()
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(stream.getvalue())))
+    from pypdf.generic import NumberObject
+    for font in writer.pages[0]["/Resources"]["/Font"].values():
+        descriptor = font.get_object().get("/FontDescriptor")
+        if descriptor:
+            descriptor.get_object()[NameObject("/Descent")] = NumberObject(-2464)
+    broken = io.BytesIO()
+    writer.write(broken)
+    source = broken.getvalue()
+    book = extract_pdf(source)
+    metadata = {"layout": book.layout}
+    segments = segments_from_blocks("test", list(book.blocks))
+    segments = [replace(s, machine_translation="排版应当完整清除原文，不应留下残余字符。")
+                for s in segments]
+    # Reconstruct the old coordinates from the unvalidated parser; keep segment IDs.
+    from copy import deepcopy
+    legacy = deepcopy(metadata)
+    with pdfplumber.open(io.BytesIO(source)) as pdf:
+        chars = [c for c in pdf.pages[0].chars if not c['text'].isspace()]
+        for item in legacy['layout']:
+            for region in item['regions']:
+                lines = []
+                for line in region['lines']:
+                    members = [c for c in chars if line[1] <= c['matrix'][5] <= line[3]]
+                    lines.append([min(c['x0'] for c in members), min(c['y0'] for c in members),
+                                  max(c['x1'] for c in members), max(c['y1'] for c in members)])
+                region['lines'] = lines
+                region['rect'] = [min(b[0] for b in lines), min(b[1] for b in lines),
+                                  max(b[2] for b in lines), max(b[3] for b in lines)]
+    result, report = compose_pdf(source, legacy, segments)
+    text = PdfReader(io.BytesIO(result)).pages[0].extract_text()
+    assert not any(c.isascii() and c.isalpha() for c in text), text
+    assert report['replaced_blocks'] == len(segments)
+    assert render_pdf_page(result, 1, 400)
+    fresh, _ = compose_pdf(source, metadata, segments)
+    assert render_pdf_page(result, 1, 400) == render_pdf_page(fresh, 1, 400)
+
+
+def test_legacy_geometry_migration_is_versioned_and_preserves_semantic_records(monkeypatch):
+    from copy import deepcopy
+
+    from jieyi.ingestion import pdf_export
+    from jieyi.ingestion.pdf import GEOMETRY_VERSION
+
+    source, metadata, _ = fixture()
+
+    class Store:
+        writes = 0
+
+        def get_pdf_metadata(self, _):
+            return deepcopy(metadata)
+
+        def get_original_pdf(self, _):
+            return source
+
+        def update_pdf_metadata(self, _, value):
+            metadata.update(value)
+            self.writes += 1
+
+    store = Store()
+    before = deepcopy(metadata['layout'])
+    first = pdf_export.ensure_pdf_layout(store, 'test')
+    assert first['geometry_version'] == GEOMETRY_VERSION
+    assert first['layout'] == before  # Healthy font metrics stay exact.
+    monkeypatch.setattr(pdf_export, 'repair_layout_geometry',
+                        lambda *_: (_ for _ in ()).throw(AssertionError('Repeated migration')))
+    assert pdf_export.ensure_pdf_layout(store, 'test') == first
+    assert store.writes == 1

@@ -177,6 +177,7 @@ class ProviderProfileUpdate(BaseModel):
     protocol: str = "chat_completions"
     auth_required: bool | None = None
     capabilities: list[str] | None = None
+    selected_models: list[str] | None = None
     api_key: str = ""
 
 
@@ -667,11 +668,14 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                     target={"format": "pdf", "page": entry["page"]},
                 ))
 
+        if store.has_manual_outline(document_id):
+            chapters = []
+
         manual_headings = [
             item
             for item in segments
             if item.kind.value == "heading"
-            and item.segmentation_reason in {"manual_split", "manual_heading"}
+            and item.segmentation_reason in {"manual_split", "manual_heading", "manual_merge"}
         ]
         if chapters and manual_headings:
             # Preserve source entries even when several bookmarks share a boundary.
@@ -919,6 +923,32 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         refresh_segment_quality(store, result["segment"]["id"])
         return result
 
+    @app.get("/documents/{document_id}/deleted-segments")
+    async def get_deleted_segments(document_id: str):
+        store.get_document(document_id)
+        return [{"id": item["segment"]["id"], "documentId": document_id,
+                 "ordinal": item["segment"]["ordinal"]}
+                for item in store.list_deleted_segments(document_id)]
+
+    @app.delete("/segments/{segment_id}")
+    async def delete_segment(segment_id: str):
+        try:
+            result = store.delete_segment(segment_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        result["segment"] = asdict(result["segment"]) if result["segment"] else None
+        return result
+
+    @app.post("/segments/{segment_id}/restore")
+    async def restore_segment(segment_id: str):
+        try:
+            result = store.restore_segment(segment_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        result["segment"] = asdict(result["segment"])
+        refresh_segment_quality(store, segment_id)
+        return result
+
     @app.patch("/segments/{segment_id}/confirm")
     async def confirm_segment(segment_id: str, body: ConfirmSegment):
         store.confirm_segment(segment_id, **body.model_dump())
@@ -1057,6 +1087,11 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
                         auth_required=item.auth_required,
                         capabilities=(
                             tuple(item.capabilities) if item.capabilities is not None else None
+                        ),
+                        selected_models=(
+                            tuple(item.selected_models) if item.selected_models is not None
+                            else current.profile(item.id).selected_models
+                            if current.profile(item.id) else None
                         ),
                     )
                     for item in body.profiles
