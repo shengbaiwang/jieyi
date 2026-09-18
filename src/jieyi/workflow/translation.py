@@ -23,6 +23,7 @@ from jieyi.quality.checks import (
     DETECTOR_VERSION,
     run_deterministic_checks,
 )
+from jieyi.quality.output import OUTPUT_RETRY_RULE, TranslationOutputError, output_problems
 from jieyi.workflow.provider_responses import (
     EmptyProviderResponseError,
     content_filter_audit_payload,
@@ -154,6 +155,20 @@ class TranslationEngine:
                         stage=CandidateStage.DRAFT,
                         model_spec=draft_spec,
                     )
+                except TranslationOutputError as exc:
+                    from jieyi.workflow.optimized import _record_deferred_segment
+
+                    _record_deferred_segment(
+                        self, job, segment, stage=CandidateStage.DRAFT,
+                        model_spec=draft_spec, error=exc, terms=terms,
+                    )
+                    current = self.store.get_job(job.id)
+                    job = self.store.save_job(replace(
+                        current, next_ordinal=segment.ordinal + 1,
+                        total_cost_usd=current.total_cost_usd + sum(r.cost_usd for r in exc.results),
+                    ))
+                    processed += 1
+                    continue
                 except _RunStopped as stopped:
                     current = self.store.get_job(job_id)
                     return self.store.save_job(replace(
@@ -294,6 +309,8 @@ class TranslationEngine:
                 request, job.recipe.draft_compute_mode, job.recipe.max_output_tokens,
             ) if optimized else None,
             "relevant_terms": [asdict(term) for term in terms],
+            "minimal_prompt": bool(getattr(request, "minimal_prompt", False)),
+            "cohesion_enabled": bool(getattr(job.recipe, "cohesion_enabled", False)),
         }
 
     def _raise_empty_result(
@@ -318,6 +335,26 @@ class TranslationEngine:
         payload["job_id"] = job.id
         self.store.record_provider_failure(segment.id, payload)
         raise error
+
+    async def _translate_clean(self, provider, request, model_spec, job):
+        from jieyi.workflow.optimized import _sum_results
+
+        results = []
+        for attempt in range(3):
+            if self.store.get_job(job.id).status is not JobStatus.RUNNING:
+                raise _RunStopped(sum(item.cost_usd for item in results))
+            result = await provider.translate(request, model_spec)
+            results.append(result)
+            problems = output_problems(request.segment.source_text, result.text)
+            if not problems:
+                return _sum_results(results, result.text)
+            self.store.record_candidate(
+                job_id=job.id, segment_id=request.segment.id, stage=request.task,
+                provider=model_spec.provider, model=model_spec.model, result=result,
+            )
+            if attempt == 0:
+                request = replace(request, context=request.context + "\n\n" + OUTPUT_RETRY_RULE)
+        raise TranslationOutputError(problems, results)
 
     async def _translate_protected(
         self,
@@ -353,7 +390,7 @@ class TranslationEngine:
             existing_translation=masked_existing,
             issue_summary=issue_summary,
         )
-        result = await provider.translate(request, model_spec)
+        result = await self._translate_clean(provider, request, model_spec, job)
         if not result.text.strip():
             self._raise_empty_result(
                 job=job,
@@ -429,7 +466,7 @@ class TranslationEngine:
                 )
                 if self.store.get_job(job.id).status is not JobStatus.RUNNING:
                     raise _RunStopped(result.cost_usd + repair_cost)
-                repaired = await provider.translate(repair_request, model_spec)
+                repaired = await self._translate_clean(provider, repair_request, model_spec, job)
                 repair_cost += repaired.cost_usd
                 if not repaired.text.strip():
                     repair_error = EmptyProviderResponseError(

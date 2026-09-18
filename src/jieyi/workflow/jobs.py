@@ -29,6 +29,11 @@ class JobManager:
                 raise DocumentBusyError("已停止派发新请求，正在保存已发请求的结果，请稍后继续。")
             return self.store.job_progress(job_id)
 
+        # 续跑旧任务时自动放宽到新预算窗口（用户截图的 2M 中断场景）。
+        refresh = getattr(self.store, "refresh_job_token_budget", None)
+        if callable(refresh):
+            refresh(job_id)
+
         reservation = self.engine.reserve(job_id)
         try:
             self.store.set_job_status(job_id, JobStatus.RUNNING)

@@ -17,11 +17,18 @@ from jieyi.domain.models import (
     TranslationRequest,
     TranslationResult,
 )
-from jieyi.prompting import build_messages
-from jieyi.protection import PlaceholderIntegrityError
+from jieyi.prompting import build_messages, is_minimal_prompt_request
+from jieyi.protection import PlaceholderIntegrityError, ProtectedText
+from jieyi.providers.openai_compatible import ReasoningMandatoryError
 from jieyi.quality.checks import (
     DETECTOR_VERSION,
     run_deterministic_checks,
+)
+from jieyi.quality.output import OUTPUT_RETRY_RULE, TranslationOutputError, output_problems
+from jieyi.workflow.cohesion import (
+    build_cohesion_messages,
+    parse_cohesion_revisions,
+    plan_cohesion_groups,
 )
 from jieyi.workflow.provider_responses import (
     EmptyProviderResponseError,
@@ -150,6 +157,9 @@ async def _complete_one(
     attempts = []
     budget = min(max_tokens, max_output_tokens)
     messages = build_messages(request)
+    # Minimal-tier requests drop project/neighbor context that was empty
+    # anyway; still count it explicitly so audits stay comparable.
+    minimal_tier = is_minimal_prompt_request(request)
     for attempt_number in range(1, 4):
         if can_dispatch is not None and not can_dispatch():
             raise _SegmentChanged(results)
@@ -164,6 +174,7 @@ async def _complete_one(
         )
         results.append(result)
         text = _strip_fence(result.text)
+        problems = output_problems(request.segment.source_text, text)
         stop_reason = response_stop_reason(result)
         attempt = inspect_empty_result(
             result,
@@ -190,13 +201,21 @@ async def _complete_one(
                 "prompt_chars": sum(len(message["content"]) for message in messages),
                 "output_chars": len(text),
                 "finish_reason": stop_reason,
+                "minimal_prompt": minimal_tier,
                 "outcome": (
+                    "output_contamination" if problems else
                     "complete" if text and not is_incomplete_result(result)
                     and attempt.kind != "content_filtered" else attempt.kind
                 ),
                 "elapsed_seconds": round(time.monotonic() - started, 3),
             })
         if text and not is_incomplete_result(result) and attempt.kind != "content_filtered":
+            if problems:
+                if attempt_number == 3:
+                    raise TranslationOutputError(problems, results)
+                messages = build_messages(request)
+                messages[0]["content"] += "\n\n" + OUTPUT_RETRY_RULE
+                continue
             return _sum_results(results, text)
         attempts.append(attempt)
         if (
@@ -252,17 +271,31 @@ async def _translate_group(engine, job, project, document, segments, **options):
             engine.store.save_job(replace(current, total_cost_usd=current.total_cost_usd + usage.cost_usd))
         raise
     translations, stages, terms, failures, usages = {}, {}, {}, {}, []
+    cohesion_committed: list[Segment] = []
     for segment, outcome in zip(segments, outcomes, strict=True):
         if isinstance(outcome, BaseException):
             failures[segment.id] = outcome
             terms[segment.id] = []
             continue
-        _, _, text, candidate_stages, usage, _, segment_terms, segment_failures = outcome
+        _, _, text, candidate_stages, usage, _, segment_terms, segment_failures, committed = outcome
         translations.update(text)
         stages.update(candidate_stages)
         terms.update(segment_terms)
         failures.update(segment_failures)
         usages.append(usage)
+        cohesion_committed.extend(committed)
+    if cohesion_committed:
+        try:
+            cohesion_result = await _run_cohesion_for_group(
+                engine, job, project, document, cohesion_committed,
+                shared_context=options.get("project_context", ""),
+                approved_terms=options.get("approved_terms", []),
+                limiter=options["limiter"],
+            )
+            if cohesion_result is not None:
+                usages.append(cohesion_result)
+        except _SegmentChanged as stopped:
+            usages.extend(stopped.results)
     return (CandidateStage.DRAFT, job.recipe.draft, translations, stages,
             _sum_results(usages, ""), time.monotonic() - started, terms, failures)
 
@@ -343,6 +376,8 @@ async def _translate_segment(
             failures[request.segment.id] = outcome
             if isinstance(outcome, EmptyProviderResponseError):
                 usage_results.append(outcome.usage_result())
+            elif isinstance(outcome, TranslationOutputError):
+                usage_results.extend(outcome.results)
             continue
         segment_id, result = outcome
         translations[segment_id] = result.text
@@ -456,6 +491,10 @@ async def _translate_segment(
                 except _SegmentChanged as stopped:
                     usage_results.extend(stopped.results)
                     break
+                except TranslationOutputError as exc:
+                    usage_results.extend(exc.results)
+                    failures[segment.id] = exc
+                    break
                 except EmptyProviderResponseError as exc:
                     usage_results.append(exc.usage_result())
                     repair_error = exc
@@ -491,6 +530,17 @@ async def _translate_segment(
             restored.pop(segment.id)
     usage = _sum_results(usage_results, "")
     elapsed = time.monotonic() - started
+    # Fresh translations committed by this batch: the only input eligible for
+    # the group cohesion pass. Deferred/failed segments are never polished.
+    # The cohesion pass runs inside the same dispatch group so batch counts,
+    # checkpoints, and max_batches semantics stay unchanged.
+    cohesion_committed: list[Segment] = []
+    if getattr(job.recipe, "cohesion_enabled", False):
+        cohesion_committed = [
+            segment for segment in segments
+            if segment.id in restored
+            and engine.store.get_segment(segment.id).source_text == segment.source_text
+        ]
     return (
         stage,
         model_spec,
@@ -500,14 +550,17 @@ async def _translate_segment(
         elapsed,
         terms_by_id,
         failures,
+        cohesion_committed,
     )
 
 
 def _can_defer_segment_failure(error: BaseException) -> bool:
     """Quarantine exhausted segment responses; transport/configuration errors still stop."""
+    if isinstance(error, ReasoningMandatoryError):
+        return False
     if is_content_filtered_error(error):
         return True
-    if isinstance(error, PlaceholderIntegrityError):
+    if isinstance(error, (PlaceholderIntegrityError, TranslationOutputError)):
         return True
     # Empty responses have already exhausted their bounded retries in _complete_one.
     # Preserve their diagnostics and continue, just as for other unusable responses.
@@ -558,7 +611,9 @@ def _record_deferred_segment(
         if visible
         else []
     )
-    if isinstance(error, PlaceholderIntegrityError):
+    if isinstance(error, TranslationOutputError):
+        failure_message = "模型反复混入原文或解释，本段已隔离且未保存。可重试草译或更换模型。"
+    elif isinstance(error, PlaceholderIntegrityError):
         reason = "EPUB 文本片段对齐失败" if "SourceAtom" in str(error) else "译文格式标记校验失败"
         failure_message = f"{reason}，自动修复 {_PLACEHOLDER_REPAIR_ATTEMPTS} 次仍未通过。本段尚未保存，可重试草译或更换模型。"
     elif is_content_filtered_error(error):
@@ -593,6 +648,250 @@ def _record_deferred_segment(
         target_text=visible,
         detector_version=DETECTOR_VERSION,
     )
+
+
+async def _run_cohesion_for_group(
+    engine,
+    job: Job,
+    project,
+    document,
+    committed: list[Segment],
+    *,
+    shared_context: str,
+    approved_terms: list[TermEntry],
+    limiter: _AdaptiveConcurrencyLimiter,
+) -> TranslationResult | None:
+    """Plan cohesion groups from fresh drafts and run one pass per group.
+
+    Usage is returned to the caller so the cohesion pass stays inside the same
+    dispatch-group batch record: batch counts, checkpoints, and max_batches
+    semantics are unchanged. Cost still lands in job totals via that batch.
+    """
+    if not getattr(job.recipe, "cohesion_enabled", False):
+        return None
+    if engine.store.get_job(job.id).status is not JobStatus.RUNNING:
+        return None
+    fresh = [
+        engine.store.get_segment(segment.id)
+        for segment in sorted(committed, key=lambda item: item.ordinal)
+    ]
+    fresh = [
+        segment for segment in fresh
+        if segment.status is not SegmentStatus.HUMAN_CONFIRMED
+        and not (segment.accepted_translation or segment.edited_translation)
+        and _visible_translation(segment)
+    ]
+    if len(fresh) < max(2, int(getattr(job.recipe, "cohesion_min_segments", 2) or 2)):
+        return None
+    collected: list[TranslationResult] = []
+    for cohesion_group in plan_cohesion_groups(
+        fresh,
+        min_segments=int(getattr(job.recipe, "cohesion_min_segments", 2) or 2),
+        max_segments=int(getattr(job.recipe, "cohesion_max_segments", 8) or 8),
+        max_group_chars=int(getattr(job.recipe, "cohesion_max_group_chars", 6_000) or 6_000),
+    ):
+        if engine.store.get_job(job.id).status is not JobStatus.RUNNING:
+            break
+        try:
+            usage, _applied, _skipped = await _run_cohesion_group(
+                engine, job, project, document, list(cohesion_group.segments),
+                shared_context=shared_context,
+                approved_terms=approved_terms,
+                limiter=limiter,
+            )
+        except _SegmentChanged as stopped:
+            collected.extend(stopped.results)
+            break
+        except (EmptyProviderResponseError, TranslationOutputError) as exc:
+            collected.extend(list(exc.results) if hasattr(exc, "results") else [])
+            continue
+        except (PlaceholderIntegrityError, RuntimeError, ValueError) as exc:
+            engine.store.record_provider_failure(
+                cohesion_group.segments[0].id,
+                {
+                    "kind": "cohesion_group_failure",
+                    "job_stage": CandidateStage.REVIEW.value,
+                    "provider": job.recipe.draft.provider,
+                    "model": job.recipe.draft.model,
+                    "segment_ordinal": cohesion_group.segments[0].ordinal,
+                    "cohesion_group": list(cohesion_group.ordinals),
+                    "message": str(exc)[:1_000],
+                    "job_id": job.id,
+                },
+            )
+            continue
+        collected.append(usage)
+    if not collected:
+        return None
+    return _sum_results(collected, "")
+
+
+async def _run_cohesion_group(
+    engine,
+    job: Job,
+    project,
+    document,
+    segments: list[Segment],
+    *,
+    shared_context: str,
+    approved_terms: list[TermEntry],
+    limiter: _AdaptiveConcurrencyLimiter,
+) -> tuple[TranslationResult, int, int]:
+    """Run one group cohesion pass; bad segments fall back to their drafts."""
+    provider = engine.providers.get(job.recipe.draft.provider)
+    ordered = sorted(segments, key=lambda item: item.ordinal)
+    expected_ids = {segment.id for segment in ordered}
+    ordered_ids = [segment.id for segment in ordered]
+    sources: dict[str, str] = {}
+    drafts: dict[str, str] = {}
+    protected_by_id: dict[str, ProtectedText] = {}
+    terms_by_id: dict[str, list[TermEntry]] = {}
+    structured_by_id: dict[str, bool] = {}
+    approved_ids = {term.id for term in approved_terms}
+    for segment in ordered:
+        current = engine.store.get_segment(segment.id)
+        visible = _visible_translation(current)
+        if not visible:
+            raise ValueError(f"Cohesion group lost its draft: {segment.id}")
+        structured_source = engine.store.epub_translation_source(segment.id)
+        protected = engine.protected_text_codec.encode(structured_source or current.source_text)
+        if structured_source:
+            protected = protected.compact_single_atom()
+        sources[segment.id] = current.source_text
+        drafts[segment.id] = visible
+        protected_by_id[segment.id] = protected
+        structured_by_id[segment.id] = bool(structured_source)
+        terms_by_id[segment.id] = [term for term in approved_terms if term.id in approved_ids]
+    messages = build_cohesion_messages(
+        context=shared_context, sources=sources, drafts=drafts, ordered_ids=ordered_ids,
+    )
+    prompt_chars = sum(len(item["content"]) for item in messages)
+    group_chars = sum(len(sources[item]) + len(drafts[item]) for item in ordered_ids)
+    budget = min(
+        max(512, job.recipe.cohesion_max_output_tokens),
+        max(512, group_chars * 2),
+        job.recipe.max_output_tokens,
+    )
+
+    async def operation() -> TranslationResult:
+        call_started = time.monotonic()
+        result = await provider.complete(
+            messages,
+            job.recipe.draft,
+            thinking=False,
+            reasoning_effort="none",
+            compute_mode="economy",
+            max_tokens=budget,
+        )
+        engine.store.record_model_call(job.id, {
+            "segment_id": ordered_ids[0],
+            "stage": CandidateStage.REVIEW.value,
+            "attempt": 1,
+            "provider": job.recipe.draft.provider,
+            "model": job.recipe.draft.model,
+            "compute_mode": "economy",
+            "max_tokens": budget,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+            "reasoning_tokens": result.reasoning_tokens,
+            "cache_hit_tokens": result.prompt_cache_hit_tokens,
+            "cache_miss_tokens": result.prompt_cache_miss_tokens,
+            "cost_usd": result.cost_usd,
+            "source_chars": group_chars,
+            "context_chars": len(shared_context),
+            "prompt_chars": prompt_chars,
+            "output_chars": len(result.text or ""),
+            "finish_reason": response_stop_reason(result),
+            "cohesion_group": [segment.ordinal for segment in ordered],
+            "outcome": "complete" if (result.text or "").strip() else "upstream_empty_response",
+            "elapsed_seconds": round(time.monotonic() - call_started, 3),
+        })
+        return result
+
+    result = await limiter.complete(operation)
+    usage_results = [result]
+    try:
+        revisions = parse_cohesion_revisions(result.text or "", expected_ids)
+    except (ValueError, TypeError):
+        engine.store.record_model_call(job.id, {
+            "segment_id": ordered_ids[0],
+            "stage": CandidateStage.REVIEW.value,
+            "attempt": 1,
+            "provider": job.recipe.draft.provider,
+            "model": job.recipe.draft.model,
+            "compute_mode": "economy",
+            "max_tokens": budget,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "cache_hit_tokens": 0,
+            "cache_miss_tokens": 0,
+            "cost_usd": 0.0,
+            "source_chars": group_chars,
+            "context_chars": len(shared_context),
+            "prompt_chars": prompt_chars,
+            "output_chars": len(result.text or ""),
+            "finish_reason": "",
+            "cohesion_group": [segment.ordinal for segment in ordered],
+            "outcome": "cohesion_invalid_json",
+            "elapsed_seconds": 0.0,
+        })
+        return _sum_results(usage_results, ""), 0, len(ordered)
+    applied = 0
+    skipped = 0
+    for segment in ordered:
+        revised = revisions[segment.id]
+        protected = protected_by_id[segment.id]
+        current = engine.store.get_segment(segment.id)
+        # Human work or source edits during the pass win; keep the draft.
+        if (
+            current.source_text != segment.source_text
+            or current.status is SegmentStatus.HUMAN_CONFIRMED
+            or (current.accepted_translation or current.edited_translation)
+        ):
+            skipped += 1
+            continue
+        try:
+            restored_value = protected.restore(revised)
+        except (PlaceholderIntegrityError, ValueError):
+            skipped += 1
+            continue
+        if revised.strip() == drafts[segment.id].strip():
+            applied += 0
+            skipped += 1
+            continue
+        structured_value: str | None = None
+        if structured_by_id[segment.id]:
+            try:
+                structured_value = engine.store.capture_epub_translation(
+                    segment.id, restored_value, CandidateStage.REVIEW.value, persist=False,
+                )
+            except ValueError:
+                skipped += 1
+                continue
+        issues = run_deterministic_checks(
+            current.source_text, restored_value, terms_by_id[segment.id],
+            segment_kind=current.kind,
+        )
+        if any(issue.code == "approved_term_missing" for issue in issues):
+            skipped += 1
+            continue
+        engine.store.record_candidate(
+            job_id=job.id, segment_id=segment.id, stage=CandidateStage.REVIEW,
+            provider=job.recipe.draft.provider, model=job.recipe.draft.model,
+            result=TranslationResult(text=restored_value),
+        )
+        engine.store.set_reviewed_translation(segment.id, restored_value)
+        if structured_value is not None:
+            engine.store.capture_epub_translation(
+                segment.id, restored_value, CandidateStage.REVIEW.value,
+            )
+        engine.store.replace_issues(
+            job.id, segment.id, issues, target_text=restored_value,
+            detector_version=DETECTOR_VERSION,
+        )
+        applied += 1
+    return _sum_results(usage_results, ""), applied, skipped
 
 
 async def run_optimized(engine, job_id: str, *, max_batches: int | None = None) -> Job:

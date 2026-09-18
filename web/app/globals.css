@@ -452,6 +452,19 @@ nav { display: grid; gap: 3px; }
 .issue-list strong { font-size: 10.5px; font-weight: 650; }
 .issue-list div span { color: var(--muted); font-size: 9.5px; }
 .issue-list > button > .symbol { color: var(--muted); font-size: 18px; }
+.issue-list button.selected { background: rgba(10,118,246,.07); box-shadow: inset 2px 0 0 var(--blue); }
+.review-issues { display: grid; gap: 6px; padding: 12px 18px 0; }
+.review-source { margin: 0; font: 16px/1.9 "Songti SC", "Noto Serif SC", Georgia, serif; letter-spacing: .01em; }
+.review-terms { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; }
+.review-terms span { border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px; color: var(--muted); background: var(--panel); font-size: 9.5px; }
+.review-queue { border-top: 1px solid var(--line); padding: 6px 18px 10px; }
+.review-queue.collapsed { padding-bottom: 6px; }
+.review-queue-toggle { width: 100%; display: flex; align-items: center; justify-content: space-between; border: 0; padding: 8px 2px; color: var(--muted); background: transparent; font-size: 10.5px; font-weight: 650; }
+.review-queue-toggle:hover { color: var(--text); }
+.review-queue-toggle .symbol { font-size: 14px; }
+.review-queue .issue-list { max-height: 260px; overflow: auto; }
+.review-queue.collapsed .issue-list { display: none; }
+.segment-draft-button kbd { color: var(--muted); font-size: 9px; }
 
 .command-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: start center; padding-top: max(12vh, 90px); background: rgba(20,23,29,.24); backdrop-filter: blur(5px); animation: fade-in .14s ease-out; }
 .command-palette { width: min(520px, calc(100vw - 32px)); overflow: hidden; border: 1px solid rgba(40,45,53,.25); border-radius: 13px; background: rgba(248,248,249,.94); box-shadow: 0 28px 80px rgba(20,24,31,.3), 0 3px 12px rgba(20,24,31,.15); backdrop-filter: blur(28px) saturate(1.4); animation: palette-in .17s ease-out; }

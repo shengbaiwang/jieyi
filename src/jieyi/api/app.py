@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from jieyi.api.pdf_routes import install_pdf_routes
 from jieyi.api.term_routes import install_term_routes
 from jieyi.domain.models import (
+    DEFAULT_TOKEN_BUDGET,
     JobStatus,
     ModelSpec,
     TermEnforcement,
@@ -131,8 +132,15 @@ class JobCreate(BaseModel):
     draft_compute_mode: str | None = None
     draft_reasoning_effort: str | None = None
     max_output_tokens: int = Field(default=6_000, ge=256, le=32_000)
-    token_budget: int = Field(default=2_000_000, ge=1)
+    token_budget: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=1)
     segment_ranges: list[tuple[int, int]] = Field(default_factory=list)
+    minimal_prompt_enabled: bool = True
+    minimal_prompt_max_chars: int = Field(default=120, ge=0, le=2_000)
+    cohesion_enabled: bool = False
+    cohesion_min_segments: int = Field(default=2, ge=2, le=20)
+    cohesion_max_segments: int = Field(default=8, ge=2, le=20)
+    cohesion_max_group_chars: int = Field(default=6_000, ge=500, le=60_000)
+    cohesion_max_output_tokens: int = Field(default=6_000, ge=256, le=32_000)
 
 
 class ConfirmSegment(BaseModel):
@@ -960,6 +968,13 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
         store.save_segment_draft(segment_id, body.translation)
         refresh_segment_quality(store, segment_id)
         return asdict(store.get_segment(segment_id))
+
+    @app.post("/segments/{segment_id}/redraft")
+    async def redraft_segment(segment_id: str):
+        store.get_segment(segment_id)
+        cleared = store.clear_segment_translation(segment_id)
+        refresh_segment_quality(store, segment_id)
+        return asdict(store.get_segment(cleared.id))
 
     @app.get("/segments/{segment_id}/candidates")
     async def get_segment_candidates(segment_id: str):

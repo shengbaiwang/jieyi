@@ -609,6 +609,13 @@ def _mode_mapping(
     }
 
 
+def _reasoning_mandatory_text(detail: str) -> bool:
+    """Share the provider's mandatory-reasoning detection with the model probe."""
+    from jieyi.providers.openai_compatible import _reasoning_mandatory
+
+    return _reasoning_mandatory(detail)
+
+
 def test_openai_compatible_model(
     chat_endpoint: str,
     api_key: str,
@@ -659,6 +666,17 @@ def test_openai_compatible_model(
     invalid_effort = run({"reasoning_effort": "__jieyi_invalid__"})
     effort_verified = not invalid_effort["accepted"]
     supported_efforts = accepted_efforts if effort_verified else []
+    rejected_details = " ".join(
+        result["detail"] for result in effort_results.values() if not result["accepted"]
+    )
+    if "none" not in accepted_efforts and _reasoning_mandatory_text(rejected_details):
+        # The endpoint refuses every reasoning-off request (e.g. "Reasoning is
+        # mandatory ... cannot be disabled"). Translate the rejection instead of
+        # reporting a misleading "short translation failed" note.
+        raise RuntimeError(
+            f"模型 {model_id} 要求保持思考开启，无法使用“节省”档；"
+            "请改用“均衡”或“性能”后再开始批量翻译。"
+        )
 
     accepted_thinking = [
         state for state in ("disabled", "enabled") if run({"thinking": {"type": state}})["accepted"]

@@ -204,6 +204,34 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(result["mode_mapping"]["performance"], "服务端默认")
         self.assertTrue(any("静默忽略" in note for note in result["notes"]))
 
+    def test_model_probe_reports_reasoning_mandatory_with_mode_guidance(self):
+        def respond(request, timeout):
+            del timeout
+            body = json.loads(request.data)
+            if body.get("reasoning_effort") in {"none", "minimal", "low"}:
+                detail = json.dumps(
+                    {"error": {"message": (
+                        "Reasoning is mandatory for this endpoint and cannot be disabled."
+                    )}}
+                ).encode("utf-8")
+                raise urllib.error.HTTPError(
+                    request.full_url, 400, "Bad Request", {}, io.BytesIO(detail)
+                )
+            return FakeResponse(
+                {"choices": [{"message": {"content": "书是打开的。"}}],
+                 "usage": {"total_tokens": 2}}
+            )
+
+        with (
+            patch("urllib.request.urlopen", side_effect=respond),
+            self.assertRaisesRegex(RuntimeError, "保持思考开启.*均衡"),
+        ):
+            check_openai_compatible_model(
+                "https://api.example.com/v1/chat/completions",
+                "secret",
+                "mandatory-reasoner",
+            )
+
     def test_keychain_authorization_failure_falls_back_to_session(self):
         secrets = LocalSecretStore()
         failed = Mock(returncode=1, stderr="Unable to obtain authorization", stdout="")

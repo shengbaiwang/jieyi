@@ -22,6 +22,16 @@ class ProviderError(RuntimeError):
     pass
 
 
+class ReasoningMandatoryError(ProviderError):
+    """An endpoint refuses to run without reasoning; surface it without retries."""
+
+    GUIDANCE = "该服务端要求保持思考开启，无法使用“节省”档；请改用“均衡”或“性能”。"
+
+    def __init__(self, message: str):
+        detail = message.replace("Provider request failed: ", "")
+        super().__init__(f"{detail} {self.GUIDANCE}")
+
+
 def _message_text(payload: object) -> str:
     """Normalize text-only and content-block chat completion responses."""
     try:
@@ -97,6 +107,34 @@ def _unsupported_reasoning_effort(detail: str) -> bool:
         )
     )
     return english_rejection or chinese_rejection
+
+
+def _reasoning_mandatory(detail: str) -> bool:
+    """Detect endpoints where reasoning must stay on.
+
+    Unlike unknown-parameter rejections, these 400s describe the endpoint's own
+    policy ("Reasoning is mandatory ... cannot be disabled"). Retrying with a
+    different effort level or dropping the field still resolves to the workflow's
+    reasoning-off intent, so every economy candidate fails identically.
+    """
+    normalized = " ".join(detail.lower().replace("-", "_").split())
+    if "reasoning" not in normalized and "thinking" not in normalized:
+        return False
+    markers = (
+        "mandatory",
+        "cannot be disabled",
+        "cannot disable",
+        "cannot_be_disabled",
+        "must be enabled",
+        "must stay enabled",
+        "must remain enabled",
+        "is required",
+        "is always enabled",
+        "always enabled",
+        "always_on",
+        "always on",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
@@ -286,7 +324,16 @@ class OpenAICompatibleProvider:
             if override_key in self._reasoning_effort_overrides:
                 effort_candidates = (self._reasoning_effort_overrides[override_key],)
         if effort_candidates is None:
-            effort_candidates = (reasoning_effort,)
+            if compute_mode is not None:
+                effort_candidates = (reasoning_effort,)
+            elif thinking is None and reasoning_effort is None:
+                # Endpoint-default retry path: no reasoning control at all. This
+                # is the recovery for "reasoning is mandatory" endpoints that
+                # infer an off intent from economy candidates.
+                effective_thinking = None
+                effort_candidates = (None,)
+            else:
+                effort_candidates = (reasoning_effort,)
         effective_effort = effort_candidates[0]
         payload: dict[str, object] = {"model": model.model, "messages": messages}
         if effective_thinking is not None and "thinking" in self.capabilities:
@@ -321,6 +368,8 @@ class OpenAICompatibleProvider:
                 break
             except urllib.error.HTTPError as exc:
                 detail = _http_error_detail(exc)
+                if exc.code == 400 and _reasoning_mandatory(detail):
+                    raise ReasoningMandatoryError(f"HTTP {exc.code}: {detail}") from exc
                 required_temperature = _required_temperature(detail)
                 if (
                     exc.code == 400

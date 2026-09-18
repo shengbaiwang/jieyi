@@ -5,9 +5,10 @@ import unicodedata
 from collections import Counter
 
 from jieyi.domain.models import IssueSeverity, QualityIssue, SegmentKind, TermEntry
+from jieyi.quality.output import output_problems
 from jieyi.terminology import resolve_terminology, term_appears
 
-DETECTOR_VERSION = "6"
+DETECTOR_VERSION = "7"
 
 _FOOTNOTE_REF = re.compile(r"\[\^[^]]+\]")
 
@@ -50,6 +51,11 @@ def run_deterministic_checks(
 
     if source.strip() and not target.strip():
         return [_issue("empty_translation", "译文为空。", IssueSeverity.ERROR)]
+
+    for code in output_problems(source, target):
+        issues.append(_issue(
+            code, "译文疑似混入原文复述、翻译标签或解释，请重新翻译本段。", IssueSeverity.ERROR,
+        ))
 
     source_footnotes = _counter(_FOOTNOTE_REF, source)
     target_footnotes = _counter(_FOOTNOTE_REF, target)

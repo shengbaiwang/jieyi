@@ -126,6 +126,49 @@ class TokenEfficiencyWorkflowTests(unittest.TestCase):
         self.assertEqual(progress['model_call_count'], 1)
         self.assertEqual(progress['repair_call_count'], 0)
 
+    def test_minimal_preview_matches_execution_and_audit(self):
+        document = create_document(
+            self.store, project_id=self.project.id, title='Minimal',
+            text='Hello world, this is a short plain sentence for translation.',
+            source_format='txt',
+        )
+        current = self.store.list_segments(document.id)[0]
+        provider = RecordingEcho()
+        engine, job = self.run_with(document, provider)
+        preview = engine.preview(job.id, current.id, optimized=True)
+        self.assertTrue(preview['minimal_prompt'])
+        self.assertFalse(preview['cohesion_enabled'])
+        self.assertIn(
+            'Translate to zh-CN (output translation only)',
+            preview['messages'][0]['content'],
+        )
+        self.assertEqual(preview['messages'][1]['content'], current.source_text)
+        completed = asyncio.run(engine.run_optimized(job.id))
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls[0][0], preview['messages'])
+        self.assertEqual(provider.calls[0][1]['max_tokens'], preview['max_output_tokens'])
+        progress = self.store.job_progress(job.id)
+        self.assertEqual(progress['model_call_count'], 1)
+        self.assertEqual(progress['minimal_prompt_call_count'], 1)
+        calls = [event['payload'] for event in self.store.list_audit_events('job', job.id)
+                 if event['action'] == 'model_call']
+        self.assertTrue(calls[0]['minimal_prompt'])
+        self.assertEqual(self.store.job_progress(job.id)['review_call_count'], 0)
+
+    def test_minimal_prompt_never_drops_neighbor_context(self):
+        document = create_document(
+            self.store, project_id=self.project.id, title='Neighbors',
+            text='First plain sentence here.\n\nSecond plain sentence here.',
+            source_format='txt',
+        )
+        current = self.store.list_segments(document.id)[0]
+        provider = RecordingEcho()
+        engine, job = self.run_with(document, provider)
+        preview = engine.preview(job.id, current.id, optimized=True)
+        self.assertFalse(preview['minimal_prompt'])
+        self.assertIn('REFERENCE CONTEXT', preview['messages'][1]['content'])
+
     def test_multi_atom_epub_preview_and_execution_keep_boundaries(self):
         document = create_epub_document(
             self.store, project_id=self.project.id, file_data=build_structural_epub(),

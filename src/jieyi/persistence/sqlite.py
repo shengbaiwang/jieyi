@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from jieyi.domain.models import (
+    DEFAULT_TOKEN_BUDGET,
     CandidateStage,
     Document,
     Job,
@@ -2150,17 +2151,27 @@ class SQLiteStore:
         with self._connect() as connection:
             connection.execute(
                 """UPDATE jobs SET status = ?, next_ordinal = ?, total_cost_usd = ?,
-                last_error = ?, updated_at = ? WHERE id = ?""",
+                last_error = ?, updated_at = ?, recipe_json = ? WHERE id = ?""",
                 (
                     updated.status.value,
                     updated.next_ordinal,
                     updated.total_cost_usd,
                     updated.last_error,
                     updated.updated_at,
+                    json.dumps(updated.recipe.to_dict(), ensure_ascii=False),
                     updated.id,
                 ),
             )
         return updated
+
+    def refresh_job_token_budget(self, job_id: str, default: int = DEFAULT_TOKEN_BUDGET) -> Job:
+        """存量任务仍是旧 2M 预算则直接放宽，避免整书被迫中断。"""
+        job = self.get_job(job_id)
+        if job.recipe.token_budget >= default:
+            return job
+        return self.save_job(
+            replace(job, recipe=replace(job.recipe, token_budget=default)),
+        )
 
     def set_job_status(self, job_id: str, status: JobStatus, last_error: str | None = None) -> Job:
         job = self.get_job(job_id)
@@ -2266,7 +2277,9 @@ class SQLiteStore:
             calls = connection.execute(
                 """SELECT COUNT(*) AS model_call_count,
                 COALESCE(SUM(json_extract(payload_json, '$.attempt') > 1), 0) AS retry_call_count,
-                COALESCE(SUM(json_extract(payload_json, '$.stage') = 'repair'), 0) AS repair_call_count
+                COALESCE(SUM(json_extract(payload_json, '$.stage') = 'repair'), 0) AS repair_call_count,
+                COALESCE(SUM(json_extract(payload_json, '$.stage') = 'review'), 0) AS review_call_count,
+                COALESCE(SUM(json_extract(payload_json, '$.minimal_prompt') IS TRUE), 0) AS minimal_prompt_call_count
                 FROM audit_events WHERE entity_type = 'job' AND entity_id = ?
                 AND action = 'model_call'""",
                 (job_id,),
@@ -2298,6 +2311,8 @@ class SQLiteStore:
             "model_call_count": int(calls["model_call_count"]),
             "retry_call_count": int(calls["retry_call_count"]),
             "repair_call_count": int(calls["repair_call_count"]),
+            "review_call_count": int(calls["review_call_count"] or 0),
+            "minimal_prompt_call_count": int(calls["minimal_prompt_call_count"] or 0),
             "prompt_tokens": int(values["prompt_tokens"] or 0),
             "completion_tokens": int(values["completion_tokens"] or 0),
             "reasoning_tokens": int(values["reasoning_tokens"] or 0),
@@ -2461,6 +2476,27 @@ class SQLiteStore:
                 "draft_saved",
                 {"characters": len(translation)},
             )
+
+    def clear_segment_translation(self, segment_id: str) -> Segment:
+        """Clear machine-visible translations so the next job redrafts this segment."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM segments WHERE id = ?", (segment_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Segment not found: {segment_id}")
+            self._clear_segment_derivatives(connection, [segment_id])
+            connection.execute(
+                """UPDATE segments SET machine_translation = NULL,
+                edited_translation = NULL, reviewed_translation = NULL,
+                accepted_translation = NULL, status = ? WHERE id = ?""",
+                (SegmentStatus.SOURCE.value, segment_id),
+            )
+            self._audit(
+                connection, "segment", segment_id, "translation_cleared", {},
+            )
+        return self.get_segment(segment_id)
 
     def confirm_segment(
         self, segment_id: str, translation: str, rationale: str = "", actor: str = "human"

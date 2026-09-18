@@ -6,7 +6,11 @@ import urllib.error
 from unittest.mock import patch
 
 from jieyi.domain.models import ModelSpec
-from jieyi.providers.openai_compatible import OpenAICompatibleProvider, ProviderError
+from jieyi.providers.openai_compatible import (
+    OpenAICompatibleProvider,
+    ProviderError,
+    ReasoningMandatoryError,
+)
 from jieyi.workflow.provider_responses import is_content_filtered_error
 
 
@@ -205,6 +209,74 @@ class ProviderUsageTests(unittest.TestCase):
             [item.get("reasoning_effort") for item in request_bodies],
             ["medium", "low", "low"],
         )
+
+    def test_reasoning_mandatory_error_skips_effort_candidates(self):
+        payload = {"choices": [{"message": {"content": "译文"}}]}
+        provider = OpenAICompatibleProvider(
+            "https://example.com/v1", capabilities=("reasoning_effort",)
+        )
+        model = ModelSpec(provider="openai-compatible", model="mandatory-reasoner")
+        request_bodies = []
+
+        def respond(request, timeout):
+            del timeout
+            body = json.loads(request.data)
+            request_bodies.append(body)
+            if "reasoning_effort" in body:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    400,
+                    "Bad Request",
+                    {},
+                    io.BytesIO(
+                        b'{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled."}}'
+                    ),
+                )
+            return FakeResponse(payload)
+
+        with (
+            patch("urllib.request.urlopen", side_effect=respond),
+            self.assertRaises(ReasoningMandatoryError),
+        ):
+            provider._complete_sync(
+                [{"role": "user", "content": "source"}],
+                model,
+                thinking=False,
+                reasoning_effort=None,
+                max_tokens=512,
+                compute_mode="economy",
+            )
+
+        # No candidate walk: every economy effort would fail identically.
+        self.assertEqual(len(request_bodies), 1)
+        self.assertEqual(request_bodies[0]["reasoning_effort"], "none")
+
+    def test_reasoning_mandatory_endpoint_default_has_no_reasoning_control(self):
+        payload = {"choices": [{"message": {"content": "译文"}}]}
+        provider = OpenAICompatibleProvider(
+            "https://example.com/v1", capabilities=("reasoning_effort",)
+        )
+        model = ModelSpec(provider="openai-compatible", model="mandatory-reasoner")
+        request_bodies = []
+
+        def respond(request, timeout):
+            del timeout
+            request_bodies.append(json.loads(request.data))
+            return FakeResponse(payload)
+
+        with patch("urllib.request.urlopen", side_effect=respond):
+            result = provider._complete_sync(
+                [{"role": "user", "content": "source"}],
+                model,
+                thinking=None,
+                reasoning_effort=None,
+                max_tokens=512,
+                compute_mode=None,
+            )
+
+        self.assertEqual(result.text, "译文")
+        self.assertNotIn("reasoning_effort", request_bodies[0])
+        self.assertNotIn("thinking", request_bodies[0])
 
     def test_preserves_empty_null_content_for_workflow_retry(self):
         payload = {

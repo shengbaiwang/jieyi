@@ -426,7 +426,7 @@ class ApiTests(unittest.TestCase):
         health = self.client.get("/health")
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["api_version"], 2)
-        self.assertEqual(health.json()["quality_detector_version"], "6")
+        self.assertEqual(health.json()["quality_detector_version"], "7")
         self.assertTrue(health.json()["db_path"].endswith("api.db"))
         self.assertIn("echo", health.json()["providers"])
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 
 from jieyi.domain.models import (
+    DEFAULT_TOKEN_BUDGET,
     Document,
     Job,
     ModelSpec,
@@ -146,8 +147,15 @@ def create_job(
     draft_compute_mode: str | None = None,
     draft_reasoning_effort: str | None = None,
     max_output_tokens: int = 6_000,
-    token_budget: int = 2_000_000,
+    token_budget: int = DEFAULT_TOKEN_BUDGET,
     segment_ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
+    minimal_prompt_enabled: bool = True,
+    minimal_prompt_max_chars: int = 120,
+    cohesion_enabled: bool = False,
+    cohesion_min_segments: int = 2,
+    cohesion_max_segments: int = 8,
+    cohesion_max_group_chars: int = 6_000,
+    cohesion_max_output_tokens: int = 6_000,
 ) -> Job:
     store.get_document(document_id)
     segment_count = len(store.list_segments(document_id))
@@ -166,6 +174,16 @@ def create_job(
         raise ValueError("max_batch_chars must be at least 500")
     if max_output_tokens < 256 or token_budget < 1:
         raise ValueError("token limits must be positive")
+    if minimal_prompt_max_chars < 0:
+        raise ValueError("minimal_prompt_max_chars cannot be negative")
+    if cohesion_min_segments < 2:
+        raise ValueError("cohesion_min_segments must be at least 2")
+    if not cohesion_min_segments <= cohesion_max_segments <= 20:
+        raise ValueError("cohesion_max_segments must be between cohesion_min_segments and 20")
+    if cohesion_max_group_chars < 500:
+        raise ValueError("cohesion_max_group_chars must be at least 500")
+    if cohesion_max_output_tokens < 256:
+        raise ValueError("cohesion_max_output_tokens must be at least 256")
     draft_request = draft_compute_mode or draft_reasoning_effort
     allowed_controls = set(COMPUTE_MODES) | set(LEGACY_EFFORTS)
     if draft_request and draft_request not in allowed_controls:
@@ -199,6 +217,13 @@ def create_job(
         max_output_tokens=max_output_tokens,
         token_budget=token_budget,
         segment_ranges=tuple(normalized_ranges),
+        minimal_prompt_enabled=minimal_prompt_enabled,
+        minimal_prompt_max_chars=minimal_prompt_max_chars,
+        cohesion_enabled=cohesion_enabled,
+        cohesion_min_segments=cohesion_min_segments,
+        cohesion_max_segments=cohesion_max_segments,
+        cohesion_max_group_chars=cohesion_max_group_chars,
+        cohesion_max_output_tokens=cohesion_max_output_tokens,
     )
     return store.create_job(
         Job(id=new_id("job"), document_id=document_id, recipe=recipe), reuse_unfinished=True,

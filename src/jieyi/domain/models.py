@@ -17,6 +17,24 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
+# 单轮 token 预算：一本书约 4-5M token，默认 20M 保证整书可一轮跑完。
+# 旧默认 2M 保留用于自动迁移存量任务。
+DEFAULT_TOKEN_BUDGET = 20_000_000
+LEGACY_TOKEN_BUDGET = 2_000_000
+
+
+def _migrate_token_budget(value: dict[str, Any]) -> int:
+    """存量任务无显式预算或仍是旧默认 2M，一律放宽到新默认。"""
+    raw = value.get("token_budget", DEFAULT_TOKEN_BUDGET)
+    try:
+        budget = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TOKEN_BUDGET
+    if budget == LEGACY_TOKEN_BUDGET:
+        return DEFAULT_TOKEN_BUDGET
+    return budget
+
+
 class SegmentKind(StrEnum):
     HEADING = "heading"
     PARAGRAPH = "paragraph"
@@ -56,6 +74,7 @@ TermEnforcement = Literal["auto", "global", "contextual", "reference"]
 class CandidateStage(StrEnum):
     DRAFT = "draft"
     REPAIR = "repair"
+    REVIEW = "review"
 
 
 class IssueSeverity(StrEnum):
@@ -148,8 +167,19 @@ class TranslationRecipe:
     draft_compute_mode: str = "economy"
     draft_reasoning_effort: str = "none"
     max_output_tokens: int = 6_000
-    token_budget: int = 2_000_000
+    token_budget: int = DEFAULT_TOKEN_BUDGET
     segment_ranges: tuple[tuple[int, int], ...] = ()
+    # Minimal prompt for short plain segments (no placeholders, no terms,
+    # no structure). Mirrors the immersive-translation short style.
+    minimal_prompt_enabled: bool = True
+    minimal_prompt_max_chars: int = 120
+    # Second-pass group cohesion pass over committed drafts (5-10 segments).
+    # Default off: opt-in per job until the A/B evaluation lands.
+    cohesion_enabled: bool = False
+    cohesion_min_segments: int = 2
+    cohesion_max_segments: int = 8
+    cohesion_max_group_chars: int = 6_000
+    cohesion_max_output_tokens: int = 6_000
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -183,11 +213,18 @@ class TranslationRecipe:
                 )
             ),
             max_output_tokens=int(value.get("max_output_tokens", 6_000)),
-            token_budget=int(value.get("token_budget", 2_000_000)),
+            token_budget=_migrate_token_budget(value),
             segment_ranges=tuple(
                 (int(item[0]), int(item[1]))
                 for item in value.get("segment_ranges", ())
             ),
+            minimal_prompt_enabled=bool(value.get("minimal_prompt_enabled", True)),
+            minimal_prompt_max_chars=int(value.get("minimal_prompt_max_chars", 120)),
+            cohesion_enabled=bool(value.get("cohesion_enabled", False)),
+            cohesion_min_segments=int(value.get("cohesion_min_segments", 2)),
+            cohesion_max_segments=int(value.get("cohesion_max_segments", 8)),
+            cohesion_max_group_chars=int(value.get("cohesion_max_group_chars", 6_000)),
+            cohesion_max_output_tokens=int(value.get("cohesion_max_output_tokens", 6_000)),
         )
 
 
@@ -202,6 +239,7 @@ class TranslationRequest:
     existing_translation: str | None = None
     issue_summary: str = ""
     atom_boundaries: tuple[tuple[str, str], ...] = ()
+    minimal_prompt: bool = False
 
 
 @dataclass(frozen=True, slots=True)

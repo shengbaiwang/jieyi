@@ -20,6 +20,7 @@ from jieyi.domain.models import (
 )
 from jieyi.persistence import SQLiteStore
 from jieyi.providers import EchoProvider, ProviderRegistry
+from jieyi.providers.openai_compatible import ReasoningMandatoryError
 from jieyi.workflow import (
     TranslationEngine,
     create_document,
@@ -180,6 +181,99 @@ class ConcurrentProbeProvider:
             )
         finally:
             self.active -= 1
+
+
+class CohesionEchoProvider:
+    """Draft each source verbatim, then append a marker in the cohesion pass."""
+
+    def __init__(self):
+        self.draft_calls = 0
+        self.cohesion_calls = 0
+
+    async def complete(self, messages, model, **kwargs):
+        del model, kwargs
+        content = messages[-1]["content"]
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("segments"), list):
+            self.cohesion_calls += 1
+            revisions = {
+                str(item["id"]): f"{item.get('draft', '')} polished"
+                for item in payload["segments"]
+                if isinstance(item, dict) and item.get("id")
+            }
+            return TranslationResult(
+                text=json.dumps(revisions, ensure_ascii=False),
+                prompt_tokens=40,
+                completion_tokens=20,
+            )
+        self.draft_calls += 1
+        source = _sources_from_messages(messages)[0]
+        return TranslationResult(
+            text=f"translated:{source}", prompt_tokens=10, completion_tokens=5,
+        )
+
+
+class CohesionInvalidJsonProvider:
+    """Return broken JSON in the cohesion pass; drafts must survive."""
+
+    def __init__(self):
+        self.draft_calls = 0
+        self.cohesion_calls = 0
+
+    async def complete(self, messages, model, **kwargs):
+        del model, kwargs
+        content = messages[-1]["content"]
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("segments"), list):
+            self.cohesion_calls += 1
+            return TranslationResult(
+                text="not json", prompt_tokens=40, completion_tokens=5,
+            )
+        self.draft_calls += 1
+        source = _sources_from_messages(messages)[0]
+        return TranslationResult(
+            text=f"translated:{source}", prompt_tokens=10, completion_tokens=5,
+        )
+
+
+class CohesionPlaceholderBreakingProvider:
+    """Drop a placeholder in one cohesion value; that segment must fall back."""
+
+    def __init__(self):
+        self.ids: list[str] = []
+
+    async def complete(self, messages, model, **kwargs):
+        del model, kwargs
+        content = messages[-1]["content"]
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("segments"), list):
+            self.ids = [str(item["id"]) for item in payload["segments"]]
+            revisions = {}
+            for index, item in enumerate(payload["segments"]):
+                draft = str(item.get("draft", ""))
+                if index == 0:
+                    draft = draft.replace("[[JY_PH_0000]]", "", 1)
+                else:
+                    draft = f"{draft} polished"
+                revisions[str(item["id"])] = draft
+            return TranslationResult(
+                text=json.dumps(revisions, ensure_ascii=False),
+                prompt_tokens=40,
+                completion_tokens=20,
+            )
+        source = _sources_from_messages(messages)[0]
+        return TranslationResult(
+            text=f"translated:{source}", prompt_tokens=10, completion_tokens=5,
+        )
 
 
 class ContinuousQueueProvider:
@@ -347,6 +441,20 @@ class SelectiveHttpSafetyProvider:
                 "系统检测到输入或生成内容可能包含不安全或敏感内容（代码 1301）"
             )
         return TranslationResult(text=f"translated:{request.segment.source_text}")
+
+
+class MandatoryReasoningProvider:
+    """Mimic an endpoint that rejects reasoning-off requests for every segment."""
+
+    def __init__(self):
+        self.calls: list[dict[str, object]] = []
+
+    async def complete(self, messages, model, **kwargs):
+        del model
+        self.calls.append(dict(kwargs))
+        raise ReasoningMandatoryError(
+            "HTTP 400: Reasoning is mandatory for this endpoint and cannot be disabled."
+        )
 
 
 class WorkflowTests(unittest.TestCase):
@@ -1152,6 +1260,39 @@ class WorkflowTests(unittest.TestCase):
         stages = [item["stage"] for item in self.store.list_candidates(segment.id)]
         self.assertEqual(stages, ["draft"])
 
+    def test_reasoning_mandatory_endpoint_fails_fast_with_guidance(self):
+        document = create_document(
+            self.store,
+            project_id=self.project.id,
+            title="Mandatory reasoning",
+            text="First plain sentence here.\n\nSecond plain sentence here.",
+            source_format="txt",
+        )
+        provider = MandatoryReasoningProvider()
+        registry = ProviderRegistry()
+        registry.register("mandatory-reasoning", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store,
+            document_id=document.id,
+            draft_provider="mandatory-reasoning",
+            draft_model="test",
+            batch_size=2,
+            concurrency=1,
+        )
+
+        with self.assertRaises(ReasoningMandatoryError):
+            asyncio.run(engine.run_optimized(job.id))
+
+        failed = self.store.get_job(job.id)
+        self.assertEqual(failed.status, JobStatus.FAILED)
+        self.assertIn("mandatory", failed.last_error.lower())
+        self.assertIn("均衡", failed.last_error)
+        # No retries: one attempt per segment, no translations committed.
+        self.assertEqual(len(provider.calls), 2)
+        for segment in self.store.list_segments(document.id):
+            self.assertIsNone(segment.machine_translation)
+
     def test_confirmed_translation_becomes_fuzzy_tm_context(self):
         first = self.store.list_segments(self.document.id)[0]
         self.store.confirm_segment(first.id, "能动性很重要。", "Approved wording")
@@ -1190,6 +1331,171 @@ class WorkflowTests(unittest.TestCase):
         segments = self.store.list_segments(document.id)
         self.assertEqual(segments[0].source_text, "Second Chapter")
         self.assertEqual(segments[3].kind, SegmentKind.FOOTNOTE)
+
+    def test_cohesion_is_opt_in_and_disabled_by_default(self):
+        document = create_document(
+            self.store,
+            project_id=self.project.id,
+            title="Cohesion default",
+            text="First plain sentence here.\n\nSecond plain sentence here.",
+            source_format="txt",
+        )
+        provider = CohesionEchoProvider()
+        registry = ProviderRegistry()
+        registry.register("cohesion", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store,
+            document_id=document.id,
+            draft_provider="cohesion",
+            draft_model="test",
+            batch_size=2,
+            concurrency=1,
+        )
+
+        self.assertFalse(job.recipe.cohesion_enabled)
+        completed = asyncio.run(engine.run_optimized(job.id))
+
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        self.assertEqual(provider.draft_calls, 2)
+        self.assertEqual(provider.cohesion_calls, 0)
+        for segment in self.store.list_segments(document.id):
+            self.assertIsNotNone(segment.machine_translation)
+            self.assertIsNone(segment.reviewed_translation)
+        progress = self.store.job_progress(job.id)
+        self.assertEqual(progress["review_call_count"], 0)
+
+    def test_cohesion_pass_revises_drafts_with_audited_usage(self):
+        document = create_document(
+            self.store,
+            project_id=self.project.id,
+            title="Cohesion group",
+            text="First plain sentence here.\n\nSecond plain sentence here.",
+            source_format="txt",
+        )
+        provider = CohesionEchoProvider()
+        registry = ProviderRegistry()
+        registry.register("cohesion", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store,
+            document_id=document.id,
+            draft_provider="cohesion",
+            draft_model="test",
+            batch_size=2,
+            concurrency=1,
+            cohesion_enabled=True,
+        )
+
+        completed = asyncio.run(engine.run_optimized(job.id))
+
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        self.assertEqual(provider.draft_calls, 2)
+        self.assertEqual(provider.cohesion_calls, 1)
+        segments = self.store.list_segments(document.id)
+        for segment in segments:
+            self.assertTrue(segment.machine_translation.startswith("translated:"))
+            self.assertTrue(segment.reviewed_translation.endswith(" polished"))
+            self.assertEqual(
+                [item["stage"] for item in self.store.list_candidates(segment.id)],
+                ["draft", "review"],
+            )
+        progress = self.store.job_progress(job.id)
+        self.assertEqual(progress["review_call_count"], 1)
+        self.assertEqual(progress["model_call_count"], 3)
+        self.assertEqual(progress["batch_count"], 1)
+        cohesion_calls = [
+            event["payload"]
+            for event in self.store.list_audit_events("job", job.id)
+            if event["action"] == "model_call"
+            and event["payload"].get("stage") == "review"
+        ]
+        self.assertEqual(len(cohesion_calls), 1)
+        self.assertEqual(
+            cohesion_calls[0]["cohesion_group"],
+            [segments[0].ordinal, segments[1].ordinal],
+        )
+
+    def test_cohesion_invalid_json_keeps_drafts(self):
+        document = create_document(
+            self.store,
+            project_id=self.project.id,
+            title="Cohesion broken",
+            text="First plain sentence here.\n\nSecond plain sentence here.",
+            source_format="txt",
+        )
+        provider = CohesionInvalidJsonProvider()
+        registry = ProviderRegistry()
+        registry.register("cohesion-broken", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store,
+            document_id=document.id,
+            draft_provider="cohesion-broken",
+            draft_model="test",
+            batch_size=2,
+            concurrency=1,
+            cohesion_enabled=True,
+        )
+
+        completed = asyncio.run(engine.run_optimized(job.id))
+
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        self.assertEqual(provider.cohesion_calls, 1)
+        for segment in self.store.list_segments(document.id):
+            self.assertTrue(segment.machine_translation.startswith("translated:"))
+            self.assertIsNone(segment.reviewed_translation)
+        invalid = [
+            event["payload"]
+            for event in self.store.list_audit_events("job", job.id)
+            if event["action"] == "model_call"
+            and event["payload"].get("outcome") == "cohesion_invalid_json"
+        ]
+        self.assertEqual(len(invalid), 1)
+
+    def test_cohesion_placeholder_damage_falls_back_per_segment(self):
+        document = create_document(
+            self.store,
+            project_id=self.project.id,
+            title="Cohesion placeholders",
+            text=(
+                "The argument follows (Smith 2020).\n\n"
+                "Another plain sentence here for cohesion."
+            ),
+            source_format="txt",
+        )
+        provider = CohesionPlaceholderBreakingProvider()
+        registry = ProviderRegistry()
+        registry.register("cohesion-markers", provider)
+        engine = TranslationEngine(self.store, registry)
+        job = create_job(
+            self.store,
+            document_id=document.id,
+            draft_provider="cohesion-markers",
+            draft_model="test",
+            batch_size=2,
+            concurrency=1,
+            cohesion_enabled=True,
+        )
+
+        completed = asyncio.run(engine.run_optimized(job.id))
+
+        self.assertEqual(completed.status, JobStatus.COMPLETED)
+        segments = self.store.list_segments(document.id)
+        # The placeholder-damaged revision is rejected; its draft survives.
+        self.assertIsNone(segments[0].reviewed_translation)
+        self.assertTrue(segments[0].machine_translation.startswith("translated:"))
+        self.assertIn("(Smith 2020)", segments[0].machine_translation)
+        # The healthy sibling is still revised.
+        self.assertTrue(segments[1].reviewed_translation.endswith(" polished"))
+        self.assertEqual(
+            [item["stage"] for item in self.store.list_candidates(segments[0].id)],
+            ["draft"],
+        )
+        self.assertEqual(
+            [item["stage"] for item in self.store.list_candidates(segments[1].id)],
+            ["draft", "review"],
+        )
 
 
 if __name__ == "__main__":

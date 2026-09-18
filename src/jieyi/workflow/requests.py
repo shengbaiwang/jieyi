@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 
 from jieyi.context.compiler import compile_neighbor_context
 from jieyi.domain.models import Segment, TermEntry, TranslationRequest
+from jieyi.prompting import downgrade_to_minimal_prompt
 from jieyi.protection import ProtectedText
 from jieyi.terminology import matching_terms, render_terminology_constraints
 
@@ -70,6 +71,16 @@ def prepare_translation(
         context=shared,
         segment_context="\n\n".join(filter(None, [terms, neighbors_text])),
     )
+    # The minimal prompt tier only removes unchanged context: it applies when
+    # the compiled neighbor + term context is empty anyway (isolated plain
+    # sentence), so no cross-segment signal is ever dropped to save tokens.
+    if not request.segment_context.strip() and not relevant:
+        request = downgrade_to_minimal_prompt(
+            request,
+            has_terms=False,
+            enabled=bool(getattr(recipe, "minimal_prompt_enabled", False)),
+            max_chars=int(getattr(recipe, "minimal_prompt_max_chars", 120) or 120),
+        )
     return PreparedTranslation(request, protected, relevant, bool(structured_source))
 
 

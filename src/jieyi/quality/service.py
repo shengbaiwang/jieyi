@@ -8,7 +8,7 @@ from .checks import DETECTOR_VERSION, run_deterministic_checks
 _QUALITY_META_KEY = "quality_detector_version"
 # Only this detector's findings are superseded by deterministic reindexing.
 _DETERMINISTIC_CODES = {
-    "empty_translation", "footnote_mismatch", "approved_term_missing", "forbidden_term_used",
+    "model_commentary", "source_echo", "empty_translation", "footnote_mismatch", "approved_term_missing", "forbidden_term_used",
     "ambiguous_term_unresolved", "terminology_pending", "number_mismatch", "numeric_mismatch",
     "parenthesis_mismatch", "bracket_mismatch", "unbalanced_parentheses",
 }
