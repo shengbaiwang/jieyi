@@ -59,6 +59,10 @@ human_confirmed
 
 机器草译不会产生 `human_confirmed`。每次模型输出写入 `candidates`，当前机器稿写入段落；人工确认同时写入 `decisions` 和 `audit_events`。重跑模型不能覆盖 `accepted_translation`。
 
+多模型对比（`stage=compare`）只追加候选，不写 `machine_translation`，也不触碰
+`accepted_translation`。人工在对比窗口点「采用此译文」后写入 `edited_translation`，
+已确认段仍需显式「更新确认」才替换正式译文。
+
 ## 任务状态与恢复
 
 ```text
@@ -203,7 +207,7 @@ TM 只作为参考上下文，不自动产生人工确认。后续数据量增�
 - 文档重新导入与稳定键对齐；
 - 语义 TM 和章节/全书知识包；
 - 大规模 TM 的 FTS/向量候选预取；
-- 更完整的 CAT 能力（候选版本对比、批注、快捷键自定义与多人协作）；
+- 更完整的 CAT 能力（候选版本对比增强、批注、快捷键自定义与多人协作）；
 - 模型响应的结构化 schema 和更细的成本统计；
 - DOCX、TEI、XLIFF/TMX/TBX；
 - 保留 XHTML/CSS/图片/目录映射的 EPUB round-trip 导出；

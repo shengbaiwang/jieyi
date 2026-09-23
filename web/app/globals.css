@@ -858,6 +858,74 @@ nav { display: grid; gap: 3px; }
 .dark .chapter.active { color: var(--accent-text); background: rgba(31,128,255,.24); }
 .dark .project-progress { border-top-color: rgba(235,238,244,.22); background: rgba(52,57,64,.98); }
 
+/* Multi-model compare window */
+.compare-trigger { min-height: 28px; border: 1px solid var(--line); border-radius: 7px; padding: 0 10px; color: var(--text); background: var(--panel); font-size: 10px; font-weight: 650; }
+.compare-trigger:hover:not(:disabled) { border-color: rgba(10,118,246,.55); color: var(--accent-text); }
+.compare-trigger:disabled { opacity: .55; }
+.model-compare-overlay { place-items: center; padding-top: 0; z-index: 40; }
+.model-compare-dialog { width: min(1180px, calc(100vw - 28px)); max-height: min(900px, calc(100vh - 36px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; color: var(--text); background: var(--paper); box-shadow: 0 30px 100px rgba(15,20,28,.38); }
+.model-compare-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--line); padding: 20px 24px 16px; }
+.model-compare-dialog > header span { color: var(--accent-text); font-size: 9px; font-weight: 760; letter-spacing: .1em; }
+.model-compare-dialog > header h2 { margin: 5px 0 4px; font-size: 18px; letter-spacing: -.02em; }
+.model-compare-dialog > header p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.model-compare-dialog > header > button { width: 28px; height: 28px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; font-size: 19px; }
+.model-compare-dialog > header > button:hover { color: var(--text); background: color-mix(in srgb, var(--muted) 13%, transparent); }
+.model-compare-body { display: grid; gap: 12px; overflow: auto; padding: 14px 20px 18px; }
+.model-compare-body h3 { margin: 0 0 8px; font-size: 11px; }
+.model-compare-body h3 small { margin-left: 6px; color: var(--muted); font-size: 9px; font-weight: 500; }
+.compare-source { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: color-mix(in srgb, var(--panel) 74%, transparent); }
+.compare-source p { margin: 0; max-height: 120px; overflow: auto; white-space: pre-wrap; font: 12px/1.6 Georgia, "Songti SC", serif; }
+.compare-controls { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: color-mix(in srgb, var(--panel) 74%, transparent); }
+.compare-model-list { display: flex; flex-wrap: wrap; gap: 7px; }
+.compare-model-list label { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; background: var(--paper); font-size: 10px; cursor: default; }
+.compare-model-list label.selected { border-color: var(--blue-solid); color: var(--accent-text); background: var(--blue-soft); }
+.compare-model-list input { position: absolute; opacity: 0; pointer-events: none; }
+.compare-model-list .chapter-check { width: 14px; height: 14px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 4px; color: transparent; font-size: 9px; font-weight: 800; }
+.compare-model-list label.selected .chapter-check { border-color: var(--blue-solid); color: white; background: var(--blue-solid); }
+.compare-actions { display: flex; align-items: flex-end; gap: 8px; flex-shrink: 0; }
+.compare-actions label { display: grid; gap: 5px; }
+.compare-actions label > span { color: var(--muted); font-size: 8.5px; font-weight: 620; }
+.compare-actions select { min-height: 32px; min-width: 96px; border: 1px solid var(--line); border-radius: 7px; padding: 0 8px; color: var(--text); background: var(--paper); font-size: 10px; }
+.compare-actions > button { min-height: 32px; min-width: 118px; border: 1px solid var(--line); border-radius: 8px; padding: 0 14px; background: var(--paper); font-size: 10px; font-weight: 680; }
+.compare-actions > button.accent { border-color: transparent; color: white; background: var(--blue-solid); }
+.compare-actions > button:disabled { opacity: .55; }
+.compare-grid { display: grid; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
+.compare-results-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.compare-results-head h3 { margin: 0; }
+.compare-reveal { flex-shrink: 0; min-height: 28px; border: 1px solid var(--line); border-radius: 7px; padding: 0 10px; color: var(--muted); background: var(--paper); font-size: 9.5px; font-weight: 650; }
+.compare-reveal:hover:not(:disabled) { border-color: rgba(10,118,246,.55); color: var(--accent-text); }
+.compare-reveal[aria-pressed="true"] { border-color: var(--blue-solid); color: var(--accent-text); background: var(--blue-soft); }
+.compare-reveal:disabled { opacity: .55; }
+.compare-card { min-width: 0; min-height: 280px; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.compare-card > header { padding: 11px 12px 8px; border-bottom: 1px solid var(--line); }
+.compare-card > header strong { display: block; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.compare-card > header small { color: var(--muted); font-size: 9px; }
+.compare-text { flex: 1; min-height: 160px; max-height: 360px; overflow: auto; margin: 0; padding: 12px; white-space: pre-wrap; font: 12px/1.65 Georgia, "Songti SC", serif; color: var(--text); background: var(--paper); }
+.compare-error { flex: 1; padding: 14px 12px; color: var(--danger-text); font-size: 10px; line-height: 1.55; background: color-mix(in srgb, var(--red) 7%, var(--paper)); }
+.compare-issues { margin: 0; padding: 8px 12px 0; list-style: none; display: grid; gap: 4px; }
+.compare-issues li { border-radius: 6px; padding: 5px 7px; color: var(--warning-text); background: color-mix(in srgb, var(--amber) 10%, transparent); font-size: 9px; line-height: 1.45; }
+.compare-issues li[data-severity="error"] { color: var(--danger-text); background: color-mix(in srgb, var(--red) 10%, transparent); }
+.compare-card > footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; border-top: 1px solid var(--line); padding: 8px 10px; }
+.compare-card > footer small { color: var(--muted); font-size: 8.5px; }
+.compare-apply { flex-shrink: 0; min-height: 28px; border: 1px solid var(--line); border-radius: 7px; padding: 0 10px; color: var(--accent-text); background: var(--paper); font-size: 9.5px; font-weight: 680; }
+.compare-apply:hover:not(:disabled) { border-color: var(--blue-solid); background: var(--blue-soft); }
+.compare-apply:disabled { opacity: .5; }
+.compare-empty { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.compare-history-list { display: grid; gap: 6px; }
+.compare-history-list > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--paper); }
+.compare-history-list strong { font-size: 10.5px; }
+.compare-history-list small { color: var(--muted); font-size: 9px; }
+.model-compare-dialog > footer { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-top: 1px solid var(--line); padding: 10px 18px 10px 24px; background: var(--panel); }
+.model-compare-dialog > footer > span { color: var(--muted); font-size: 9px; }
+.model-compare-dialog > footer button { min-height: 32px; border: 1px solid var(--line); border-radius: 8px; padding: 0 13px; background: var(--paper); font-size: 10px; font-weight: 680; }
+.model-compare-dialog > footer button:disabled { opacity: .55; }
+.dark .model-compare-dialog { background: #22262c; }
+.dark .compare-source, .dark .compare-controls, .dark .compare-history-list > div { background: #292e35; }
+.dark .compare-text { background: #1d2126; color: var(--text-strong); }
+.dark .compare-card { background: #2a2f36; }
+.dark .compare-model-list label { background: #252a31; }
+.dark .compare-actions select, .dark .compare-actions > button, .dark .compare-apply, .dark .model-compare-dialog > footer button, .dark .compare-reveal { background: #252a31; color: var(--text); }
+
 @media (max-width: 560px) {
   .book-model-grid { grid-template-columns: 1fr; }
   .book-style-presets { grid-template-columns: 1fr 1fr; }

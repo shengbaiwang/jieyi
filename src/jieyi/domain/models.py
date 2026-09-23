@@ -75,6 +75,8 @@ class CandidateStage(StrEnum):
     DRAFT = "draft"
     REPAIR = "repair"
     REVIEW = "review"
+    # Side-by-side multi-model trials. Never becomes the segment machine draft.
+    COMPARE = "compare"
 
 
 class IssueSeverity(StrEnum):

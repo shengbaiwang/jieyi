@@ -68,6 +68,7 @@ from jieyi.workflow import (
     create_job,
     create_project,
 )
+from jieyi.workflow.compare import ModelCompareError, compare_segment_models
 from jieyi.workflow.jobs import JobManager
 
 
@@ -173,6 +174,16 @@ class SplitSegmentSource(BaseModel):
 
 class MergeSegmentSource(BaseModel):
     direction: str = Field(pattern="^(previous|next)$")
+
+
+class ModelCompareItem(BaseModel):
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+
+
+class ModelCompareRequest(BaseModel):
+    models: list[ModelCompareItem] = Field(min_length=1, max_length=6)
+    compute_mode: str = "economy"
 
 
 class ProviderProfileUpdate(BaseModel):
@@ -980,6 +991,20 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
     async def get_segment_candidates(segment_id: str):
         store.get_segment(segment_id)
         return store.list_candidates(segment_id)
+
+    @app.post("/segments/{segment_id}/model-compare")
+    async def compare_segment_models_route(segment_id: str, body: ModelCompareRequest):
+        store.get_segment(segment_id)
+        compute_mode = normalize_compute_mode(body.compute_mode, "economy")
+        try:
+            return await compare_segment_models(
+                engine,
+                segment_id,
+                [item.model_dump() for item in body.models],
+                compute_mode=compute_mode,
+            )
+        except ModelCompareError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/segments/{segment_id}/provider-failures")
     async def get_segment_provider_failures(segment_id: str):

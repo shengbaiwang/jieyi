@@ -11,6 +11,7 @@ import { activeChapter, toggleChapter, normalizeSegmentRanges, type ChapterLocat
 import { createSubmissionGate } from "./submission-gate";
 import { SourceEditor } from "./source-editor";
 import { sourceSelectionOffsets } from "./source-editing";
+import { ModelComparePanel } from "./model-compare-panel";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
 const PAGE_SIZE = 120;
@@ -46,7 +47,17 @@ function termEnforcement(term: Term): string {
 
 type Issue = { id: string; segment_id: string; ordinal: number; code: string; message: string; severity: string; resolved: number };
 type HumanReviewItem = { segment_id: string; ordinal: number; reason: "error" | "warning"; issue_count: number; source_text: string; translation: string };
-type Candidate = { id: string; job_id: string; stage: string; provider: string; model: string; prompt_tokens: number; completion_tokens: number; cost_usd: number; created_at: string };
+type Candidate = { id: string; job_id: string; stage: string; provider: string; model: string; text: string; prompt_tokens: number; completion_tokens: number; reasoning_tokens?: number; cost_usd: number; created_at: string };
+type CompareResultItem = {
+  candidate_id?: string | null; provider: string; model: string; text: string; raw_text?: string;
+  ok: boolean; error?: string | null; prompt_tokens?: number; completion_tokens?: number;
+  reasoning_tokens?: number; cost_usd?: number; compute_mode?: string;
+  issues?: Array<{ code: string; message: string; severity: string }>;
+};
+type ModelCompareResponse = {
+  segment_id: string; ordinal: number; source_text: string; compute_mode: string;
+  job_id: string; total_cost_usd: number; results: CompareResultItem[];
+};
 type Job = {
   id: string; status: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
   draining?: boolean;
@@ -186,6 +197,9 @@ export default function Home() {
   const [bookSettingsEditor, setBookSettingsEditor] = useState<BookSettingsEditor | null>(null);
   const [savingBookSettings, setSavingBookSettings] = useState(false);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [compareOpen, setCompareOpen] = useState(false);
+  const [compareBusy, setCompareBusy] = useState(false);
+  const [compareResults, setCompareResults] = useState<CompareResultItem[]>([]);
   const [translation, setTranslation] = useState("");
   const [draftDirty, setDraftDirty] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -1242,6 +1256,60 @@ export default function Home() {
     finally { release(); setStartingTask(false); }
   }
 
+  async function runModelCompare(models: Array<{ provider: string; model: string }>, computeMode: "economy" | "balanced" | "performance") {
+    if (!overview || !currentSegment || compareBusy) return;
+    if (draftDirty) {
+      try { await saveDraftImmediately(); }
+      catch { notify("当前译文保存失败，已停留在本段。"); return; }
+    }
+    setCompareBusy(true);
+    try {
+      const payload = await api<ModelCompareResponse>(`/segments/${currentSegment.id}/model-compare`, {
+        method: "POST",
+        body: JSON.stringify({ models, compute_mode: computeMode }),
+      });
+      setCompareResults(payload.results);
+      const candidateItems = await api<Candidate[]>(`/segments/${currentSegment.id}/candidates`).catch(() => candidates);
+      setCandidates(candidateItems);
+      const okCount = payload.results.filter((item) => item.ok).length;
+      notify(okCount
+        ? `对比完成：${okCount}/${payload.results.length} 个模型有可用译文。`
+        : "对比结束，但所选模型都未返回可用译文。");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "模型对比失败");
+    } finally {
+      setCompareBusy(false);
+    }
+  }
+
+  function applyCompareResult(text: string) {
+    if (!currentSegment || !text.trim()) return;
+    setTranslation(text);
+    setDraftDirty(true);
+    setSaveState("idle");
+    setCompareOpen(false);
+    void (async () => {
+      try {
+        await api(`/segments/${currentSegment.id}/draft`, {
+          method: "PATCH",
+          body: JSON.stringify({ translation: text }),
+        });
+        setPage((current) => current ? {
+          ...current,
+          items: current.items.map((item) => item.id === currentSegment.id ? { ...item, edited_translation: text, reviewed_translation: null } : item),
+        } : current);
+        setDraftDirty(false);
+        setSaveState("saved");
+        notify(currentSegment.status === "human_confirmed"
+          ? "已写入译文草稿；已确认译文仍生效，请点「更新确认」正式替换。"
+          : "已采用该模型译文为当前草稿，可继续修改后确认。");
+      } catch (error) {
+        setSaveState("error");
+        notify(error instanceof Error ? error.message : "采用译文失败");
+      }
+    })();
+  }
+
   async function controlJob(job: Job, action: "pause" | "cancel") {
     try {
       const updated = await api<Job>("/jobs/" + job.id + "/" + action, { method: "POST" });
@@ -1353,7 +1421,7 @@ export default function Home() {
           </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : selectedDocument.source_format === "pdf" ? "导出为 PDF，保留原页尺寸、图片、图表与目录；双语版逐页交替原文和译文。较长译文会在原页文字区内自适应重排。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
         </section>}
 
-        {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : overview ? "这本书已没有文段。" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
+        {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : overview ? "这本书已没有文段。" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><button type="button" className="compare-trigger" disabled={!currentSegment || compareBusy} onClick={() => { setCompareResults([]); setCompareOpen(true); }}>{compareBusy ? "对比中…" : "模型对比"}</button><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
           <div className={`editor-columns ${view === "target" ? "target-only" : ""}`}>
             {view === "split" && <SourceEditor
               key={`${currentSegment.id}:${sourceBaseline}:${sourceEditing}`}
@@ -1510,5 +1578,17 @@ export default function Home() {
       </div>
     </div>}
     {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
+    <ModelComparePanel
+      open={compareOpen && Boolean(currentSegment)}
+      ordinal={currentSegment?.ordinal ?? 0}
+      sourceText={currentSegment?.source_text || ""}
+      candidates={candidates}
+      settings={settings}
+      busy={compareBusy}
+      results={compareResults}
+      onRun={runModelCompare}
+      onApply={applyCompareResult}
+      onClose={() => { if (!compareBusy) setCompareOpen(false); }}
+    />
   </main>;
 }
