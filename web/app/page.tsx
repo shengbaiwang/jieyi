@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PdfLayoutReader } from "./pdf-layout-reader";
+import { parsePdfReadingState, pdfReadingKey } from "./pdf-reading";
 import { PdfSourcePanel, pdfPages } from "./pdf-source-panel";
 import { ImportBookPanel, ProviderSettingsPanel } from "./setup-panels";
 import { TermDiscoveryPanel } from "./term-discovery-panel";
@@ -1102,7 +1103,12 @@ export default function Home() {
         legacySegments.current.set(document.id, items);
         setOverview(summary);
         setReaderSegments(items);
-        setPdfReaderPage(pdfPages(items.find((segment) => segment.ordinal === seedOrdinal)?.source_refs)[0] || 1);
+        let savedPdfPage = 0;
+        if (document.source_format === "pdf") {
+          try { const raw = localStorage.getItem(pdfReadingKey(document.id)); if (raw) savedPdfPage = parsePdfReadingState(raw).location.page; }
+          catch { /* The PDF reader reports unreadable records without overwriting them. */ }
+        }
+        setPdfReaderPage(savedPdfPage || pdfPages(items.find((segment) => segment.ordinal === seedOrdinal)?.source_refs)[0] || 1);
         const startOrdinal = seedOrdinal || items[0]?.ordinal || 0;
         readerRestoreOrdinal.current = startOrdinal || null;
         setReaderOrdinal(startOrdinal);
@@ -1330,6 +1336,7 @@ export default function Home() {
       legacySegments.current.delete(pendingDelete.id);
       localStorage.removeItem("jieyi.ordinal." + pendingDelete.id);
       localStorage.removeItem("jieyi.chapter." + pendingDelete.id);
+      localStorage.removeItem(pdfReadingKey(pendingDelete.id));
       localStorage.removeItem("jieyi.book-settings." + pendingDelete.id);
       setBookSettings((current) => { const next = { ...current }; delete next[pendingDelete.id]; return next; });
       if (overview?.document.id === pendingDelete.id) {
@@ -1355,11 +1362,20 @@ export default function Home() {
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, []);
 
+  function openFullTextSearch() {
+    if (panel === "reader" && overview?.document.source_format === "pdf") {
+      window.dispatchEvent(new Event("jieyi-pdf-search"));
+      return;
+    }
+    setSearchOpen(true);
+    window.setTimeout(() => searchInput.current?.focus(), 30);
+  }
+
   useEffect(() => {
     function keydown(event: KeyboardEvent) {
       if (event.isComposing) return;
       const command = event.metaKey || event.ctrlKey;
-      if (command && event.key.toLowerCase() === "k") { event.preventDefault(); setSearchOpen(true); window.setTimeout(() => searchInput.current?.focus(), 30); }
+      if (command && event.key.toLowerCase() === "k") { event.preventDefault(); openFullTextSearch(); }
       if (command && event.key === "Enter" && (panel === "translate" || panel === "quality")) { event.preventDefault(); void confirmCurrent(panel === "quality" ? { advanceReview: true } : undefined); }
       if (!command && panel === "quality" && (event.key === "j" || event.key === "J")) { event.preventDefault(); void stepReview(1); }
       if (!command && panel === "quality" && (event.key === "k" || event.key === "K")) { event.preventDefault(); void stepReview(-1); }
@@ -1376,7 +1392,7 @@ export default function Home() {
       <header className="titlebar">
         <div className="titlebar-start"><div className="traffic-lights" aria-hidden="true"><span className="traffic red" /><span className="traffic yellow" /><span className="traffic green" /></div><button className="icon-button sidebar-toggle" aria-label="切换侧栏" onClick={() => setSidebarOpen((value) => !value)}><Mark>▥</Mark></button></div>
         <div className="document-title"><strong>{panel === "library" ? "我的书库" : panel === "import" ? "导入书籍" : panel === "settings" ? "模型配置" : panel === "export" ? "导出书籍" : activeDocument?.title || "介译"}</strong><span>{panel === "translate" ? currentChapter?.title || "正文" : panel === "reader" ? `原书排版阅读 · ${readerMode === "original" ? "原文" : readerMode === "translated" ? "译文" : "双语"}` : overview?.project.name || "本地翻译工作台"}</span></div>
-        <div className="titlebar-actions"><button className="icon-button" aria-label="全文搜索" onClick={() => setSearchOpen(true)}><Mark>⌕</Mark><kbd>⌘K</kbd></button><button className="icon-button theme-toggle" title={dark ? "切换到日间模式" : "切换到夜览模式"} aria-label={dark ? "切换到日间模式" : "切换到夜览模式"} aria-pressed={dark} onClick={changeDark}><ThemeIcon dark={dark} /></button></div>
+        <div className="titlebar-actions"><button className="icon-button" aria-label="全文搜索" onClick={openFullTextSearch}><Mark>⌕</Mark><kbd>⌘K</kbd></button><button className="icon-button theme-toggle" title={dark ? "切换到日间模式" : "切换到夜览模式"} aria-label={dark ? "切换到日间模式" : "切换到夜览模式"} aria-pressed={dark} onClick={changeDark}><ThemeIcon dark={dark} /></button></div>
         {latestJob?.status === "running" && <div className="title-progress indeterminate" />}
       </header>
 
@@ -1395,7 +1411,7 @@ export default function Home() {
         </nav></>}
         {selectedJob && <details className="workspace-job"><summary><span>当前任务</span><strong>{jobStatusLabel(selectedJob.status, selectedJob.deferred_segments)}</strong></summary>{selectedJob && <div className={"job-progress-card status-" + selectedJob.status}><div className="job-progress-head"><div><span>{selectedJob.recipe.segment_ranges?.length ? "篇章草译" : "全书草译"}</span><strong>{jobStatusLabel(selectedJob.status, selectedJob.deferred_segments)}</strong></div><small>{selectedJob.processed_segments ?? selectedJob.next_ordinal} / {selectedJob.total_segments ?? "—"} 段</small></div><div className="job-progress-track"><span style={{ width: String(Math.min(100, Math.round(((selectedJob.processed_segments ?? selectedJob.next_ordinal) / Math.max(1, selectedJob.total_segments || 1)) * 100))) + "%" }} /></div><div className="job-metrics"><span><b>{selectedJob.batch_count || 0}</b> 批</span><span><b>{formatTokens(selectedJob.total_tokens)}</b> token</span><span><b>{formatTokens(selectedJob.reasoning_tokens)}</b> 推理</span>{Boolean(selectedJob.model_call_count) && <span><b>{selectedJob.model_call_count}</b> 已记录请求</span>}{Boolean(selectedJob.retry_call_count) && <span><b>{selectedJob.retry_call_count}</b> 重试</span>}{Boolean(selectedJob.repair_call_count) && <span><b>{selectedJob.repair_call_count}</b> 结构修复</span>}{Boolean(selectedJob.review_call_count) && <span><b>{selectedJob.review_call_count}</b> 统稿</span>}{Boolean(selectedJob.minimal_prompt_call_count) && <span><b>{selectedJob.minimal_prompt_call_count}</b> 极简</span>}{Boolean(selectedJob.deferred_segments) && <span><b>{selectedJob.deferred_segments}</b> 隔离待复核</span>}<span><b>{formatDuration(selectedJob.eta_seconds)}</b> 预计剩余</span></div><p>{`单段隔离、${selectedJob.recipe.concurrency || 3}→${selectedJob.recipe.max_concurrency || selectedJob.recipe.concurrency || 3} 路自适应并发；异常段不会覆盖正文。`}</p>{selectedJob.last_error && <div className="job-progress-error">{selectedJob.last_error}</div>}<div className="job-controls">{selectedJob.status === "running" && <button onClick={() => void controlJob(selectedJob, "pause")}>暂停</button>}{(selectedJob.status === "paused" || selectedJob.status === "failed") && selectedDocument && <button className="accent" onClick={() => void runWholeBook(selectedDocument, selectedJob.recipe.segment_ranges || [])}>继续</button>}{!["completed", "cancelled"].includes(selectedJob.status) && <button className="danger" onClick={() => void controlJob(selectedJob, "cancel")}>取消任务</button>}</div></div>}</details>}
 
-        {overview && overview.document.id === selectedDocumentId && ["translate", "reader", "quality"].includes(panel) && <><div className="eyebrow section-label">
+        {overview && overview.document.id === selectedDocumentId && ["translate", "reader", "quality"].includes(panel) && !(panel === "reader" && overview.document.source_format === "pdf") && <><div className="eyebrow section-label">
           <span>目录</span><small>{overview.chapters.length} 节</small></div><div className="chapter-list real-chapters">{overview.chapters.map((chapter, index) => <button key={chapter.id} data-level={chapter.level} style={{ paddingLeft: `${9 + Math.min(chapter.level, 3) * 12}px` }} className={`chapter ${currentChapter?.id === chapter.id ? "active" : ""}`}
           aria-current={currentChapter?.id === chapter.id ? "location" : undefined} disabled={panel === "reader" && readerLoading}
           onClick={() => { if (panel === "reader") jumpToReaderChapter(chapter); else void navigateTo(chapter.start_ordinal, chapter.id); }}
@@ -1449,7 +1465,10 @@ export default function Home() {
             <strong>{currentChapter?.title || (epubReader ? `${epubReader.spine.filter((item) => item.linear).length} 个书脊文档` : `${readerSegments.length} 段`)}</strong></div>
             <div className="reader-toolbar-actions">{overview?.document.source_format === "pdf" && <button className="pdf-page-link" onClick={() => setPdfSource({ documentId: overview.document.id, title: overview.document.title, page: pdfPages(readerSegments.find((segment) => segment.ordinal === readerOrdinal)?.source_refs)[0] || 1 })}>查看 PDF 原页 ↗</button>}
               {epubReader?.spine.some((item) => item.fixed_layout) && <div className="segmented" aria-label="定版 EPUB 排版策略"><button className={readerLayout === "faithful" ? "active" : ""} onClick={() => changeReaderLayout("faithful")}>忠实排版</button><button className={readerLayout === "comfort" ? "active" : ""} onClick={() => changeReaderLayout("comfort")}>舒适阅读</button></div>}<div className="segmented" aria-label="显示"><button className={readerMode === "original" ? "active" : ""} onClick={() => changeReaderMode("original")}>原文</button><button className={readerMode === "translated" ? "active" : ""} onClick={() => changeReaderMode("translated")}>译文</button><button className={readerMode === "bilingual" ? "active" : ""} onClick={() => changeReaderMode("bilingual")}>双语</button></div></div></div>
-          {readerLoading ? <div className="empty-workspace">正在准备原书资源…</div> : overview?.document.source_format === "pdf" ? <PdfLayoutReader key={`${overview.document.id}-${readerMode}`} apiBase={API_BASE} documentId={overview.document.id} page={pdfReaderPage} mode={readerMode} onPage={(number) => { rememberChapter(null); setPdfReaderPage(number); const segment = readerSegments.find((item) => pdfPages(item.source_refs).includes(number)); if (segment) setReaderOrdinal(segment.ordinal); }} /> : epubReader ? <div className={`epub-reader-stack layout-${readerLayout}`}>{epubReader.cover_url && <section className="epub-cover-sheet"><img src={API_BASE + epubReader.cover_url} alt={`《${overview?.document.title || "EPUB"}》封面`} /></section>}
+          {readerLoading ? <div className="empty-workspace">正在准备原书资源…</div> : overview?.document.source_format === "pdf" ? <PdfLayoutReader key={overview.document.id} apiBase={API_BASE} documentId={overview.document.id} title={overview.document.title} page={pdfReaderPage} mode={readerMode}
+            chapters={overview.chapters.map((chapter) => ({ id: chapter.id, title: chapter.title, level: chapter.level, page: chapter.target?.page || pdfPages(readerSegments.find((item) => item.ordinal === chapter.start_ordinal)?.source_refs)[0] || 1 }))}
+            footnotes={readerSegments.filter((item) => item.kind === "footnote").map((item) => ({ id: item.id, text: item.source_text, page: pdfPages(item.source_refs)[0] || 1 }))}
+            onMode={changeReaderMode} onChapter={rememberChapter} onPage={(number) => { rememberChapter(null); setPdfReaderPage(number); const segment = readerSegments.find((item) => pdfPages(item.source_refs)[0] === number) || readerSegments.find((item) => pdfPages(item.source_refs).includes(number)); if (segment) setReaderOrdinal(segment.ordinal); }} /> : epubReader ? <div className={`epub-reader-stack layout-${readerLayout}`}>{epubReader.cover_url && <section className="epub-cover-sheet"><img src={API_BASE + epubReader.cover_url} alt={`《${overview?.document.title || "EPUB"}》封面`} /></section>}
             {epubReader.spine.filter((item) => item.linear).map((item, index) =>
               <section id={`reader-spine-${item.spine_index}`} data-reader-ordinal={readerOrdinalForSpine(item.spine_index)} data-reader-page={index + 1} className={`epub-spine-sheet ${item.fixed_layout ? "fixed-layout" : "reflowable"}`} key={item.spine_index}>
                 <iframe title={`${overview?.document.title || "EPUB"} · 第 ${index + 1} 页 · ${item.path}`}

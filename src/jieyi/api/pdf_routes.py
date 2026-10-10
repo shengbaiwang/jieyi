@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import time
 from collections import OrderedDict
 from dataclasses import asdict
@@ -14,6 +15,7 @@ from fastapi import HTTPException, Query, Request, Response
 from jieyi.domain.models import new_id
 from jieyi.ingestion.pdf import GEOMETRY_VERSION, extract_pdf, render_pdf_page
 from jieyi.ingestion.pdf_export import compose_pdf, ensure_pdf_layout
+from jieyi.ingestion.pdf_reading import pdf_page_interactions, pdf_page_text, pdf_search_pages
 from jieyi.workflow.services import create_pdf_document
 
 MAX_BYTES = 128 * 1024 * 1024
@@ -36,6 +38,10 @@ def install_pdf_routes(app, store):
     app.state.pdf_tasks = tasks
     parsing = asyncio.Semaphore(2)
     images: OrderedDict = OrderedDict()
+    search_indexes: OrderedDict = OrderedDict()
+    indexing: dict[str, asyncio.Task] = {}
+    text_pages: OrderedDict = OrderedDict()
+    interactions: OrderedDict = OrderedDict()
     pending: dict[tuple, asyncio.Task] = {}
     rendering = asyncio.Semaphore(2)
 
@@ -189,7 +195,7 @@ def install_pdf_routes(app, store):
                 layout = ensure_pdf_layout(store, document_id)
                 source, report = compose_pdf(source, layout, segments, only_page=page_number, deleted_segments=deleted)
                 number = 1
-            return render_pdf_page(source, number, width), report
+            return render_pdf_page(source, number, width), report, (source if mode == "translated" else b""), number
 
         async def render():
             try:
@@ -222,7 +228,7 @@ def install_pdf_routes(app, store):
         width: int = Query(default=1200, ge=320, le=1800),
         mode: str = Query(default="original", pattern="^(original|translated)$"),
     ):
-        image, report = await page_variant(document_id, page_number, width, mode)
+        image, report, _, _ = await page_variant(document_id, page_number, width, mode)
         return Response(
             image,
             media_type="image/png",
@@ -235,5 +241,97 @@ def install_pdf_routes(app, store):
 
     @app.get("/documents/{document_id}/pdf/pages/{page_number}/translation-notes")
     async def page_notes(document_id: str, page_number: int):
-        _, report = await page_variant(document_id, page_number, 1200, "translated")
+        _, report, _, _ = await page_variant(document_id, page_number, 1200, "translated")
         return report
+
+
+    @app.get("/documents/{document_id}/pdf/pages/{page_number}/text")
+    async def page_text(
+        document_id: str, page_number: int,
+        mode: str = Query(default="original", pattern="^(original|translated)$"),
+    ):
+        metadata = store.get_pdf_metadata(document_id)
+        if not 1 <= page_number <= len(metadata["pages"]):
+            raise HTTPException(404, "PDF 页码超出范围")
+        if mode == "translated":
+            _, _, source, number = await page_variant(document_id, page_number, 1200, mode)
+        else:
+            source, number = store.get_original_pdf(document_id), page_number
+        key = (document_id, page_number, mode, hashlib.sha256(source).hexdigest())
+        if key not in text_pages:
+            async with rendering:
+                text_pages[key] = await asyncio.to_thread(pdf_page_text, source, number)
+            while len(text_pages) > 24:
+                text_pages.popitem(last=False)
+        text_pages.move_to_end(key)
+        result = {"page": page_number, "mode": mode, **text_pages[key]}
+        # Original destinations cannot be laid over reflowed translation geometry.
+        if mode == "original":
+            link_key = (document_id, page_number)
+            if link_key not in interactions:
+                interactions[link_key] = await asyncio.to_thread(
+                    pdf_page_interactions, source, page_number,
+                )
+                while len(interactions) > 24:
+                    interactions.popitem(last=False)
+            result.update(interactions[link_key])
+        else:
+            result.update(links=[], annotations=[])
+        return result
+
+    @app.get("/documents/{document_id}/pdf/search")
+    async def search(
+        document_id: str, q: str = Query(min_length=1, max_length=500),
+        mode: str = Query(default="original", pattern="^(original|translated)$"),
+        offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100),
+    ):
+        store.get_pdf_metadata(document_id)
+        query = q.strip()
+        if not query:
+            raise HTTPException(422, "请输入搜索文字")
+        # Whitespace follows PDF line breaks; user text is always a literal query.
+        pattern = re.compile(r"\s+".join(re.escape(part) for part in query.split()), re.IGNORECASE)
+        if mode == "original":
+            if document_id not in search_indexes:
+                async def build_index():
+                    try:
+                        async with parsing:
+                            result = await asyncio.to_thread(
+                                pdf_search_pages, store.get_original_pdf(document_id),
+                            )
+                        search_indexes[document_id] = result
+                        while len(search_indexes) > 3:
+                            search_indexes.popitem(last=False)
+                        return result
+                    finally:
+                        indexing.pop(document_id, None)
+                if document_id not in indexing:
+                    task = asyncio.create_task(build_index())
+                    indexing[document_id] = task
+                    tasks.add(task)
+                    task.add_done_callback(tasks.discard)
+                pages = await asyncio.shield(indexing[document_id])
+            else:
+                search_indexes.move_to_end(document_id)
+                pages = search_indexes[document_id]
+        else:
+            pages = []
+            for segment in store.list_segments(document_id):
+                text = (segment.accepted_translation or segment.reviewed_translation
+                        or segment.edited_translation or segment.machine_translation
+                        or segment.source_text)
+                page_refs = [int(ref.split(":")[2]) for ref in segment.source_refs
+                             if re.fullmatch(r"pdf:page:\d+", ref)]
+                pages.append({"page": page_refs[0] if page_refs else 1, "text": text})
+        results, total = [], 0
+        for item in pages:
+            for match in pattern.finditer(item["text"]):
+                if offset <= total < offset + limit:
+                    start, end = match.span()
+                    results.append({"page": item["page"], "quote": match.group(),
+                                    "snippet": item["text"][max(0, start - 70):end + 100],
+                                    "start": len(item["text"][:start].encode("utf-16-le")) // 2,
+                                    "end": len(item["text"][:end].encode("utf-16-le")) // 2,
+                                    "mode": mode})
+                total += 1
+        return {"results": results, "total": total, "offset": offset, "limit": limit}

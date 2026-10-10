@@ -285,6 +285,17 @@ PDF 与其他书稿共用单段/选章/全书草译、术语、人工校对、�
 仍可单独导出纯文本。中文排版嵌入本机中文字体；macOS 自动使用黑体，
 其他系统可通过 `JIEYI_PDF_FONT` 指定可嵌入的中文 TTF/TTC 字体。
 
+PDF 阅读工具提供可折叠的章节层级目录、原文与译文全文搜索、原页选文复制、
+原书内部链接与批注，以及个人书签、高亮和笔记汇总。点击搜索结果、目录、书签、
+笔记或原书内部链接后，可用“返回正文”回到跳转前的页面位置。
+`Ctrl/Cmd+F` 或顶部全文搜索按钮打开 PDF 搜索，结果分批展示并标出页内匹配文字。
+选中文字后可复制、选择高亮颜色并写笔记；笔记按页码汇总，可编辑、删除或导出 Markdown。
+译文修改后，高亮会尝试按唯一的原选文重新定位；无法准确定位时保留选文和笔记供核对。
+
+阅读位置会保存到具体页内位置，再次打开本书自动续读。个人书签可命名、修改和删除。
+这些个人阅读记录按书籍保存在当前浏览器中，不会写入原 PDF；清除浏览器数据会删除记录，
+需要保留的笔记可先导出 Markdown。
+
 扫描版须先做 OCR；混合文件会提示文字较少的页数，保留原页供核对。
 复杂表格、多栏和脚注的文字顺序仍需要人工核查，工作台支持编辑与拆并段。
 
@@ -294,6 +305,9 @@ API：`POST /imports/pdf/inspect` 接收原始 PDF 字节并返回解析 ID，
 `GET /documents/{id}/pdf` 返回目录和页码元数据，
 `GET /documents/{id}/pdf/pages/{page}` 返回静态原页（`mode=translated` 返回译页），
 `GET /documents/{id}/pdf/original` 下载原件。
+`GET /documents/{id}/pdf/pages/{page}/text?mode=original|translated` 返回页面文字、位置和内部链接，
+`GET /documents/{id}/pdf/search?q=关键词&mode=original|translated&offset=0&limit=50`
+返回全书匹配总数与分页搜索结果。
 
 ### 译文输出验收
 
