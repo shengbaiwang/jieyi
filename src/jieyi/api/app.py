@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from jieyi.api.pdf_routes import install_pdf_routes
 from jieyi.api.term_routes import install_term_routes
+from jieyi.api.text_routes import install_text_routes
 from jieyi.domain.models import (
     DEFAULT_TOKEN_BUDGET,
     JobStatus,
@@ -40,7 +41,7 @@ from jieyi.ingestion.epub_reader import (
     safe_resource,
 )
 from jieyi.ingestion.epub_roundtrip import parse_epub_archive
-from jieyi.ingestion.pdf_export import export_translated_pdf
+from jieyi.ingestion.pdf_export_cache import PDFExportCache
 from jieyi.persistence.execution import DocumentBusyError
 from jieyi.persistence.sqlite import NotFoundError, SQLiteStore
 from jieyi.providers import EchoProvider, OpenAICompatibleProvider, ProviderRegistry
@@ -269,6 +270,7 @@ def _provider_registry(settings_store: LocalSettingsStore) -> ProviderRegistry:
 def create_app(db_path: str | None = None, settings_path: str | None = None) -> FastAPI:
     resolved_db_path = db_path or os.getenv("JIEYI_DB", "jieyi.db")
     store = SQLiteStore(resolved_db_path)
+    pdf_exports = PDFExportCache()
     store.migrate()
     reindex_all_quality(store)
     store.pause_interrupted_jobs()
@@ -386,6 +388,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return asdict(document)
 
+    install_text_routes(app, providers, settings_store)
     install_pdf_routes(app, store)
 
     @app.post("/projects/{project_id}/documents/epub", status_code=201)
@@ -1088,7 +1091,7 @@ def create_app(db_path: str | None = None, settings_path: str | None = None) -> 
             )
         if format == "book" and document.source_format == "pdf":
             try:
-                content = await asyncio.to_thread(export_translated_pdf, store, document_id,
+                content = await asyncio.to_thread(pdf_exports.export, store, document_id,
                                                   bilingual=bilingual)
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc

@@ -200,6 +200,8 @@ class TranslationEngine:
                     final.text,
                     terms,
                     segment_kind=segment.kind,
+                    source_lang=project.source_lang,
+                    target_lang=project.target_lang,
                 )
                 committed = self.store.commit_generated_translation(
                     job=job, segment=segment, text=final.text, issues=final_issues,

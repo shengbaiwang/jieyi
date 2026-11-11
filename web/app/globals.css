@@ -373,6 +373,18 @@ nav { display: grid; gap: 3px; }
 .translation-pane textarea:focus-visible { outline: 0; }
 .editor-footer { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; align-items: center; padding-top: 20px; color: var(--muted); font-size: 9.5px; }
 .editor-footer-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+.redraft-controls { width: 100%; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.redraft-controls > label, .redraft-model { min-width: 0; display: grid; gap: 5px; }
+.redraft-connection { flex: 1 1 105px; }
+.redraft-model { flex: 2 1 160px; }
+.redraft-compute { flex: 0 0 76px; }
+.redraft-controls select { width: 100%; min-width: 0; min-height: 31px; border: 1px solid var(--line); border-radius: 7px; padding: 0 7px; color: var(--text); background: var(--panel); font-size: 10.5px; }
+.redraft-controls select:disabled, .redraft-controls .model-select > button:disabled { opacity: .5; }
+.redraft-controls .model-select-pop { top: auto; bottom: calc(100% + 5px); width: min(320px, calc(100vw - 60px)); }
+.redraft-controls .model-select-list > button { overflow-wrap: anywhere; }
+.redraft-controls > button { min-height: 31px; }
+.redraft-controls > small { flex-basis: 100%; font-size: 9px; }
+
 .segment-draft-button { min-height: 27px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--blue-soft); color: var(--accent-text); font-size: 10.5px; font-weight: 620; white-space: nowrap; }
 .segment-draft-button:hover:not(:disabled) { border-color: var(--blue); }
 .segment-draft-button:disabled { opacity: .45; }
@@ -673,6 +685,7 @@ nav { display: grid; gap: 3px; }
   .editor-columns { grid-template-columns: 1fr; }
   .editor-columns .source-pane { display: none; }
   .translation-pane { border-left: 0 !important; }
+  .redraft-controls .model-select-pop { width: 100%; }
   .titlebar-actions .icon-button:first-child kbd { display: none; }
   .titlebar-actions .icon-button:nth-child(2) { display: none; }
   .library-view { padding: 30px 22px; }

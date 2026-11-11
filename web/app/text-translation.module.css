@@ -1,0 +1,71 @@
+.page { min-width: 0; overflow: auto; background: var(--panel); padding: 38px clamp(22px, 3.5vw, 54px); }
+.page[hidden] { display: none; }
+.form { max-width: 1120px; margin: 0 auto; }
+.heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 30px; }
+.heading h1 { margin: 7px 0 9px; color: var(--text-strong); font-size: 28px; font-weight: 650; letter-spacing: -.045em; }
+.heading p { margin: 0; color: var(--muted); font-size: 13px; }
+.headingMark { display: flex; align-items: center; gap: 10px; color: var(--accent-text); font-family: Georgia, "Songti SC", serif; font-size: 34px; }
+.headingMark span { font: 20px -apple-system, sans-serif; color: var(--muted); }
+.options { border: 0; padding: 0; margin: 0 0 22px; min-width: 0; }
+.modelRow { display: flex; gap: 12px; align-items: end; }
+.modelRow label { display: flex; flex-direction: column; gap: 7px; min-width: 0; flex: 1; }
+.modelRow label.modelField { flex: 2; }
+.modelRow label > span, .styleRow > span { color: var(--muted); font-size: 11px; }
+.modelRow input, .modelRow select { width: 100%; height: 38px; border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; background: var(--paper); font-size: 12px; }
+.modelRow input { text-overflow: ellipsis; }
+.styleRow { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 18px; }
+.styleRow > div { display: flex; flex-wrap: wrap; gap: 6px; }
+.styleRow button { border: 1px solid transparent; padding: 7px 12px; border-radius: 7px; background: var(--surface-subtle); font-size: 12px; }
+.styleRow button:hover { background: var(--surface-hover); }
+.styleRow button.selected { color: var(--accent-text); border-color: var(--blue-soft); background: var(--blue-soft); }
+.customStyle { margin-left: auto; color: var(--muted); font-size: 12px; }
+.customStyle summary { cursor: pointer; padding: 7px 0; }
+.customStyle[open] { flex-basis: 100%; margin-left: 0; }
+.customStyle label { display: block; margin: 8px 0; }
+.customStyle textarea { display: block; width: 100%; min-height: 90px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); resize: vertical; line-height: 1.7; }
+.configHint { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; padding: 12px 14px; background: var(--blue-soft); border-radius: 8px; color: var(--info-text); font-size: 12px; }
+.configHint button { flex-shrink: 0; color: var(--accent-text); padding: 4px; background: transparent; border: 0; }
+.workspace { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); border: 1px solid var(--line); border-radius: 14px; background: var(--paper); box-shadow: 0 3px 18px rgba(30, 40, 60, .025); overflow: hidden; }
+.column { display: flex; flex-direction: column; min-width: 0; }
+.target { border-left: 1px solid var(--line); background: var(--surface-subtle); }
+.columnHeader { display: flex; justify-content: space-between; align-items: center; min-height: 62px; margin: 0 24px; border-bottom: 1px solid var(--line); gap: 8px; }
+.columnHeader label { display: flex; align-items: center; gap: 9px; font-size: 12px; }
+.columnHeader label > span { color: var(--muted); font-size: 11px; }
+.columnHeader select { max-width: 140px; border: 0; background: transparent; padding: 6px 3px; font-weight: 550; }
+.columnHeader select option { background: var(--paper); }
+.columnHeader button, .columnFooter button { border: 0; padding: 6px; border-radius: 6px; background: transparent; color: var(--muted); font-size: 11px; }
+.columnHeader button:hover, .columnFooter button:hover { background: var(--surface-hover); color: var(--accent-text); }
+.editor { display: block; width: 100%; min-height: clamp(280px, 37vh, 440px); flex: 1; padding: 24px; border: 0; border-radius: 0; background: transparent; resize: vertical; font-size: 15px; line-height: 1.95; letter-spacing: .01em; }
+.editor::placeholder { font-size: 14px; }
+.editor:focus-visible { outline: 2px solid var(--blue-soft); outline-offset: -2px; }
+.columnFooter { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 42px; padding: 0 24px 9px; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.swap { position: absolute; top: 17px; left: 50%; transform: translateX(-50%); display: grid; place-items: center; height: 28px; width: 28px; padding: 0; border: 1px solid var(--line); border-radius: 50%; color: var(--icon); background: var(--paper); z-index: 1; }
+.swap:hover { color: var(--accent-text); border-color: var(--blue); }
+.actions { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-top: 18px; }
+.feedback { min-width: 0; color: var(--muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
+.error { color: var(--danger-text); }
+.translate, .stop { display: flex; align-items: center; justify-content: center; flex-shrink: 0; gap: 22px; min-height: 40px; padding: 0 18px; border: 0; border-radius: 8px; background: var(--blue-solid); color: var(--on-accent); font-size: 12px; font-weight: 600; }
+.translate:hover { filter: brightness(1.08); }
+.translate span { font-size: 17px; }
+.stop { background: var(--surface-active); color: var(--text); }
+.page button { cursor: pointer; }
+.page button:disabled { opacity: .4; cursor: default; }
+.page input:disabled, .page textarea:disabled, .page select:disabled { opacity: .7; }
+.srOnly { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@media (max-width: 1000px) { .page { padding: 26px 22px; } .columnHeader { margin: 0 16px; } .editor { padding: 20px 16px; } .columnFooter { padding-left: 16px; padding-right: 16px; } }
+@media (max-width: 720px) {
+  .page { padding: 24px 16px; }
+  .heading { margin-bottom: 24px; }
+  .heading h1 { font-size: 25px; }
+  .headingMark { font-size: 28px; }
+  .modelRow { flex-wrap: wrap; }
+  .modelRow label { flex: 1 1 35%; }
+  .modelRow label.modelField { flex: 1 1 100%; order: 2; }
+  .styleRow { gap: 8px; }
+  .styleRow button { padding: 8px 10px; }
+  .workspace { grid-template-columns: minmax(0, 1fr); }
+  .target { border-left: 0; border-top: 1px solid var(--line); }
+  .swap { top: 50%; left: auto; right: 12px; transform: translateY(-50%); }
+  .editor { min-height: 230px; resize: none; }
+  .actions { align-items: flex-start; }
+}

@@ -521,6 +521,7 @@ async def _translate_segment(
         text = restored[segment.id]
         issues = run_deterministic_checks(
             segment.source_text, text, terms_by_id[segment.id], segment_kind=segment.kind,
+            source_lang=project.source_lang, target_lang=project.target_lang,
         )
         if not engine.store.commit_generated_translation(
             job=job, segment=segment, text=text, issues=issues,
@@ -601,12 +602,15 @@ def _record_deferred_segment(
     engine.store.record_provider_failure(segment.id, payload)
 
     visible = _visible_translation(segment)
+    project = engine.store.get_project_for_document(segment.document_id)
     issues = (
         run_deterministic_checks(
             segment.source_text,
             visible,
             terms,
             segment_kind=segment.kind,
+            source_lang=project.source_lang,
+            target_lang=project.target_lang,
         )
         if visible
         else []
@@ -872,6 +876,8 @@ async def _run_cohesion_group(
         issues = run_deterministic_checks(
             current.source_text, restored_value, terms_by_id[segment.id],
             segment_kind=current.kind,
+            source_lang=project.source_lang,
+            target_lang=project.target_lang,
         )
         if any(issue.code == "approved_term_missing" for issue in issues):
             skipped += 1

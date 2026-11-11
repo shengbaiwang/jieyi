@@ -4,7 +4,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { PdfLayoutReader } from "./pdf-layout-reader";
 import { parsePdfReadingState, pdfReadingKey } from "./pdf-reading";
 import { PdfSourcePanel, pdfPages } from "./pdf-source-panel";
-import { ImportBookPanel, ProviderSettingsPanel } from "./setup-panels";
+import { ImportBookPanel, ModelSelect, ProviderSettingsPanel } from "./setup-panels";
 import { TermDiscoveryPanel } from "./term-discovery-panel";
 import { TerminologyReviewPanel } from "./terminology-review-panel";
 import { createReaderNavigation, type ReaderPageTarget } from "./reader-navigation";
@@ -13,13 +13,15 @@ import { createSubmissionGate } from "./submission-gate";
 import { SourceEditor } from "./source-editor";
 import { sourceSelectionOffsets } from "./source-editing";
 import { ModelComparePanel } from "./model-compare-panel";
+import { TextTranslationPanel } from "./text-translation-panel";
+import { STYLE_PRESETS } from "./translation-styles";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
 const PAGE_SIZE = 120;
 
 type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ComputeMode = "economy" | "balanced" | "performance";
-type Panel = "library" | "translate" | "reader" | "terms" | "quality" | "import" | "settings" | "export";
+type Panel = "text" | "library" | "translate" | "reader" | "terms" | "quality" | "import" | "settings" | "export";
 type ViewMode = "split" | "target";
 type Project = { id: string; name: string; source_lang: string; target_lang: string; style_guide: string };
 type Document = { id: string; project_id: string; title: string; source_format: string; created_at: string; cover_url: string | null };
@@ -120,12 +122,6 @@ function statusLabel(segment: Segment | null) { return segment?.status === "huma
 function jobStatusLabel(status: Job["status"], deferredSegments = 0) { if (status === "completed" && deferredSegments > 0) return `已结束 · ${deferredSegments} 段未成功`; return ({ pending: "等待中", running: "运行中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" } as const)[status]; }
 function formatTokens(value = 0) { return value >= 1_000_000 ? (value / 1_000_000).toFixed(2) + "M" : value >= 1_000 ? (value / 1_000).toFixed(1) + "K" : String(value); }
 function formatDuration(value?: number | null) { if (value == null) return "测算中"; if (value < 60) return Math.max(1, Math.round(value)) + " 秒"; const minutes = Math.round(value / 60); return minutes < 60 ? minutes + " 分钟" : Math.floor(minutes / 60) + " 小时 " + (minutes % 60) + " 分"; }
-const STYLE_PRESETS = [
-  { id: "academic", label: "学术严谨", guide: "忠实原意，保持严谨、克制的学术表达；统一核心概念译法，保留引文、脚注、专名及论证层次。" },
-  { id: "literary", label: "文学自然", guide: "准确传达原意与人物声调，译文自然流畅并保留文学节奏、意象与修辞；避免生硬直译。" },
-  { id: "popular", label: "通俗易读", guide: "在不损失关键信息的前提下使用清晰、自然、易读的现代语言；必要术语首次出现时给出简短说明。" },
-  { id: "faithful", label: "忠实直译", guide: "尽量贴近原文句法、措辞和段落结构，不擅自增删或改写；歧义处保留原文的开放性。" },
-];
 function defaultBookSettings(settings: ProviderSettings): BookTranslationSettings {
   return {
     draft_profile_id: settings.draft_profile_id,
@@ -195,6 +191,7 @@ export default function Home() {
   const [jobsDocumentId, setJobsDocumentId] = useState("");
   const [settings, setSettings] = useState<ProviderSettings | null>(null);
   const [bookSettings, setBookSettings] = useState<Record<string, BookTranslationSettings>>({});
+  const [redraftSettings, setRedraftSettings] = useState<Record<string, BookTranslationSettings>>({});
   const [bookSettingsEditor, setBookSettingsEditor] = useState<BookSettingsEditor | null>(null);
   const [savingBookSettings, setSavingBookSettings] = useState(false);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
@@ -280,8 +277,13 @@ export default function Home() {
     else localStorage.removeItem(key);
     localStorage.setItem(`jieyi.ordinal.${overview.document.id}`, String(panel === "reader" ? readerOrdinal : ordinal));
   }, [currentChapter, loading, readerLoading, overview, selectedDocumentId, panel, readerOrdinal, ordinal]);
-  const currentIssues = useMemo(() => issues.filter((item) => item.segment_id === currentSegment?.id), [currentSegment, issues]);
-  const errorIssues = useMemo(() => issues.filter((item) => item.severity === "error"), [issues]);
+  const currentIssues = useMemo(() => currentSegment?.status === "human_confirmed"
+    ? [] : issues.filter((item) => item.segment_id === currentSegment?.id), [currentSegment, issues]);
+  const errorIssues = useMemo(() => {
+    const pendingIds = new Set(humanReviewQueue.map((item) => item.segment_id));
+    const confirmedIds = new Set(page?.items.filter((item) => item.status === "human_confirmed").map((item) => item.id));
+    return issues.filter((item) => item.severity === "error" && pendingIds.has(item.segment_id) && !confirmedIds.has(item.segment_id));
+  }, [issues, humanReviewQueue, page]);
   const currentErrorIssues = useMemo(() => currentIssues.filter((item) => item.severity === "error"), [currentIssues]);
   const currentWarningIssues = useMemo(() => currentIssues.filter((item) => item.severity === "warning"), [currentIssues]);
   const pendingTermSegments = new Set(issues.filter((item) => item.code === "terminology_pending").map((item) => item.segment_id)).size;
@@ -315,6 +317,12 @@ export default function Home() {
       ? { prompt: latestCandidate.prompt_tokens, completion: latestCandidate.completion_tokens, cost: latestCandidate.cost_usd, task: false }
       : null;
   const currentDocumentBusy = jobsDocumentId === overview?.document.id && jobs.some((job) => job.status === "pending" || job.status === "running");
+  const redraftConfig = overview && settings
+    ? redraftSettings[overview.document.id] || bookSettings[overview.document.id] || defaultBookSettings(settings)
+    : null;
+  const redraftProfile = settings?.profiles.find((profile) => profile.id === redraftConfig?.draft_profile_id);
+  const redraftBlocked = Boolean(segmentDraft) || startingTask || currentDocumentBusy || saveState === "saving";
+  const canRedraft = Boolean(redraftProfile?.base_url && redraftConfig?.draft_model.trim());
   const hasCurrentTranslation = Boolean(translation.trim() || segmentTranslation(currentSegment).trim());
   const structureLocked = structureBusy || draftDirty || saveState === "saving" || sourceDirty || sourceSaveState === "saving" || Boolean(segmentDraft);
   const completion = overview?.segment_count ? Math.round((overview.confirmed_count / overview.segment_count) * 100) : 0;
@@ -327,6 +335,11 @@ export default function Home() {
 
   function settingsForBook(documentId: string, providerSettings: ProviderSettings): BookTranslationSettings {
     return bookSettings[documentId] || defaultBookSettings(providerSettings);
+  }
+
+  function updateRedraftSettings(patch: Partial<BookTranslationSettings>) {
+    if (!overview || !redraftConfig) return;
+    setRedraftSettings((current) => ({ ...current, [overview.document.id]: { ...redraftConfig, ...patch } }));
   }
 
   function openBookSettings(document: Document) {
@@ -1177,7 +1190,9 @@ export default function Home() {
   }
 
   async function redraftCurrentSegment() {
-    if (!overview || !currentSegment || segmentDraft || startingTask || currentDocumentBusy || saveState === "saving") return;
+    if (!overview || !currentSegment || redraftBlocked) return;
+    if (!canRedraft || !redraftConfig) { notify("请先选择重新翻译使用的连接与模型。"); return; }
+    const translationSettings = { ...redraftConfig, draft_model: redraftConfig.draft_model.trim() };
     if (draftDirty) {
       try { await saveDraftImmediately(); }
       catch { notify("当前译文保存失败，已停留在本段。"); return; }
@@ -1191,8 +1206,8 @@ export default function Home() {
       setPage((current) => current ? { ...current, items: current.items.map((item) => item.id === cleared.id ? cleared : item) } : current);
       setTranslation("");
       setDraftDirty(false);
-      notify(`正在重新翻译第 ${target.ordinal + 1} 段。`);
-      const job = await runWholeBook(overview.document, [[target.ordinal, target.ordinal]], { silent: true });
+      notify(`正在用 ${translationSettings.draft_model} 重新翻译第 ${target.ordinal + 1} 段。`);
+      const job = await runWholeBook(overview.document, [[target.ordinal, target.ordinal]], { silent: true, translationSettings });
       setSegmentDraft(job ? { ...target, jobId: job.id } : null);
       if (!job) setSegmentDraft(null);
     } catch (error) {
@@ -1215,7 +1230,7 @@ export default function Home() {
     }
   }
 
-  async function runWholeBook(document: Document, segmentRanges: [number, number][] = [], options: { silent?: boolean } = {}) {
+  async function runWholeBook(document: Document, segmentRanges: [number, number][] = [], options: { silent?: boolean; translationSettings?: BookTranslationSettings } = {}) {
     const release = taskSubmission.current.acquire();
     if (!release) return;
     setStartingTask(true);
@@ -1224,7 +1239,7 @@ export default function Home() {
       const singleOrdinal = normalizedRanges.length === 1 && normalizedRanges[0][0] === normalizedRanges[0][1] ? normalizedRanges[0][0] : null;
       const providerSettings = settings || await api<ProviderSettings>("/settings/provider").catch(() => null);
       if (!providerSettings) { setPanel("settings"); notify("请先配置并测试草译模型。"); return; }
-      const bookConfig = settingsForBook(document.id, providerSettings);
+      const bookConfig = options.translationSettings || settingsForBook(document.id, providerSettings);
       const draftProfile = providerSettings.profiles.find((item) => item.id === bookConfig.draft_profile_id);
       if (!draftProfile?.base_url || !bookConfig.draft_model) { openBookSettings(document); notify("请先为这本书选择草译连接与模型。"); return; }
       const currentSettings: ProviderSettings = {
@@ -1391,7 +1406,7 @@ export default function Home() {
     <section className={`workspace-window ${!sidebarOpen ? "sidebar-closed" : ""} ${!inspectorOpen || panel !== "translate" ? "inspector-closed" : ""}`} aria-label="介译翻译工作台">
       <header className="titlebar">
         <div className="titlebar-start"><div className="traffic-lights" aria-hidden="true"><span className="traffic red" /><span className="traffic yellow" /><span className="traffic green" /></div><button className="icon-button sidebar-toggle" aria-label="切换侧栏" onClick={() => setSidebarOpen((value) => !value)}><Mark>▥</Mark></button></div>
-        <div className="document-title"><strong>{panel === "library" ? "我的书库" : panel === "import" ? "导入书籍" : panel === "settings" ? "模型配置" : panel === "export" ? "导出书籍" : activeDocument?.title || "介译"}</strong><span>{panel === "translate" ? currentChapter?.title || "正文" : panel === "reader" ? `原书排版阅读 · ${readerMode === "original" ? "原文" : readerMode === "translated" ? "译文" : "双语"}` : overview?.project.name || "本地翻译工作台"}</span></div>
+        <div className="document-title"><strong>{panel === "text" ? "文本翻译" : panel === "library" ? "我的书库" : panel === "import" ? "导入书籍" : panel === "settings" ? "模型配置" : panel === "export" ? "导出书籍" : activeDocument?.title || "介译"}</strong><span>{panel === "text" ? "输入文字，即刻翻译" : panel === "translate" ? currentChapter?.title || "正文" : panel === "reader" ? `原书排版阅读 · ${readerMode === "original" ? "原文" : readerMode === "translated" ? "译文" : "双语"}` : overview?.project.name || "本地翻译工作台"}</span></div>
         <div className="titlebar-actions"><button className="icon-button" aria-label="全文搜索" onClick={openFullTextSearch}><Mark>⌕</Mark><kbd>⌘K</kbd></button><button className="icon-button theme-toggle" title={dark ? "切换到日间模式" : "切换到夜览模式"} aria-label={dark ? "切换到日间模式" : "切换到夜览模式"} aria-pressed={dark} onClick={changeDark}><ThemeIcon dark={dark} /></button></div>
         {latestJob?.status === "running" && <div className="title-progress indeterminate" />}
       </header>
@@ -1399,6 +1414,7 @@ export default function Home() {
       <div className="workspace-grid">
         <aside className="sidebar"><div className="sidebar-scroll"><div className="eyebrow">工作空间</div><nav aria-label="全局导航">
           <button className={`nav-item ${panel === "library" ? "active" : ""}`} onClick={() => setPanel("library")}><Mark><LibraryIcon /></Mark>书库 <b>{documents.length}</b></button>
+          <button className={`nav-item ${panel === "text" ? "active" : ""}`} onClick={() => setPanel("text")}><Mark><TranslationIcon /></Mark>文本翻译</button>
           <button className={`nav-item ${panel === "import" ? "active" : ""}`} onClick={() => setPanel("import")}><Mark>⇧</Mark>导入书籍</button>
           <button className={`nav-item ${panel === "settings" ? "active" : ""}`} onClick={() => setPanel("settings")}><Mark>⚙</Mark>模型配置</button>
         </nav>
@@ -1421,7 +1437,9 @@ export default function Home() {
             <small>{panel === "reader" && readerPageTargets[chapter.start_ordinal] ? `第 ${readerPageTargets[chapter.start_ordinal].pageNumber} 页 · ${chapter.segment_count} 段` : `${chapter.confirmed_count} 已确认 · ${chapter.segment_count} 段`}</small>
           </div>
         </button>)}</div></>}
-        </div>{overview && overview.document.id === selectedDocumentId && panel !== "library" && <div className="project-progress"><div><span>人工确认</span><strong>{completion}%</strong></div><div className="progress-track"><span style={{ width: `${completion}%` }} /></div><small>草译 {overview.translated_count} / {overview.segment_count} · {translationProgress}%</small></div>}</aside>
+        </div>{overview && overview.document.id === selectedDocumentId && ["translate", "reader", "quality", "terms", "export"].includes(panel) && <div className="project-progress"><div><span>人工确认</span><strong>{completion}%</strong></div><div className="progress-track"><span style={{ width: `${completion}%` }} /></div><small>草译 {overview.translated_count} / {overview.segment_count} · {translationProgress}%</small></div>}</aside>
+
+        <TextTranslationPanel active={panel === "text"} apiBase={API_BASE} settings={settings} onConfigure={() => setPanel("settings")} />
 
         {panel === "library" && <section className="library-view book-library">
           <div className="library-header"><div><span className="page-kicker">本机项目</span><h1>我的书库</h1><p>{documents.length ? "共 " + projects.length + " 个项目、" + documents.length + " 本书或文档。" : "导入第一本书，开始可追溯的长文本翻译。"}</p></div><button className="primary-button" onClick={() => setPanel("import")}>＋ 导入书籍</button></div>
@@ -1433,8 +1451,8 @@ export default function Home() {
           <div className="library-header"><div><span className="page-kicker">当前书籍</span><h1>导出书籍</h1><p>{selectedDocument ? `《${selectedDocument.title}》` : "请先在书库选择一本书。"}</p></div></div>
           {selectedDocument && <><fieldset className="export-options"><legend>选择导出内容</legend>
             <label aria-label="仅译文" htmlFor="export-translated" className={!exportBilingual ? "selected" : ""}><input id="export-translated" type="radio" name="book-export-mode" checked={!exportBilingual} onChange={() => setExportBilingual(false)} /><span><strong>仅译文</strong><small>只包含译文，适合连续阅读。</small></span></label>
-            <label aria-label="原文译文对照" htmlFor="export-bilingual" className={exportBilingual ? "selected" : ""}><input id="export-bilingual" type="radio" name="book-export-mode" checked={exportBilingual} onChange={() => setExportBilingual(true)} /><span><strong>原文译文对照</strong><small>逐段保留原文与译文，方便对照阅读。</small></span></label>
-          </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : selectedDocument.source_format === "pdf" ? "导出为 PDF，保留原页尺寸、图片、图表与目录；双语版逐页交替原文和译文。较长译文会在原页文字区内自适应重排。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
+            <label aria-label="原文译文对照" htmlFor="export-bilingual" className={exportBilingual ? "selected" : ""}><input id="export-bilingual" type="radio" name="book-export-mode" checked={exportBilingual} onChange={() => setExportBilingual(true)} /><span><strong>原文译文对照</strong><small>{selectedDocument?.source_format === "pdf" ? "每页左侧原文、右侧译文，方便并排对照阅读。" : "逐段保留原文与译文，方便对照阅读。"}</small></span></label>
+          </fieldset><div className="export-download"><span>导出文件名</span><strong>{exportName(selectedDocument, exportBilingual)}</strong><p>{selectedDocument.source_format === "epub" ? "导出为 EPUB，保留原书封面、目录和图片。" : selectedDocument.source_format === "markdown" ? "导出为 Markdown 文件。" : selectedDocument.source_format === "pdf" ? "导出为 PDF，保留原页版式、图片、图表与目录；双语版将原文放在左侧、对应译文放在右侧，合为一页并排阅读，两侧均保持原页大小。较长译文会在原页文字区内自适应重排。" : "导出为 TXT 文件。"}尚未翻译的段落不会自动生成译文。</p><a className="primary-button" href={`${API_BASE}/documents/${selectedDocument.id}/export?format=book&bilingual=${exportBilingual}`} download={exportName(selectedDocument, exportBilingual)}>导出书籍</a></div></>}
         </section>}
 
         {panel === "translate" && <section className="editor">{!currentSegment ? <div className="empty-workspace">{loading ? "正在加载书稿…" : overview ? "这本书已没有文段。" : "请选择一本书。"}</div> : <><div className="editor-toolbar"><div className="segment-nav"><button aria-label="上一段" disabled={ordinal === 0} onClick={() => void navigateTo(ordinal - 1)}>‹</button><span><i className={`status-dot ${currentStatus === "human_confirmed" ? "confirmed" : currentStatus === "machine_translated" ? "draft" : "source"}`} /> 第 {ordinal + 1} 段，共 {overview?.segment_count || page?.total} 段</span><button aria-label="下一段" disabled={ordinal + 1 >= (overview?.segment_count || 0)} onClick={() => void navigateTo(ordinal + 1)}>›</button><label className="ordinal-jump">跳至<input aria-label="段落编号" type="number" min={1} max={overview?.segment_count} value={ordinal + 1} onChange={(event) => void navigateTo(Number(event.target.value) - 1)} /></label></div><div className="editor-tools"><div className="segmented" aria-label="显示"><button className={view === "split" ? "active" : ""} onClick={() => setView("split")}>双语</button><button className={view === "target" ? "active" : ""} onClick={() => setView("target")}>译文</button></div><button type="button" className="compare-trigger" disabled={!currentSegment || compareBusy} onClick={() => { setCompareResults([]); setCompareOpen(true); }}>{compareBusy ? "对比中…" : "模型对比"}</button><div className="task-menu-anchor"><button className="task-trigger" aria-haspopup="menu" aria-expanded={taskMenu} disabled={!activeDocument || loading} onClick={() => setTaskMenu((value) => !value)}>{startingTask ? "正在启动…" : currentDocumentBusy ? "任务进行中" : "草译任务"} ▾</button>{taskMenu && <><div className="task-menu-backdrop" role="presentation" onMouseDown={() => setTaskMenu(false)} /><div className="task-menu" role="menu"><button role="menuitem" disabled={segmentDraft !== null || startingTask || currentDocumentBusy || hasCurrentTranslation || draftDirty || saveState === "saving"} onClick={() => { setTaskMenu(false); void draftCurrentSegment(); }}>草译当前段</button><button role="menuitem" disabled={!activeDocument || startingTask || draftPickerLoading || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void openDraftPicker(activeDocument); }}>{draftPickerLoading ? "正在读取目录…" : "草译选定篇章…"}</button><button role="menuitem" disabled={!activeDocument || startingTask || activeDraftJob?.status === "running"} onClick={() => { setTaskMenu(false); if (activeDocument) void runWholeBook(activeDocument, []); }}>草译全书</button></div></>}</div><button className={`icon-button inspector-toggle ${inspectorOpen ? "active" : ""}`} aria-label="切换检查器" onClick={() => setInspectorOpen((value) => !value)}><Mark>▧</Mark></button></div></div>
@@ -1523,7 +1541,21 @@ export default function Home() {
             <article className="translation-pane">
               <div className="column-label"><span>译文 · {overview?.project.target_lang}</span><div className={`draft-state ${currentStatus === "human_confirmed" ? "confirmed" : ""}`}><i />{statusLabel(currentSegment)}</div></div>
               <textarea aria-label="审校译文编辑器" readOnly={draftingCurrentSegment} aria-busy={draftingCurrentSegment} value={translation} onChange={(event) => { setTranslation(event.target.value); setDraftDirty(true); setSaveState("idle"); }} placeholder={draftingCurrentSegment ? "正在重新翻译…" : "编辑译文…"} spellCheck={false} />
-              <div className="editor-footer"><span>{translation.length} 字 · {draftingCurrentSegment ? "正在重新翻译…" : saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : draftDirty ? "待保存" : "已保存"}</span><div className="editor-footer-actions"><button className="segment-draft-button" onClick={() => void redraftCurrentSegment()} disabled={Boolean(segmentDraft) || startingTask || currentDocumentBusy || saveState === "saving"} aria-busy={draftingCurrentSegment}>{draftingCurrentSegment ? "翻译中…" : "重新翻译"}</button><button className="segment-draft-button" onClick={() => void stepReview(1)} disabled={!reviewQueue.length}>稍后处理</button><button className="confirm-button" onClick={() => void confirmCurrent({ advanceReview: true })} disabled={!translation.trim() || saveState === "saving" || draftingCurrentSegment}>确认并继续<kbd>⌘↵</kbd></button></div></div>
+              <div className="editor-footer">
+                {settings && redraftConfig && <div className="redraft-controls" role="group" aria-label="重新翻译设置">
+                  <label className="redraft-connection"><span>连接</span><select aria-label="重新翻译连接" value={redraftConfig.draft_profile_id} disabled={redraftBlocked} onChange={(event) => {
+                    const profileId = event.target.value;
+                    const bookConfig = settingsForBook(overview.document.id, settings);
+                    updateRedraftSettings({ draft_profile_id: profileId, draft_model: profileId === bookConfig.draft_profile_id ? bookConfig.draft_model : modelsForProfile(settings, profileId)[0] || "" });
+                  }}>{!redraftProfile && <option value={redraftConfig.draft_profile_id}>请选择连接</option>}{settings.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label>
+                  <div className="redraft-model"><span>模型</span><ModelSelect label="重新翻译模型" value={redraftConfig.draft_model} options={modelsForProfile(settings, redraftConfig.draft_profile_id)} disabled={redraftBlocked || !redraftProfile} onChange={(model) => updateRedraftSettings({ draft_model: model })} /></div>
+                  <label className="redraft-compute"><span>计算档位</span><select aria-label="重新翻译计算档位" value={redraftConfig.draft_compute_mode} disabled={redraftBlocked} onChange={(event) => updateRedraftSettings({ draft_compute_mode: event.target.value as ComputeMode })}><option value="economy">节省</option><option value="balanced">均衡</option><option value="performance">性能</option></select></label>
+                  <button className="segment-draft-button" onClick={() => void redraftCurrentSegment()} disabled={redraftBlocked || !canRedraft} aria-busy={draftingCurrentSegment}>{draftingCurrentSegment ? "翻译中…" : "重新翻译"}</button>
+                  <small>仅用于重新翻译</small>
+                </div>}
+                <span>{translation.length} 字 · {draftingCurrentSegment ? "正在重新翻译…" : saveState === "saving" ? "正在保存" : saveState === "error" ? "保存失败" : draftDirty ? "待保存" : "已保存"}</span>
+                <div className="editor-footer-actions"><button className="segment-draft-button" onClick={() => void stepReview(1)} disabled={!reviewQueue.length}>稍后处理</button><button className="confirm-button" onClick={() => void confirmCurrent({ advanceReview: true })} disabled={!translation.trim() || saveState === "saving" || draftingCurrentSegment}>确认并继续<kbd>⌘↵</kbd></button></div>
+              </div>
             </article>
           </div>
           <div className={`review-queue ${reviewQueueOpen ? "open" : "collapsed"}`}><button className="review-queue-toggle" aria-expanded={reviewQueueOpen} onClick={() => setReviewQueueOpen((value) => !value)}><span>待审队列 · {reviewQueue.length} 项{currentReviewIndex >= 0 ? ` · 当前第 ${currentReviewIndex + 1} 项` : ""}</span><Mark>{reviewQueueOpen ? "▾" : "▸"}</Mark></button>{reviewQueueOpen && <div className="issue-list">{reviewQueue.map((item, index) => <button key={item.segment_id} className={item.segment_id === currentSegment?.id ? "selected" : ""} onClick={() => void navigateTo(item.ordinal)}><i className={item.reason === "error" ? "warning-icon" : "format-icon"}>{item.reason === "error" ? "!" : "?"}</i><div><strong>{index + 1} · 第 {item.ordinal + 1} 段 · {item.reason === "error" ? "必改" : "建议复核"} · {item.issue_count} 项</strong><span>{item.source_text.slice(0, 90)}</span></div><Mark>›</Mark></button>)}</div>}</div></>}

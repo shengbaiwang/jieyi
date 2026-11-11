@@ -156,6 +156,8 @@ async def compare_segment_models(
                     restored_text,
                     prepared.terms,
                     segment_kind=segment.kind,
+                    source_lang=project.source_lang,
+                    target_lang=project.target_lang,
                 )
                 candidate_id = engine.store.record_candidate(
                     job_id=job.id,

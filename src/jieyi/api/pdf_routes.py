@@ -14,8 +14,9 @@ from fastapi import HTTPException, Query, Request, Response
 
 from jieyi.domain.models import new_id
 from jieyi.ingestion.pdf import GEOMETRY_VERSION, extract_pdf, render_pdf_page
-from jieyi.ingestion.pdf_export import compose_pdf, ensure_pdf_layout
+from jieyi.ingestion.pdf_export import PDF_LAYOUT_VERSION, compose_pdf, ensure_pdf_layout
 from jieyi.ingestion.pdf_reading import pdf_page_interactions, pdf_page_text, pdf_search_pages
+from jieyi.ingestion.typography import TYPOGRAPHY_VERSION
 from jieyi.workflow.services import create_pdf_document
 
 MAX_BYTES = 128 * 1024 * 1024
@@ -180,7 +181,7 @@ def install_pdf_routes(app, store):
             raise HTTPException(404, "PDF 页码超出范围")
         segments = store.list_segments(document_id) if mode == "translated" else []
         deleted = store.list_deleted_source_segments(document_id) if mode == "translated" else []
-        revision = (hashlib.sha256(repr((segments, deleted, GEOMETRY_VERSION)).encode()).hexdigest()
+        revision = (hashlib.sha256(repr((segments, deleted, GEOMETRY_VERSION, TYPOGRAPHY_VERSION, PDF_LAYOUT_VERSION)).encode()).hexdigest()
                     if mode == "translated" else "original")
         key = (document_id, page_number, width, mode, revision)
         if key in images:
@@ -193,7 +194,8 @@ def install_pdf_routes(app, store):
             number = page_number
             if mode == "translated":
                 layout = ensure_pdf_layout(store, document_id)
-                source, report = compose_pdf(source, layout, segments, only_page=page_number, deleted_segments=deleted)
+                source, report = compose_pdf(source, layout, segments, only_page=page_number,
+                                             deleted_segments=deleted, strict=False)
                 number = 1
             return render_pdf_page(source, number, width), report, (source if mode == "translated" else b""), number
 

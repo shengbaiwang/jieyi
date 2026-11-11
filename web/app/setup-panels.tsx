@@ -1,6 +1,7 @@
 "use client";
 
 import { DragEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { STYLE_PRESETS } from "./translation-styles";
 import { endpointPreview, modelSearch, selectedModels, uniqueModels, validBaseUrl } from "./model-config";
 
 const API_BASE = process.env.NEXT_PUBLIC_JIEYI_API || "http://127.0.0.1:8000";
@@ -142,8 +143,8 @@ async function epubApi<T>(path: string, data: ArrayBuffer, format = "epub", sign
   return payload as T;
 }
 
-function ModelSelect({ value, options, loading, disabled, onChange }: {
-  value: string; options: string[]; loading?: boolean; disabled?: boolean; onChange: (value: string) => void;
+export function ModelSelect({ value, options, loading, disabled, label = "选择模型", onChange }: {
+  value: string; options: string[]; loading?: boolean; disabled?: boolean; label?: string; onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -176,7 +177,7 @@ function ModelSelect({ value, options, loading, disabled, onChange }: {
   }
 
   return <div className="model-select" ref={root}>
-    <button type="button" ref={trigger} aria-label="选择模型" aria-haspopup="listbox" aria-expanded={open} aria-controls={listId}
+    <button type="button" ref={trigger} aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={listId}
       className={value ? "" : "empty"} disabled={disabled}
       onClick={() => { setQuery(""); setHighlighted(0); setOpen((current) => !current); }}
       onKeyDown={(event) => { if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); setHighlighted(0); setOpen(true); } }}
@@ -207,13 +208,6 @@ const COMPUTE_OPTIONS: { value: ComputeMode; label: string }[] = [
   { value: "balanced", label: "均衡" },
   { value: "performance", label: "性能" },
 ];
-
-const STYLE_PRESETS = [
-  { id: "academic", label: "学术严谨", note: "概念稳定，论证清楚", guide: "忠实原意，保持严谨、克制的学术表达；统一核心概念译法，保留引文、脚注、专名及论证层次。" },
-  { id: "literary", label: "文学自然", note: "保留声调与节奏", guide: "准确传达原意与人物声调，译文自然流畅并保留文学节奏、意象与修辞；避免生硬直译。" },
-  { id: "popular", label: "通俗易读", note: "清晰、顺畅、少术语", guide: "在不损失关键信息的前提下使用清晰、自然、易读的现代语言；必要术语首次出现时给出简短说明。" },
-  { id: "faithful", label: "忠实直译", note: "贴近句法与措辞", guide: "尽量贴近原文句法、措辞和段落结构，不擅自增删或改写；歧义处保留原文的开放性。" },
-] as const;
 
 function ComputeModeSelect({ value, disabled, probe, onChange }: {
   value: ComputeMode;

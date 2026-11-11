@@ -22,6 +22,7 @@ test("server-renders the Jieyi translation workbench", async () => {
   const html = await response.text();
   assert.match(html, /<title>介译 · 翻译工作台<\/title>/);
   assert.match(html, /我的书库/);
+  assert.match(html, /文本翻译<\/button>/);
   // The sidebar splits into a global group (always rendered) and a per-book
   // group (rendered only once a document is open, so absent from the empty SSR).
   assert.match(html, /<nav aria-label="全局导航">[\s\S]*书库 <b>[\s\S]*导入书籍<\/button>[\s\S]*模型配置<\/button>/);

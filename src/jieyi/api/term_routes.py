@@ -306,6 +306,7 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
 
         affected = []
         if term.enforcement != "reference":
+            project = store.get_project(term.project_id)
             project_terms = store.list_terms(term.project_id)
             for document in store.list_documents(term.project_id):
                 for segment in store.list_segments(document.id):
@@ -317,7 +318,8 @@ def install_term_routes(app: FastAPI, store, providers) -> None:
                     if not target:
                         continue
                     issues = run_deterministic_checks(
-                        segment.source_text, target, project_terms, segment_kind=segment.kind
+                        segment.source_text, target, project_terms, segment_kind=segment.kind,
+                        source_lang=project.source_lang, target_lang=project.target_lang,
                     )
                     affected.append(
                         {

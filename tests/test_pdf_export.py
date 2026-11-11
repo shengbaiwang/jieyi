@@ -2,9 +2,12 @@ import hashlib
 import io
 from dataclasses import replace
 
+import pdfplumber
+import pytest
 from PIL import Image, ImageChops
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject
+from pypdf.annotations import Link
+from pypdf.generic import NameObject, RectangleObject
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
@@ -87,32 +90,101 @@ def test_superscript_footnotes_remain_searchable_when_cjk_font_lacks_glyphs():
     assert "\x00" not in text
 
 
-def test_long_translation_stays_complete_on_original_page_without_appendix():
+def test_excess_translation_is_rejected_instead_of_creating_microtext():
     source, metadata, segments = fixture()
     text = "海湾沿岸的交流与历史。" * 350 + "结束标记。"
     segments[0] = replace(segments[0], machine_translation=text)
-    result, report = compose_pdf(source, metadata, segments)
-    after = PdfReader(io.BytesIO(result))
-    assert report["overflow_count"] == 0
-    assert report["reflowed_pages"] == [1]
-    assert len(after.pages) == 2
-    first_page = after.pages[0].extract_text()
-    assert "The Gulf connects" not in first_page
-    assert text in "".join(first_page.splitlines())
-    assert "These communities" in first_page
-    assert image_hashes(after) == image_hashes(PdfReader(io.BytesIO(source)))
+    with pytest.raises(ValueError, match="可读字号"):
+        compose_pdf(source, metadata, segments)
 
 
-def test_bilingual_pairs_original_and_translated_pages():
+def test_bilingual_pairs_original_left_and_translation_right_on_each_page():
     source, metadata, segments = fixture()
     segments[0] = replace(segments[0], machine_translation="海湾地区的历史交流。")
-    result, _ = compose_pdf(source, metadata, segments, bilingual=True)
+    translated, _ = compose_pdf(source, metadata, segments)
+    result, report = compose_pdf(source, metadata, segments, bilingual=True)
     reader = PdfReader(io.BytesIO(result))
-    assert len(reader.pages) == 4
-    assert "The Gulf connects" in reader.pages[0].extract_text()
-    assert "海湾地区" in reader.pages[1].extract_text()
-    assert image_hashes(reader)[0] == image_hashes(reader)[1]
-    assert image_hashes(reader)[2] == image_hashes(reader)[3]
+    assert report["replaced_blocks"] == 1
+    assert len(reader.pages) == 2
+    assert list(reader.pages[0].mediabox) == [0, 0, 824, 600]
+    assert list(reader.pages[1].mediabox) == [0, 0, 1024, 400]
+    assert reader.metadata.title == "Illustrated Gulf"
+    assert reader.page_layout == "/SinglePage"
+    assert reader.get_destination_page_number(reader.outline[0]) == 0
+    with pdfplumber.open(io.BytesIO(result)) as pdf:
+        left = pdf.pages[0].crop((0, 0, 400, 600)).extract_text()
+        right = pdf.pages[0].crop((424, 0, 824, 600)).extract_text()
+        assert "The Gulf connects" in left
+        assert "海湾地区" not in left
+        assert "海湾地区" in right
+        assert "The Gulf connects" not in right
+        assert "These communities" in right  # Untranslated content remains visible.
+    # Each half renders exactly like its standalone page, including native graphics.
+    for number, (width, height) in enumerate(((400, 600), (500, 400)), 1):
+        spread = Image.open(io.BytesIO(render_pdf_page(result, number, width * 2 + 24)))
+        for offset, data in ((0, source), (width + 24, translated)):
+            expected = Image.open(io.BytesIO(render_pdf_page(data, number, width)))
+            actual = spread.crop((offset, 0, offset + width, height))
+            assert ImageChops.difference(expected, actual).getbbox() is None
+        assert spread.crop((width, 0, width + 24, height)).getextrema() == (
+            (255, 255), (255, 255), (255, 255),
+        )
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("cropped", [False, True])
+def test_bilingual_spreads_preserve_visible_crop_and_rotation(rotation, cropped):
+    source, _, _ = fixture()
+    writer = PdfWriter(clone_from=io.BytesIO(source))
+    page = writer.pages[0]
+    page.rotate(rotation)
+    if cropped:
+        page.cropbox = RectangleObject((20, 30, 380, 560))
+    stream = io.BytesIO()
+    writer.write(stream)
+    source = stream.getvalue()
+    book = extract_pdf(source)
+    result, _ = compose_pdf(source, {"layout": book.layout}, [], bilingual=True)
+    width, height = (360, 530) if cropped else (400, 600)
+    if rotation in (90, 270):
+        width, height = height, width
+    page = PdfReader(io.BytesIO(result)).pages[0]
+    assert float(page.mediabox.width) == pytest.approx(width * 2 + 24)
+    assert float(page.mediabox.height) == pytest.approx(height)
+    assert page.rotation == 0
+    expected = Image.open(io.BytesIO(render_pdf_page(source, 1, width)))
+    spread = Image.open(io.BytesIO(render_pdf_page(result, 1, width * 2 + 24)))
+    for offset in (0, width + 24):
+        actual = spread.crop((offset, 0, offset + width, height))
+        assert ImageChops.difference(expected, actual).getbbox() is None
+
+
+def test_bilingual_spreads_keep_nested_bookmarks_and_links_on_both_halves():
+    source, _, _ = fixture()
+    writer = PdfWriter(clone_from=io.BytesIO(source))
+    parent = writer.add_outline_item("Images", 1)
+    writer.add_outline_item("Detail", 1, parent=parent)
+    link = writer.add_annotation(0, Link(rect=(40, 520, 160, 540), target_page_index=1))
+    link["/Dest"][0] = writer.pages[1].indirect_reference
+    writer.add_annotation(1, Link(rect=(50, 50, 100, 80), url="https://example.com"))
+    stream = io.BytesIO()
+    writer.write(stream)
+    source = stream.getvalue()
+    book = extract_pdf(source)
+    result, _ = compose_pdf(source, {"layout": book.layout}, [], bilingual=True)
+    reader = PdfReader(io.BytesIO(result))
+    assert reader.outline[1].title == "Images"
+    assert reader.outline[2][0].title == "Detail"
+    assert reader.get_destination_page_number(reader.outline[1]) == 1
+    assert reader.get_destination_page_number(reader.outline[2][0]) == 1
+    links = [ref.get_object() for ref in reader.pages[0]["/Annots"]]
+    assert [list(link["/Rect"]) for link in links] == [
+        [40, 520, 160, 540], [464, 520, 584, 540],
+    ]
+    assert all(link["/Dest"][0] == reader.pages[1].indirect_reference for link in links)
+    external = [ref.get_object() for ref in reader.pages[1]["/Annots"]]
+    assert len(external) == 2
+    assert all(link["/A"]["/URI"] == "https://example.com" for link in external)
 
 
 def test_stale_source_mapping_reflows_on_original_page_without_discarding_translation():

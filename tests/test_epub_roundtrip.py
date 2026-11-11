@@ -385,7 +385,7 @@ class EpubRoundTripTests(unittest.TestCase):
             layout="faithful",
         )
         self.assertIn(b"strong", translated)
-        self.assertIn(b"jy-source-italic", translated)
+        self.assertIn(b'data-jy-typeface="kai"', translated)
         self.assertIn(b"cover.svg", translated)
         self.assertIn(b"table", translated)
         bilingual, _ = render_spine(
@@ -399,8 +399,8 @@ class EpubRoundTripTests(unittest.TestCase):
         self.assertIn("jy-bilingual-pair", bilingual_text)
         self.assertIn("jy-original", bilingual_text)
         self.assertIn("jy-translation", bilingual_text)
-        self.assertIn("jy-source-italic", bilingual_text)
-        self.assertIn("font-family: \"Kaiti SC\"", bilingual_text)
+        self.assertIn('data-jy-typeface="kai"', bilingual_text)
+        self.assertIn("Kaiti SC", bilingual_text)
         self.assertIn("font-style: normal !important", bilingual_text)
         self.assertIn(
             "grid-template-columns: minmax(0, 1fr) minmax(0, 1fr)",

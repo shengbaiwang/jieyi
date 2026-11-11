@@ -20,7 +20,7 @@ from pypdf import PdfReader
 from jieyi.domain.models import SegmentKind
 from jieyi.ingestion.plaintext import ParsedBlock
 
-VERSION = "pdf-layout-v3"
+VERSION = "pdf-layout-v4"
 GEOMETRY_VERSION = "baseline-validated-v1"
 # PDFium is not thread-safe, including separate documents.
 _RENDER_LOCK = threading.Lock()
@@ -133,12 +133,51 @@ def repair_layout_geometry(data, layout, page_numbers=None):
     return repaired
 
 
+def enrich_layout_fonts(data, layout):
+    """Upgrade existing geometry in place of resegmentation or retranslation."""
+    from copy import deepcopy
+
+    if all(region.get("font_name") for item in layout for region in item["regions"]):
+        return layout
+    enriched = deepcopy(layout)
+    by_page = {}
+    for item in enriched:
+        for region in item["regions"]:
+            if not region.get("font_name"):
+                by_page.setdefault(region["page"], []).append(region)
+    if not by_page:
+        return enriched
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        for number, regions in by_page.items():
+            page = pdf.pages[number - 1]
+            chars = [_validated_char(char, page.height) for char in page.chars]
+            for region in regions:
+                fonts = Counter(
+                    char["fontname"] for char in chars
+                    if not char["text"].isspace() and any(
+                        char["x0"] >= line[0] - 1 and char["x1"] <= line[2] + 1
+                        and char["y0"] >= line[1] - 1 and char["y1"] <= line[3] + 1
+                        for line in region["lines"]
+                    )
+                )
+                region["font_name"] = fonts.most_common(1)[0][0] if fonts else "unknown"
+            page.close()
+    return enriched
+
+
 def _page_lines(page) -> list[dict]:
+    # pdfplumber also exposes printer marks outside the visible page boxes.
+    # Keep any partly visible glyph; only wholly invisible text is excluded.
+    visible = (max(page.bbox[0], page.cropbox[0]), max(page.bbox[1], page.cropbox[1]),
+               min(page.bbox[2], page.cropbox[2]), min(page.bbox[3], page.cropbox[3]))
     # Ornament fonts often map flourishes to ASCII digits. Remove those glyphs
     # before line detection: their tall bounds can swallow the chapter label.
     def keep_glyph(obj):
         if obj.get("object_type") != "char":
             return True
+        if (min(obj["x1"], visible[2]) <= max(obj["x0"], visible[0])
+                or min(obj["bottom"], visible[3]) <= max(obj["top"], visible[1])):
+            return False
         if re.search(r"dingbats|wingdings|webdings", obj.get("fontname", ""), re.IGNORECASE):
             return False
         # A landscape insert may retain the portrait page's folio/production
@@ -464,6 +503,10 @@ def extract_pdf(data: bytes, progress: Callable[[int, int], None] | None = None)
                             {
                                 "page": number,
                                 "font_size": size,
+                                "font_name": max(
+                                    {line["font"] for line in group},
+                                    key=lambda font: sum(len(line["text"]) for line in group if line["font"] == font),
+                                ),
                                 "rect": [
                                     min(line["x0"] for line in group),
                                     height - max(line["bottom"] for line in group),

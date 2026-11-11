@@ -3,7 +3,7 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from jieyi.api.app import create_app
@@ -208,6 +208,15 @@ def test_pdf_api_import_reuse_translate_export_delete(tmp_path):
         assert pdf_export.content.startswith(b"%PDF")
         assert "translated.pdf" in pdf_export.headers["content-disposition"]
         assert preview.content == render_pdf_page(pdf_export.content, 1, 1200)
+        bilingual_export = client.get(root + "/export?format=book&bilingual=true")
+        assert bilingual_export.status_code == 200
+        assert "bilingual.pdf" in bilingual_export.headers["content-disposition"]
+        paired = PdfReader(io.BytesIO(bilingual_export.content))
+        assert len(paired.pages) == 3
+        assert list(paired.pages[0].mediabox) == [0, 0, 1224, 800]
+        assert "The Persian Gulf" in paired.pages[0].extract_text()
+        assert "波斯湾连接" in paired.pages[0].extract_text()
+        assert paired.get_destination_page_number(paired.outline[1]) == 2
         original = client.get(root + "/segments").json()[1]
         split = client.post(
             f"/segments/{original['id']}/split",

@@ -13,6 +13,8 @@ from xml.etree import ElementTree as ET
 
 from jieyi.ingestion.epub import EpubIngestionError, _local_name, _parse_xml, _safe_member_name
 from jieyi.ingestion.epub_navigation import parse_epub_navigation, position_navigation
+from jieyi.ingestion.epub_typography import book_typography
+from jieyi.ingestion.typography import TRANSLATION_TYPOGRAPHY_CSS
 
 _DANGEROUS_ELEMENTS = {
     "script",
@@ -83,14 +85,6 @@ _READER_STYLE = """
   padding-inline-start: 1rem !important;
   border-inline-start: 1px solid rgba(40,100,190,.28) !important;
   color: inherit !important;
-}
-.jy-translation.jy-source-italic,
-[data-jy-atoms].jy-source-italic,
-.jy-translation :is(em, i),
-[data-jy-atoms] :is(em, i) {
-  font-family: "Kaiti SC", STKaiti, KaiTi, "楷体", serif !important;
-  font-style: normal !important;
-  font-synthesis: none !important;
 }
 .jy-bilingual-pair > :is(.jy-original, .jy-translation) > :first-child { margin-block-start: 0 !important; }
 .jy-bilingual-pair > :is(.jy-original, .jy-translation) > :last-child { margin-block-end: 0 !important; }
@@ -402,7 +396,6 @@ def _pair_translation(
     atom_ids: list[str],
     *,
     missing: bool = False,
-    source_italic: bool = False,
 ) -> None:
     namespace = _element_namespace(element)
     original = ET.Element(namespace + "span", {"class": "jy-original"})
@@ -416,7 +409,6 @@ def _pair_translation(
         namespace + "span",
         {
             "class": "jy-translation"
-            + (" jy-source-italic" if source_italic else "")
             + (" jy-missing-translation" if missing else ""),
             "lang": "zh",
             "data-jy-for": " ".join(atom_ids),
@@ -431,16 +423,6 @@ def _pair_translation(
     ).strip()
     element.append(original)
     element.append(translated)
-
-
-def _source_uses_italic(atoms: list[dict]) -> bool:
-    """Return whether the source styling marks any atom as italic or oblique."""
-    for atom in atoms:
-        fields = str(atom.get("style_signature") or "").split("\x1f")
-        font_style = fields[6].strip().casefold() if len(fields) > 6 else ""
-        if font_style.startswith(("italic", "oblique")):
-            return True
-    return False
 
 
 def _inject_style(root: ET.Element, css: str) -> None:
@@ -519,6 +501,10 @@ def render_spine(
     resource = store.get_epub_resource(document_id, item["path"])
     root = _parse_xml(bytes(resource["data"]), item["path"])
     paths = _path_map(root)
+    project = store.get_project_for_document(document_id)
+    typography = (book_typography(store, document_id, root, item["path"])
+                  if mode != "original" and project.target_lang.casefold().startswith("zh") else None)
+    targets = []
     _apply_deleted_source(store, document_id, spine_index, root, paths)
     root = _sanitize_tree(root, document_id=document_id, base_path=item["path"])
 
@@ -564,19 +550,17 @@ def render_spine(
                         [atom["atom_id"] for atom in group],
                         missing=True,
                     )
+                    element[-2].attrib["lang"] = project.source_lang
+                    element[-1].attrib["lang"] = project.target_lang
                 continue
             markup = " ".join(atom["translation_markup"] for atom in translated)
-            source_italic = _source_uses_italic(translated)
             if mode == "translated":
                 if len(group) == 1:
                     _replace_inner(element, markup)
                 else:
                     _replace_text_nodes(paths, group, node_rows)
-                element.attrib["lang"] = "zh"
-                if source_italic:
-                    element.attrib["class"] = (
-                        element.attrib.get("class", "") + " jy-source-italic"
-                    ).strip()
+                element.attrib["lang"] = project.target_lang
+                targets.append((element, element))
                 element.attrib["data-jy-atoms"] = " ".join(
                     atom["atom_id"] for atom in translated
                 )
@@ -585,9 +569,15 @@ def render_spine(
                     element,
                     markup,
                     [atom["atom_id"] for atom in translated],
-                    source_italic=source_italic,
                 )
+                element[-2].attrib["lang"] = project.source_lang
+                element[-1].attrib["lang"] = project.target_lang
+                targets.append((element[-1], element))
 
+    if typography is not None:
+        for target, source in targets:
+            typography.apply(target, source)
+        _inject_style(root, TRANSLATION_TYPOGRAPHY_CSS)
     root = _sanitize_tree(root, document_id=document_id, base_path=item["path"])
     css = _READER_STYLE
     if layout == "comfort" or not item["fixed_layout"]:
@@ -621,6 +611,9 @@ def _render_export_spine(
     paths = _path_map(root)
     _apply_deleted_source(store, document_id, spine_index, root, paths)
     project = store.get_project_for_document(document_id)
+    typography = (book_typography(store, document_id, root, item["path"])
+                  if project.target_lang.casefold().startswith("zh") else None)
+    targets = []
 
     atoms = store.list_epub_atoms_for_spine(document_id, spine_index)
     node_rows = {
@@ -642,10 +635,10 @@ def _render_export_spine(
                 markup or "〔尚未翻译〕",
                 [atom["atom_id"] for atom in group],
                 missing=not translated,
-                source_italic=_source_uses_italic(translated),
             )
             element[-2].attrib["lang"] = project.source_lang
             element[-1].attrib["lang"] = project.target_lang
+            targets.append((element[-1], element))
             continue
         if not translated:
             missing = [dict(atom) for atom in group]
@@ -658,7 +651,13 @@ def _render_export_spine(
             _replace_inner(element, markup)
         else:
             _replace_text_nodes(paths, group, node_rows)
+        element.attrib["lang"] = project.target_lang
+        targets.append((element, element))
 
+    if typography is not None:
+        for target, source in targets:
+            typography.apply(target, source)
+        _inject_style(root, TRANSLATION_TYPOGRAPHY_CSS)
     if bilingual:
         # Stacked pairs also work in EPUB readers without CSS Grid support.
         _inject_style(root, _READER_STYLE + """

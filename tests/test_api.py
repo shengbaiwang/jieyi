@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from test_epub import build_epub
 
 from jieyi.api.app import create_app
+from jieyi.quality.checks import DETECTOR_VERSION
 
 
 class ApiTests(unittest.TestCase):
@@ -426,7 +427,7 @@ class ApiTests(unittest.TestCase):
         health = self.client.get("/health")
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["api_version"], 2)
-        self.assertEqual(health.json()["quality_detector_version"], "7")
+        self.assertEqual(health.json()["quality_detector_version"], DETECTOR_VERSION)
         self.assertTrue(health.json()["db_path"].endswith("api.db"))
         self.assertIn("echo", health.json()["providers"])
 

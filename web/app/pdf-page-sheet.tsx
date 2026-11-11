@@ -36,7 +36,10 @@ export function PdfPageSheet({ apiBase, documentId, number, label, mode, width, 
     const controller = new AbortController();
     fetch(`${apiBase}/documents/${documentId}/pdf/pages/${number}/text?mode=${mode}`, { signal: controller.signal })
       .then(async (response) => {
-        if (!response.ok) throw new Error("文字层加载失败，可重试或下载 PDF。");
+        if (!response.ok) {
+          const detail = await response.json().catch(() => null);
+          throw new Error(typeof detail?.detail === "string" ? detail.detail : "文字层加载失败，可重试或查看 PDF 原页。");
+        }
         return response.json() as Promise<PdfTextPage>;
       }).then((result) => { setTextPage(result); onTextRef.current(result); })
       .catch((caught) => { if (!controller.signal.aborted) setError(caught.message); });
@@ -109,7 +112,7 @@ export function PdfPageSheet({ apiBase, documentId, number, label, mode, width, 
     <figcaption>{pageLabel}</figcaption>
     <div className="pdf-page-surface" style={{ aspectRatio: `${textPage?.width || width} / ${textPage?.height || height}` }}>
       {near && <img src={`${apiBase}/documents/${documentId}/pdf/pages/${number}?width=1200&mode=${mode}&retry=${retry}`} alt={pageLabel} draggable={false}
-        onLoad={() => setLoaded(true)} onError={() => setError("页面加载失败，可重试或下载 PDF。")} />}
+        onLoad={() => setLoaded(true)} onError={() => setError((current) => current || "页面加载失败，可重试或查看 PDF 原页。")} />}
       {!loaded && !error && <p className="pdf-sheet-status" role="status">正在准备页面…</p>}
       {textPage && <>
         <div className="pdf-mark-layer" aria-hidden="true">

@@ -3,14 +3,74 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
+from html import unescape
 
 from jieyi.domain.models import IssueSeverity, QualityIssue, SegmentKind, TermEntry
+from jieyi.protection import ProtectedTextCodec
 from jieyi.quality.output import output_problems
+from jieyi.quality.references import is_retained_reference
 from jieyi.terminology import resolve_terminology, term_appears
 
-DETECTOR_VERSION = "7"
+DETECTOR_VERSION = "8"
 
 _FOOTNOTE_REF = re.compile(r"\[\^[^]]+\]")
+_PLACEHOLDER = re.compile(r"\[\[JY_PH_\d{4}\]\]")
+_WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
+_EAST_ASIAN = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_TARGET_SCRIPTS = {
+    "zh": re.compile(r"[\u3400-\u9fff]"),
+    "ja": re.compile(r"[\u3400-\u9fff\u3040-\u30ff]"),
+    "ko": re.compile(r"[\uac00-\ud7af]"),
+}
+
+
+def _untranslated_text(
+    source: str, target: str, source_lang: str | None, target_lang: str | None,
+) -> bool:
+    """Find copied prose, leaving short names and protected technical text alone."""
+    if not source_lang or not target_lang:
+        return False
+    source_language = source_lang.strip().lower().replace("_", "-").split("-")[0]
+    target_language = target_lang.strip().lower().replace("_", "-").split("-")[0]
+    if not source_language or not target_language or source_language == target_language:
+        return False
+
+    def prose(text: str) -> str:
+        # Match the translation contract: citations, URLs, code, markup and
+        # footnote markers are allowed to survive unchanged.
+        masked = ProtectedTextCodec().encode(text).masked
+        return unicodedata.normalize("NFKC", unescape(_PLACEHOLDER.sub(" ", masked)))
+
+    original, translated = prose(source), prose(target)
+    source_letters = "".join(char for char in original if char.isalpha())
+    if not source_letters:
+        return False
+    target_script = _TARGET_SCRIPTS.get(target_language)
+    if target_script and len(target_script.findall(source_letters)) >= len(source_letters) / 2:
+        # A passage already written in the target script may need no translation.
+        return False
+    if len(_EAST_ASIAN.findall(source_letters)) >= len(source_letters) / 2:
+        is_prose = len(source_letters) >= 8
+    else:
+        words = _WORD.findall(original)
+        # Several lowercase words distinguish ordinary prose from most personal
+        # names, acronyms and compact labels; include short punctuated sentences.
+        sentence_end = original.rstrip().endswith((".", "!", "?"))
+        is_prose = (
+            len(source_letters) >= 10
+            and sum(word[0].islower() for word in words) >= 2
+            and (len(words) >= 4 or (len(words) >= 3 and sentence_end))
+        ) or (
+            source_letters.isupper() and len(words) >= 6
+            and len(source_letters) >= 20 and sentence_end
+        )
+    if not is_prose:
+        return False
+
+    def comparable(text: str) -> str:
+        return "".join(char for char in text.casefold() if char.isalnum())
+
+    return comparable(original) == comparable(translated) and not is_retained_reference(source)
 
 
 def _normalise_text(text: str) -> str:
@@ -45,12 +105,22 @@ def run_deterministic_checks(
     terms: list[TermEntry] | tuple[TermEntry, ...] = (),
     *,
     segment_kind: SegmentKind | str | None = None,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
 ) -> list[QualityIssue]:
     """Check high-confidence invariants without guessing about punctuation or numbers."""
     issues: list[QualityIssue] = []
 
     if source.strip() and not target.strip():
         return [_issue("empty_translation", "译文为空。", IssueSeverity.ERROR)]
+
+    if _untranslated_text(source, target, source_lang, target_lang):
+        issues.append(_issue(
+            "untranslated_text",
+            "译文与原文相同，疑似未成功翻译，请重新翻译或人工核实。",
+            IssueSeverity.ERROR,
+            {"source_lang": source_lang, "target_lang": target_lang},
+        ))
 
     for code in output_problems(source, target):
         issues.append(_issue(
